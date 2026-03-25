@@ -463,7 +463,9 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
   void update_event_end(const std::string& event_id, uint64_t end_ms,
                         const std::string& /*now_str*/) override {
     for (auto& e : events)
-      if (e.id == event_id) { e.ended = true; e.end_ms = end_ms; break; }
+      if (e.id == event_id) {
+        e.ended = true; e.end_ms = end_ms; break;
+      }
   }
 
   void write_thumbnail(const std::string& /*thumb_id*/,
@@ -646,7 +648,12 @@ static void test_detection_e2e(const std::string& ubv_dir) {
   int orphan_sdo = 0;
   for (auto& s : bptr->sdos) {
     bool found = false;
-    for (auto& e : bptr->events) if (e.id == s.event_id) { found = true; break; }
+    for (auto& e : bptr->events) {
+      if (e.id == s.event_id) {
+        found = true;
+        break;
+      }
+    }
     if (!found) ++orphan_sdo;
   }
   CHECK(orphan_sdo == 0,
