@@ -40,19 +40,32 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
-#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "absl/flags/flag.h"
+#include "absl/flags/parse.h"
+#include "absl/status/statusor.h"
+
+// ---------------------------------------------------------------------------
+// flags
+// ---------------------------------------------------------------------------
+ABSL_FLAG(std::string, db_host, "127.0.0.1",
+    "Host for the UniFi Protect PostgreSQL database.");
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
-static void mkdir_p(const std::string& dir) {
+static bool mkdir_p(const std::string& dir) {
   struct stat st{};
-  if (stat(dir.c_str(), &st) == 0) return;  // already exists
-  if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST)
-    throw std::runtime_error("mkdir " + dir + ": " + strerror(errno));
+  if (stat(dir.c_str(), &st) == 0) return true;  // already exists
+  if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
+    std::cerr << "mkdir " << dir << ": " << strerror(errno) << "\n";
+    return false;
+  }
+  return true;
 }
 
 // Format milliseconds-since-epoch as "YYYY-MM-DD_HH-MM-SS"
@@ -77,32 +90,31 @@ static std::string sanitize(std::string s) {
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
-  if (argc != 4) {
-    std::cerr << "Usage: " << argv[0]
+  std::vector<char*> args = absl::ParseCommandLine(argc, argv);
+  if (args.size() != 4) {
+    std::cerr << "Usage: " << args[0]
               << " <ubv_file> <camera_mac> <output_dir>\n";
     return 1;
   }
 
-  const std::string ubv_path   = argv[1];
-  const std::string camera_mac = argv[2];
-  const std::string out_dir    = argv[3];
+  const std::string ubv_path   = args[1];
+  const std::string camera_mac = args[2];
+  const std::string out_dir    = args[3];
 
   // -- decode all frames from the UBV file ---------------------------------
   std::cout << "Decoding " << ubv_path << " ...\n";
-  std::vector<ubv::Frame> frames;
-  try {
-    frames = ubv::decode(ubv_path);
-  } catch (const std::exception& e) {
-    std::cerr << "Error: " << e.what() << "\n";
+  auto frames_or = ubv::decode(ubv_path);
+  if (!frames_or.ok()) {
+    std::cerr << "Error: " << frames_or.status().message() << "\n";
     return 1;
   }
+  std::vector<ubv::Frame> frames = std::move(*frames_or);
   std::cout << "Found " << frames.size() << " JPEG frame(s).\n";
   if (frames.empty()) return 0;
 
   // -- connect to UniFi Protect PostgreSQL ---------------------------------
-  const char* db_host = std::getenv("ONVIF_DB_HOST");
   std::string connstr =
-    std::string("host=") + (db_host ? db_host : "127.0.0.1") +
+    std::string("host=") + absl::GetFlag(FLAGS_db_host) +
     " port=5433 dbname=unifi-protect user=postgres";
   PGconn* conn = PQconnectdb(connstr.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
@@ -115,7 +127,7 @@ int main(int argc, char** argv) {
   }
 
   // -- create output directory ---------------------------------------------
-  mkdir_p(out_dir);
+  if (!mkdir_p(out_dir)) return 1;
 
   // -- for each frame, look up event and write JPEG -----------------------
   int saved = 0;

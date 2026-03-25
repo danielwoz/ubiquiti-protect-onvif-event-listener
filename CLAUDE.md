@@ -116,7 +116,7 @@ Optionally, per-camera UBV thumbnail files are also written to `ONVIF_UBV_DIR` i
 - Thumbnail crop priority: ONVIF `tt:BoundingBox` (if w>0 && h>0) → ML detector
   (`ObjectDetector::detect()`) → smart_crop heuristic (square at 60% vertical centre).
 - `ObjectDetector` uses NanoDet-M (NCNN) on host; ARM64 builds compile without
-  `WITH_NCNN` and always return `nullopt` (smart_crop fallback).  Set `ONVIF_MODEL_DIR`
+  `WITH_NCNN` and always return `nullopt` (smart_crop fallback).  Pass `--model_dir`
   at runtime so `main.cpp` loads the model; if absent, smart_crop is used silently.
 - NCNN is built from source via `rules_foreign_cc` cmake(); model files are downloaded
   by Bazel `http_file` rules (`nanodet_m_param`, `nanodet_m_bin`).
@@ -150,14 +150,19 @@ make pgo-bench-x86
 > chmod +x .git/hooks/pre-push
 > ```
 
-## Environment variables (runtime)
+## Command-line flags (runtime)
 
-| Variable | Default | Description |
+All configuration is now via `absl::flags`. Pass `--help` for the full list.
+
+| Flag | Default | Description |
 |---|---|---|
-| `ONVIF_DB_CONN` | _(local socket)_ | libpq conninfo (default: `host=/run/postgresql port=5433 dbname=unifi-protect user=postgres`) |
-| `ONVIF_DB_HOST` | _(Unix socket)_ | Host for the Protect PostgreSQL camera DB |
-| `ONVIF_UBV_DIR` | _(unset)_ | If set, also write per-camera UBV thumbnail files to this directory |
-| `ONVIF_PRE_BUFFER_SEC` | `2` | Seconds before first detection event |
-| `ONVIF_POST_BUFFER_SEC` | `2` | Seconds after last detection event |
-| `ONVIF_VERBOSE` | _(unset)_ | Set to `1` to enable verbose logging (lifecycle, events, renewals) |
-| `ONVIF_MODEL_DIR` | _(unset)_ | Directory containing `nanodet_m.param` and `nanodet_m.bin`; if unset, smart_crop heuristic is used |
+| `--db_conn` | `host=/run/postgresql port=5433 dbname=unifi-protect user=postgres` | libpq conninfo for the UniFi Protect database |
+| `--db_host` | _(empty = Unix socket)_ | Override PostgreSQL host for camera config loading |
+| `--ubv_dir` | _(empty)_ | Directory for per-camera UBV thumbnail files (optional) |
+| `--pre_buffer_sec` | `2` | Seconds to buffer before the first detection event |
+| `--post_buffer_sec` | `2` | Seconds to buffer after the last detection event |
+| `--verbose` | `false` | Enable verbose logging (lifecycle, events, renewals) |
+| `--model_dir` | _(empty)_ | Directory containing `nanodet_m.param` and `nanodet_m.bin`; if empty, smart_crop heuristic is used |
+
+`ubv_extract` accepts `--db_host` (default `127.0.0.1`) to override the Protect DB host.
+`gen_examples` accepts `--model_dir` for the NanoDet-M model path.

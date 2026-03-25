@@ -103,5 +103,19 @@ cc_binary(
         ":object_detect",
         ":onvif_listener",
         ":unifi_camera_config",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
     ],
+)
+
+cc_binary(
+    name = "ubv_extract",
+    srcs = ["ubv_extract.cpp"],
+    linkopts = ["-lldap", "-llber"],
+    deps = [
+        ":ubv_thumbnail",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/status:statusor",
+    ] + _PQ,
 )

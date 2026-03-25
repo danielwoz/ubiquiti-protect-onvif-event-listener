@@ -40,8 +40,14 @@
 #include <utility>
 #include <vector>
 
+#include "absl/flags/flag.h"
+#include "absl/flags/parse.h"
 #include "../jpeg_crop.hpp"
 #include "../object_detect.hpp"
+
+ABSL_FLAG(std::string, model_dir, "",
+    "Directory containing nanodet_m.param and nanodet_m.bin; "
+    "if empty, smart-crop heuristic is used.");
 
 namespace {
 
@@ -98,14 +104,15 @@ std::string stem(const std::string& path) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  if (argc < 3) {
-    std::cerr << "Usage: " << argv[0]
+  std::vector<char*> args = absl::ParseCommandLine(argc, argv);
+  if (args.size() < 3) {
+    std::cerr << "Usage: " << args[0]
               << " <out_dir> <image.jpg> [<image.jpg> ...]\n"
-              << "  ONVIF_MODEL_DIR=<dir>  optional: load NanoDet-M from dir\n";
+              << "  --model_dir=<dir>  optional: load NanoDet-M from dir\n";
     return 1;
   }
 
-  const std::string out_dir = argv[1];
+  const std::string out_dir = args[1];
   // Create output directory (equivalent to mkdir -p).
   std::string mkdir_cmd = "mkdir -p " + out_dir;
   if (std::system(mkdir_cmd.c_str()) != 0) {  // NOLINT(runtime/threadsafe_fn)
@@ -115,10 +122,10 @@ int main(int argc, char* argv[]) {
 
   // Load object detector if model dir is set.
   std::unique_ptr<object_detect::ObjectDetector> detector;
-  const char* model_dir = std::getenv("ONVIF_MODEL_DIR");
-  if (model_dir) {
-    std::string param = std::string(model_dir) + "/nanodet_m.param";
-    std::string bin   = std::string(model_dir) + "/nanodet_m.bin";
+  const std::string model_dir = absl::GetFlag(FLAGS_model_dir);
+  if (!model_dir.empty()) {
+    std::string param = model_dir + "/nanodet_m.param";
+    std::string bin   = model_dir + "/nanodet_m.bin";
     auto result = object_detect::ObjectDetector::Load(param, bin);
     if (result.ok()) {
       detector = std::move(*result);
@@ -130,8 +137,8 @@ int main(int argc, char* argv[]) {
   }
 
   int ok = 0, fail = 0;
-  for (int i = 2; i < argc; ++i) {
-    const std::string in_path = argv[i];
+  for (size_t i = 2; i < args.size(); ++i) {
+    const std::string in_path = args[i];
     const auto input = read_file(in_path);
     if (input.empty()) {
       std::cerr << "  skip " << in_path << ": cannot read\n";

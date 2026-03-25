@@ -35,12 +35,35 @@
 #include <string>
 #include <utility>
 
+#include "absl/flags/flag.h"
+#include "absl/flags/parse.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "detection_recorder.hpp"
 #include "object_detect.hpp"
 #include "onvif_listener.hpp"
 #include "unifi_camera_config.hpp"
+
+// ============================================================
+// Command-line flags
+// ============================================================
+ABSL_FLAG(std::string, db_conn,
+    "host=/run/postgresql port=5433 dbname=unifi-protect user=postgres",
+    "libpq connection string for the UniFi Protect database.");
+ABSL_FLAG(std::string, db_host, "",
+    "Override the PostgreSQL host for camera config loading "
+    "(empty = use /run/postgresql Unix socket).");
+ABSL_FLAG(std::string, ubv_dir, "",
+    "Directory for per-camera UBV thumbnail files (optional).");
+ABSL_FLAG(int32_t, pre_buffer_sec, 2,
+    "Seconds to buffer before the first detection event.");
+ABSL_FLAG(int32_t, post_buffer_sec, 2,
+    "Seconds to buffer after the last detection event.");
+ABSL_FLAG(bool, verbose, false,
+    "Enable verbose logging (lifecycle, events, renewals).");
+ABSL_FLAG(std::string, model_dir, "",
+    "Directory containing nanodet_m.param and nanodet_m.bin; "
+    "if empty, smart-crop heuristic is used.");
 
 // ============================================================
 // JSON helpers (used only by EventRecorder)
@@ -151,7 +174,9 @@ static void signal_handler(int) {
 // ============================================================
 // Entry point
 // ============================================================
-int main() {
+int main(int argc, char* argv[]) {
+  absl::ParseCommandLine(argc, argv);
+
   std::time_t t0 = std::time(nullptr);
   std::tm tm0{};
   gmtime_r(&t0, &tm0);
@@ -160,35 +185,21 @@ int main() {
   std::string output_path  = std::string("onvif_events_") + ts_buf + ".jsonl";
   std::string raw_path     = std::string("onvif_raw_")    + ts_buf + ".jsonl";
 
-  // Configuration via environment variables:
-  //   ONVIF_DB_CONN  = libpq conninfo string
-  //                    (default: local Protect Unix socket on port 5433)
-  //   ONVIF_UBV_DIR  = directory for per-camera UBV thumbnail files
-  //                    (optional; thumbnails are also stored in the PG DB)
-  const char* env_conn       = std::getenv("ONVIF_DB_CONN");
-  const char* env_db_host    = std::getenv("ONVIF_DB_HOST");
-  const char* env_ubv_dir    = std::getenv("ONVIF_UBV_DIR");
-  const char* env_pre_buf    = std::getenv("ONVIF_PRE_BUFFER_SEC");
-  const char* env_post_buf   = std::getenv("ONVIF_POST_BUFFER_SEC");
-  const char* env_verbose    = std::getenv("ONVIF_VERBOSE");
-
-  std::string db_conn = env_conn ? env_conn
-                                 : "host=/run/postgresql port=5433 "
-                                   "dbname=unifi-protect user=postgres";
-  std::string thumbs_dir = env_ubv_dir ? env_ubv_dir : "";
-  uint32_t    pre_buf_sec  = env_pre_buf  ?
-    static_cast<uint32_t>(std::stoul(env_pre_buf))  : 2u;
-  uint32_t    post_buf_sec = env_post_buf ?
-    static_cast<uint32_t>(std::stoul(env_post_buf)) : 2u;
-
-  const bool verbose = env_verbose && std::string(env_verbose) != "0";
+  const std::string db_conn     = absl::GetFlag(FLAGS_db_conn);
+  const std::string db_host     = absl::GetFlag(FLAGS_db_host);
+  const std::string thumbs_dir  = absl::GetFlag(FLAGS_ubv_dir);
+  const uint32_t pre_buf_sec    =
+      static_cast<uint32_t>(absl::GetFlag(FLAGS_pre_buffer_sec));
+  const uint32_t post_buf_sec   =
+      static_cast<uint32_t>(absl::GetFlag(FLAGS_post_buffer_sec));
+  const bool verbose            = absl::GetFlag(FLAGS_verbose);
 
   std::cerr << "ONVIF Event Recorder\n"
             << "Events file : " << output_path  << '\n'
             << "Raw file    : " << raw_path      << '\n'
             << "DB backend  : postgres\n"
             << "DB conn     : " << db_conn       << '\n'
-            << "DB host     : " << (env_db_host ? env_db_host : "(default)") << '\n'
+            << "DB host     : " << (db_host.empty() ? "(default)" : db_host) << '\n'
             << "Pre-buffer  : " << pre_buf_sec   << " s\n"
             << "Post-buffer : " << post_buf_sec  << " s\n"
             << "Verbose     : " << (verbose ? "yes" : "no") << '\n';
@@ -219,9 +230,8 @@ int main() {
 
   // Optional: load NCNN object detector for thumbnail subject cropping.
   std::unique_ptr<object_detect::ObjectDetector> detector;
-  const char* model_dir_cstr = std::getenv("ONVIF_MODEL_DIR");
-  if (model_dir_cstr) {
-    const std::string model_dir(model_dir_cstr);
+  const std::string model_dir = absl::GetFlag(FLAGS_model_dir);
+  if (!model_dir.empty()) {
     auto det = object_detect::ObjectDetector::Load(
         model_dir + "/nanodet_m.param",
         model_dir + "/nanodet_m.bin");
@@ -247,13 +257,9 @@ int main() {
     det_rec.set_ubv_dir(thumbs_dir);
 
   // Camera configs are loaded from the UniFi Protect database.
-  // ONVIF_DB_HOST overrides the host; default uses the local Unix socket
-  // so no TCP listener is required on the router.
+  // --db_host overrides the host; empty = use the local Unix socket.
   unifi::DbConfig cam_db;
-  if (env_db_host)
-    cam_db.host = env_db_host;
-  else
-    cam_db.host = "/run/postgresql";
+  cam_db.host = db_host.empty() ? "/run/postgresql" : db_host;
 
   auto cams_or = unifi::load_cameras(cam_db);
   if (!cams_or.ok()) {
