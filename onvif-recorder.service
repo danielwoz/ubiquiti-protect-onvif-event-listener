@@ -7,7 +7,6 @@ Wants=postgresql@14-protect.service
 Type=simple
 User=root
 WorkingDirectory=/root
-Environment=ONVIF_DB_BACKEND=postgres
 ExecStart=/root/onvif_recorder
 Restart=on-failure
 RestartSec=10
