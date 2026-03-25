@@ -118,8 +118,10 @@ Optionally, per-camera UBV thumbnail files are also written to `ONVIF_UBV_DIR` i
 - `ObjectDetector` uses NanoDet-M (NCNN) on host; ARM64 builds compile without
   `WITH_NCNN` and always return `nullopt` (smart_crop fallback).  Pass `--model_dir`
   with `--detect` (or `--detect_override`) to enable on-device detection.
-- Thumbnail crop priority: `--detect_override=false` → ONVIF bbox → NanoDet-M → smart_crop;
-  `--detect_override=true` → NanoDet-M → smart_crop (ONVIF bbox discarded).
+- Thumbnail crop modes (default → ONVIF bbox only; no bbox → full image stored uncropped):
+  - default: ONVIF bbox → crop; no bbox → full image
+  - `--detect`: ONVIF bbox → crop; no bbox → NanoDet-M → smart_crop
+  - `--detect_override`: always NanoDet-M → smart_crop (ONVIF bbox discarded)
 - NCNN is built from source via `rules_foreign_cc` cmake(); model files are downloaded
   by Bazel `http_file` rules (`nanodet_m_param`, `nanodet_m_bin`).
 

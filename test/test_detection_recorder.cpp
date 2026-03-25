@@ -1063,7 +1063,8 @@ static void test_thumbnail_crop_dimensions(const std::string& ubv_dir) {
   CHECK(ok, "thumb_crop_dims: timed out before all events arrived");
   if (!ok) return;
 
-  // cam108: snapshot_108.jpg 2560×1440 → smart_crop → 1440×1440
+  // cam108: snapshot_108.jpg 2560×1440; no ONVIF bbox, no detector →
+  // stored uncropped (full 2560×1440).
   {
     const std::string ubv_path =
         ubv_dir + "/" + ctx.cfg108.ip + "_thumbnails.ubv";
@@ -1079,15 +1080,16 @@ static void test_thumbnail_crop_dimensions(const std::string& ubv_dir) {
         bool ok_d = jpeg_dims(frames[i].jpeg, &w, &h);
         CHECK(ok_d, "thumb_crop_dims: cam108 frame " + std::to_string(i)
                     + " not a valid JPEG");
-        CHECK(w == 1440 && h == 1440,
+        CHECK(w == 2560 && h == 1440,
               "thumb_crop_dims: cam108 frame " + std::to_string(i)
-              + " expected 1440×1440, got "
+              + " expected 2560×1440, got "
               + std::to_string(w) + "×" + std::to_string(h));
       }
     }
   }
 
-  // cam109: snapshot_109.jpg 720×480 → smart_crop → 480×480
+  // cam109: snapshot_109.jpg 720×480; no ONVIF bbox, no detector →
+  // stored uncropped (full 720×480).
   {
     const std::string ubv_path =
         ubv_dir + "/" + ctx.cfg109.ip + "_thumbnails.ubv";
@@ -1103,9 +1105,9 @@ static void test_thumbnail_crop_dimensions(const std::string& ubv_dir) {
         bool ok_d = jpeg_dims(frames[i].jpeg, &w, &h);
         CHECK(ok_d, "thumb_crop_dims: cam109 frame " + std::to_string(i)
                     + " not a valid JPEG");
-        CHECK(w == 480 && h == 480,
+        CHECK(w == 720 && h == 480,
               "thumb_crop_dims: cam109 frame " + std::to_string(i)
-              + " expected 480×480, got "
+              + " expected 720×480, got "
               + std::to_string(w) + "×" + std::to_string(h));
       }
     }

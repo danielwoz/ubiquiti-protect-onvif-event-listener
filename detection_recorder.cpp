@@ -653,24 +653,30 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     std::vector<unsigned char> snapshot;
     if (db_->needs_snapshot() && !snap_url.empty()) {
       snapshot = fetch_snapshot(snap_url, snap_user, snap_pass);
-      // Crop snapshot.  Priority:
-      //   det_override=false: ONVIF bbox → detector → smart-crop heuristic
-      //   det_override=true : detector → smart-crop heuristic (ONVIF bbox ignored)
+      // Crop snapshot.
+      //   default (no detector):  ONVIF bbox → crop; no bbox → full image
+      //   --detect:               ONVIF bbox → crop; no bbox → NanoDet-M → smart-crop
+      //   --detect_override:      NanoDet-M → smart-crop (ONVIF bbox ignored)
       if (!snapshot.empty()) {
         int img_w = 0, img_h = 0;
         if (jpeg_read_dimensions(snapshot, &img_w, &img_h)) {
           const jpeg_crop::BoundingBox* onvif_bbox =
               (ev.bbox && !det_override) ? &*ev.bbox : nullptr;
           std::optional<jpeg_crop::BoundingBox> det_result;
-          if ((!onvif_bbox || det_override) && det_ptr)
+          if (det_ptr && (!onvif_bbox || det_override))
             det_result = det_ptr->detect(snapshot);
           const jpeg_crop::BoundingBox* det_bbox =
               det_result ? &*det_result : nullptr;
-          const jpeg_crop::BoundingBox box =
-              jpeg_crop::select_crop_box(img_w, img_h, onvif_bbox, det_bbox);
-          auto cropped = jpeg_crop::crop(snapshot, box);
-          if (!cropped.empty())
-            snapshot = std::move(cropped);
+          // Only crop when we have a basis: an ONVIF bbox, or a loaded
+          // detector (which may yield a result or fall back to smart-crop).
+          // Without either, store the full uncropped image.
+          if (onvif_bbox || det_ptr) {
+            const jpeg_crop::BoundingBox box =
+                jpeg_crop::select_crop_box(img_w, img_h, onvif_bbox, det_bbox);
+            auto cropped = jpeg_crop::crop(snapshot, box);
+            if (!cropped.empty())
+              snapshot = std::move(cropped);
+          }
         }
       }
     }
