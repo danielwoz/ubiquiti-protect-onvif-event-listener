@@ -1,6 +1,6 @@
 workspace(name = "onvif")
 
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
 
 # Abseil C++ — provides absl::Status / absl::StatusOr.
 http_archive(
@@ -25,12 +25,33 @@ pkg_config_library(name = "libcurl", pkg = "libcurl",
                       "-lgssapi_krb5", "-lssl", "-lcrypto",
                       "-Wl,--allow-multiple-definition"])
 pkg_config_library(name = "openssl",       pkg = "openssl")
-pkg_config_library(name = "sqlite3",       pkg = "sqlite3")
 pkg_config_library(name = "libmicrohttpd", pkg = "libmicrohttpd",
     extra_linkopts = ["-lgnutls", "-lhogweed", "-lnettle", "-lgmp",
                       "-ltasn1", "-lunistring", "-lp11-kit"])
 pkg_config_library(name = "libpq", pkg = "libpq",
     extra_linkopts = ["-lpgcommon", "-lpgport", "-lgssapi_krb5", "-lssl", "-lcrypto"])
+pkg_config_library(name = "libjpeg", pkg = "libjpeg")
+
+# NCNN — lightweight neural network inference for on-device object detection.
+http_archive(
+    name = "ncnn",
+    sha256 = "2fdc5c6e37f8552921a9daad498a1be54a6fa6edd32c1a9e3030b27fab253b47",
+    strip_prefix = "ncnn-20260113",
+    url = "https://github.com/Tencent/ncnn/archive/refs/tags/20260113.tar.gz",
+    build_file = "//third_party:ncnn.BUILD",
+)
+
+# NanoDet-M model files for object detection.
+http_file(
+    name = "nanodet_m_param",
+    sha256 = "8543dccd5604ded10d06bdb2b2f702f8f2f1dac09652c81750f21bf0a6e3f1a8",
+    urls = ["https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.param"],
+)
+http_file(
+    name = "nanodet_m_bin",
+    sha256 = "8d7f846cfc340a3ef66389f174a66819709f7182b9d35788ee1506679caac65e",
+    urls = ["https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.bin"],
+)
 
 # arm64 cross-compilation sysroot + toolchain.
 # Declares the repository; packages are downloaded only when --config=arm64

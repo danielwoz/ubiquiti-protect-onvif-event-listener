@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -433,6 +434,7 @@ struct Notification {
   std::string property_op;
   std::map<std::string, std::string> source;
   std::map<std::string, std::string> data;
+  std::optional<jpeg_crop::BoundingBox> bbox;
 };
 
 // -------------------------------------------------------
@@ -642,7 +644,7 @@ class CameraWorker {
       cb_(OnvifEvent{
         cfg_.ip, cfg_.user,
         n.topic, n.event_time, n.property_op,
-        n.source, n.data});
+        n.source, n.data, n.bbox});
     }
     return absl::OkStatus();
   }
@@ -697,6 +699,35 @@ class CameraWorker {
       };
       fill_items(".//tt:Source/tt:SimpleItem", n.source);
       fill_items(".//tt:Data/tt:SimpleItem",   n.data);
+
+      // Extract optional tt:BoundingBox from analytics events.
+      // ONVIF uses [-1,1] coordinate space; convert to normalised [0,1].
+      {
+        auto bb_obj = doc.xpath(".//tt:BoundingBox", msg_node);
+        if (bb_obj && bb_obj->nodesetval && bb_obj->nodesetval->nodeNr > 0) {
+          xmlNodePtr bb_node = bb_obj->nodesetval->nodeTab[0];
+          auto get_attr = [&](const char* attr) -> std::optional<float> {
+            xmlChar* v = xmlGetProp(bb_node, BAD_CAST attr);
+            if (!v) return std::nullopt;
+            float val = std::strtof(reinterpret_cast<char*>(v), nullptr);
+            xmlFree(v);
+            return val;
+          };
+          auto left   = get_attr("left");
+          auto top    = get_attr("top");
+          auto right  = get_attr("right");
+          auto bottom = get_attr("bottom");
+          if (left && top && right && bottom) {
+            jpeg_crop::BoundingBox bb;
+            bb.x = (*left   + 1.0f) / 2.0f;
+            bb.y = (*top    + 1.0f) / 2.0f;
+            bb.w = (*right  - *left)  / 2.0f;
+            bb.h = (*bottom - *top)   / 2.0f;
+            if (bb.w > 0.0f && bb.h > 0.0f)
+              n.bbox = bb;
+          }
+        }
+      }
 
       out.push_back(std::move(n));
     }

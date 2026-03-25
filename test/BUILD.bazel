@@ -149,6 +149,7 @@ cc_test(
         "testdata/snapshot_108.jpg",
         "testdata/snapshot_109.jpg",
     ],
+    linkstatic = True,
     deps = [
         "//:detection_recorder",
         "//:ubv_thumbnail",
@@ -178,6 +179,24 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
+filegroup(
+    name = "security_cam_outdoor_jpg",
+    srcs = ["testdata/security_cam_outdoor.jpg"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "security_cam_person_jpg",
+    srcs = ["testdata/security_cam_person.jpg"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "security_cam_vehicle_jpg",
+    srcs = ["testdata/security_cam_vehicle.jpg"],
+    visibility = ["//visibility:public"],
+)
+
 cc_binary(
     name = "bench_onvif_listener",
     srcs = ["bench_onvif_listener.cpp"],
@@ -190,4 +209,43 @@ cc_binary(
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
     ],
+)
+
+cc_binary(
+    name = "bench_jpeg_crop",
+    srcs = ["bench_jpeg_crop.cpp"],
+    args = ["$(location //test:security_cam_outdoor_jpg)"],
+    data = [
+        "//test:security_cam_outdoor_jpg",
+        "//test:security_cam_person_jpg",
+        "//test:security_cam_vehicle_jpg",
+    ],
+    deps = ["//:jpeg_crop"],
+)
+
+cc_binary(
+    name = "gen_examples",
+    srcs = ["gen_examples.cpp"],
+    deps = [
+        "//:jpeg_crop",
+        "//:object_detect",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_binary(
+    name = "bench_object_detect",
+    srcs = ["bench_object_detect.cpp"],
+    args = [
+        "$(location @nanodet_m_param//file)",
+        "$(location @nanodet_m_bin//file)",
+        "$(location //test:security_cam_outdoor_jpg)",
+    ],
+    data = [
+        "@nanodet_m_param//file",
+        "@nanodet_m_bin//file",
+        "//test:security_cam_outdoor_jpg",
+    ],
+    deps = ["//:object_detect"],
 )

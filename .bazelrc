@@ -25,3 +25,25 @@ build:pgo_instrument --linkopt=-fprofile-instr-generate
 # ThinLTO -- fast whole-program optimisation; combine with pgo_optimize.
 build:lto --copt=-flto=thin
 build:lto --linkopt=-flto=thin
+
+# Sanitizer builds -- requires --config=clang; incompatible with each other
+# and with --config=arm64.
+# Usage:
+#   bazel test --config=clang --config=asan //test:all
+#   bazel test --config=clang --config=tsan //test:all
+#   bazel test --config=clang --config=msan //test:all   # needs instrumented libc
+build:asan --copt=-fsanitize=address
+build:asan --linkopt=-fsanitize=address
+build:asan --copt=-fno-omit-frame-pointer
+build:asan --copt=-O1
+
+build:tsan --copt=-fsanitize=thread
+build:tsan --linkopt=-fsanitize=thread
+build:tsan --copt=-fno-omit-frame-pointer
+build:tsan --copt=-O1
+
+build:msan --copt=-fsanitize=memory
+build:msan --linkopt=-fsanitize=memory
+build:msan --copt=-fno-omit-frame-pointer
+build:msan --copt=-fsanitize-memory-track-origins
+build:msan --copt=-O1

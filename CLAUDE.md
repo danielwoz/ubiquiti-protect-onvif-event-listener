@@ -25,6 +25,13 @@ bazel run //test:test_ubv_thumbnail  -- /path/to/file.ubv
 bazel run //test:bench_onvif_listener
 bazel run //test:bench_onvif_listener -- 100000   # custom event count
 
+# JPEG crop benchmark (single core)
+bazel run //test:bench_jpeg_crop                  # uses security_cam_outdoor.jpg
+
+# Object detection benchmark (single core, 100 iterations)
+# Model files are downloaded automatically by Bazel via http_file rules.
+bazel run //test:bench_object_detect
+
 # PGO + ThinLTO optimised build (x86)
 make pgo-bench-x86                   # baseline → instrument → profile → optimised
 make pgo-bench-x86 PGO_EVENTS=100000
@@ -56,10 +63,19 @@ Key rules in practice:
 
 ```
 onvif_listener.hpp/.cpp       — WS-PullPoint ONVIF subscription library
+                                  Parses tt:BoundingBox from ONVIF analytics events
 detection_recorder.hpp/.cpp   — Detection → SQLite/PostgreSQL recorder
+                                  Crops thumbnails: ONVIF bbox → ML detect → smart crop
 ubv_thumbnail.hpp/.cpp        — UBV container encode/decode (thumbnail storage)
+jpeg_crop.hpp/.cpp            — JPEG decode/crop/re-encode via libjpeg
+object_detect.hpp/.cpp        — NanoDet-M on-device object detection via NCNN
+                                  Guarded by WITH_NCNN; stub returns nullopt without NCNN
 unifi_camera_config.hpp/.cpp  — Load camera credentials from UniFi Protect DB
 main.cpp                      — Binary entry point
+
+third_party/
+  ncnn.BUILD                  — filegroup for NCNN source archive
+  BUILD.bazel                 — rules_foreign_cc cmake() target building libncnn.a
 
 test/
   onvif_camera_emulator.hpp/.cpp  — libmicrohttpd fake camera base class
@@ -67,21 +83,24 @@ test/
   test_onvif_listener.cpp         — Listener integration test
   test_detection_recorder.cpp     — Detection recorder e2e test
   test_ubv_thumbnail.cpp          — UBV round-trip test
+  bench_onvif_listener.cpp        — ONVIF parsing throughput benchmark
+  bench_jpeg_crop.cpp             — JPEG crop throughput benchmark
+  bench_object_detect.cpp         — NanoDet-M inference latency benchmark
   testdata/
-    snapshot_108.jpg                  — Real JPEG from cam 192.168.1.108
-    snapshot_109.jpg                  — Real JPEG from cam 192.168.1.109
-    onvif_raw_20260219_085752.jsonl   — Canonical raw SOAP log for listener tests
+    snapshot_108.jpg              — Real JPEG from cam 192.168.1.108
+    snapshot_109.jpg              — Real JPEG from cam 192.168.1.109
+    security_cam_outdoor.jpg      — 1562×1020 outdoor CCTV (public domain, Wikimedia)
+    security_cam_person.jpg       — 2750×4080 indoor CCTV person (public domain)
+    security_cam_vehicle.jpg      — 1050×656 outdoor CCTV vehicle (public domain)
 ```
 
-## Database backends
+## Database backend
 
-`DetectionRecorder` supports two backends selected at runtime via `ONVIF_DB_BACKEND`:
+`DetectionRecorder` uses **PostgreSQL** (the UniFi Protect database). Thumbnails are
+inserted directly into the `thumbnails` table as `bytea` with a 24-char hex `id` so
+UniFi Protect's UI routes them correctly (IDs of length ≠ 24 go to msp TCP and fail).
 
-- **SQLite** (default): writes to a local `.db` file; thumbnails stored in per-camera
-  `.ubv` files under `ONVIF_UBV_DIR` (default: `thumbnails/`).
-- **PostgreSQL**: writes to the UniFi Protect database; thumbnails inserted directly
-  into the `thumbnails` table as `bytea` with a 24-char hex `id` so UniFi Protect's
-  UI routes them correctly (IDs of length ≠ 24 go to msp TCP and fail).
+Optionally, per-camera UBV thumbnail files are also written to `ONVIF_UBV_DIR` if set.
 
 ## Key architectural notes
 
@@ -94,6 +113,13 @@ test/
   the PostgreSQL backend to set `cameraId` and generate thumbnail IDs.
 - Detection mapping: ONVIF `"Human"` → `"person"`, `"Vehicle"` → `"vehicle"`.
 - `"end"` must be double-quoted in SQL (reserved word).
+- Thumbnail crop priority: ONVIF `tt:BoundingBox` (if w>0 && h>0) → ML detector
+  (`ObjectDetector::detect()`) → smart_crop heuristic (square at 60% vertical centre).
+- `ObjectDetector` uses NanoDet-M (NCNN) on host; ARM64 builds compile without
+  `WITH_NCNN` and always return `nullopt` (smart_crop fallback).  Set `ONVIF_MODEL_DIR`
+  at runtime so `main.cpp` loads the model; if absent, smart_crop is used silently.
+- NCNN is built from source via `rules_foreign_cc` cmake(); model files are downloaded
+  by Bazel `http_file` rules (`nanodet_m_param`, `nanodet_m_bin`).
 
 ## Pre-push checklist
 
@@ -128,10 +154,10 @@ make pgo-bench-x86
 
 | Variable | Default | Description |
 |---|---|---|
-| `ONVIF_DB_BACKEND` | `sqlite` | `sqlite` or `postgres` |
-| `ONVIF_DB_CONN` | `onvif_detections.db` | SQLite path or libpq conninfo |
-| `ONVIF_DB_HOST` | `127.0.0.1` | Host for the Protect PostgreSQL camera DB (postgres backend defaults to Unix socket `/run/postgresql`) |
-| `ONVIF_UBV_DIR` | `thumbnails` | Directory for UBV thumbnail files (SQLite only) |
+| `ONVIF_DB_CONN` | _(local socket)_ | libpq conninfo (default: `host=/run/postgresql port=5433 dbname=unifi-protect user=postgres`) |
+| `ONVIF_DB_HOST` | _(Unix socket)_ | Host for the Protect PostgreSQL camera DB |
+| `ONVIF_UBV_DIR` | _(unset)_ | If set, also write per-camera UBV thumbnail files to this directory |
 | `ONVIF_PRE_BUFFER_SEC` | `2` | Seconds before first detection event |
 | `ONVIF_POST_BUFFER_SEC` | `2` | Seconds after last detection event |
 | `ONVIF_VERBOSE` | _(unset)_ | Set to `1` to enable verbose logging (lifecycle, events, renewals) |
+| `ONVIF_MODEL_DIR` | _(unset)_ | Directory containing `nanodet_m.param` and `nanodet_m.bin`; if unset, smart_crop heuristic is used |

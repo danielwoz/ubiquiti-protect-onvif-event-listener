@@ -22,9 +22,10 @@
  *   - serves scripted SOAP PullMessages responses (ONVIF events)
  *   - serves a real JPEG snapshot at GET /snapshot
  *
- * After the listener collects all events the following are verified:
+ * After the listener collects all events the following are verified via an
+ * in-memory MockBackend (no PostgreSQL required):
  *
- *   SQLite -- events table
+ *   events table (MockBackend::events)
  *     * 3 rows total (Human x2 + Vehicle x1)
  *     * all type = 'smartDetectZone'
  *     * all "end" IS NOT NULL (no open/orphaned rows)
@@ -32,11 +33,14 @@
  *     * all thumbnailId IS NOT NULL
  *     * per-camera counts correct
  *
- *   SQLite -- smartDetectObjects table
+ *   smartDetectObjects table (MockBackend::sdos)
  *     * 3 rows total
  *     * 2 x type='person', 1 x type='vehicle'
- *     * all detectedAt > 0
  *     * all eventId references exist in events
+ *
+ *   smartDetectRaws table (MockBackend::sdrs)
+ *     * 3 rows total
+ *     * 2 x objectType="person", 1 x objectType="vehicle"
  *
  *   UBV thumbnail files
  *     * cam108 file: 2 frames (human start + vehicle start)
@@ -44,7 +48,9 @@
  *     * every frame contains valid JPEG bytes (FF D8 magic)
  */
 
-#include <sqlite3.h>
+#include <stddef.h>   // for size_t (needed before jpeglib.h)
+#include <stdio.h>    // for FILE (needed before jpeglib.h)
+#include <jpeglib.h>
 
 #include <atomic>
 #include <chrono>
@@ -145,6 +151,46 @@ static std::string make_field_detector_response(
     "<tt:Data>"
     "<tt:SimpleItem Name=\"IsInside\" Value=\"" + val + "\"/>"
     "</tt:Data>"
+    "</tt:Message>"
+    "</wsnt:Message>"
+    "</wsnt:NotificationMessage>"
+    "</tev:PullMessagesResponse>"
+    "</s:Body>"
+    "</s:Envelope>";
+}
+
+// Camera 108 style with ONVIF BoundingBox in the analytics event.
+// Coords are in ONVIF [-1,1] space; the listener converts them to [0,1].
+static std::string make_field_detector_with_bbox_response(
+  const std::string& rule,
+  bool               inside,
+  const std::string& utc_time,
+  float left_v, float top_v, float right_v, float bottom_v) {
+  const std::string val = inside ? "true" : "false";
+  char bbox_buf[256];
+  std::snprintf(bbox_buf, sizeof(bbox_buf),
+    "<tt:BoundingBox left=\"%.3f\" top=\"%.3f\" right=\"%.3f\" bottom=\"%.3f\"/>",
+    left_v, top_v, right_v, bottom_v);
+  return
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+    "<s:Envelope"
+    " xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\""
+    " xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\""
+    " xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\""
+    " xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+    "<s:Body>"
+    "<tev:PullMessagesResponse>"
+    "<wsnt:NotificationMessage>"
+    "<wsnt:Topic>tns1:RuleEngine/FieldDetector/ObjectsInside</wsnt:Topic>"
+    "<wsnt:Message>"
+    "<tt:Message UtcTime=\"" + utc_time + "\" PropertyOperation=\"Changed\">"
+    "<tt:Source>"
+    "<tt:SimpleItem Name=\"Rule\" Value=\"" + rule + "\"/>"
+    "</tt:Source>"
+    "<tt:Data>"
+    "<tt:SimpleItem Name=\"IsInside\" Value=\"" + val + "\"/>"
+    "</tt:Data>"
+    + std::string(bbox_buf) +
     "</tt:Message>"
     "</wsnt:Message>"
     "</wsnt:NotificationMessage>"
@@ -331,22 +377,116 @@ static std::string source_dir() {
   return (slash != std::string::npos) ? f.substr(0, slash + 1) : "./";
 }
 
-// Run a SQLite query returning the integer value of the first column of the
-// first row, or -1 on error.
-static int db_count(sqlite3* db, const char* sql) {
-  sqlite3_stmt* stmt = nullptr;
-  if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) return -1;
-  int val = (sqlite3_step(stmt) == SQLITE_ROW) ? sqlite3_column_int(stmt, 0) : -1;
-  sqlite3_finalize(stmt);
-  return val;
+// Read JPEG dimensions from header only (no full decompress).
+// Returns false on error.
+static bool jpeg_dims(const std::vector<uint8_t>& data, int* w, int* h) {
+  struct JpegErr {
+    jpeg_error_mgr base;  // must be first
+    bool           fatal{false};
+  } err;
+  jpeg_decompress_struct info{};
+  info.err = jpeg_std_error(&err.base);
+  err.base.error_exit = [](j_common_ptr c) {
+    reinterpret_cast<JpegErr*>(c->err)->fatal = true;
+  };
+  err.base.output_message = [](j_common_ptr) {};
+  jpeg_create_decompress(&info);
+  jpeg_mem_src(&info,
+               const_cast<unsigned char*>(
+                   reinterpret_cast<const unsigned char*>(data.data())),
+               static_cast<unsigned long>(data.size()));  // NOLINT(runtime/int)
+  jpeg_read_header(&info, TRUE);
+  *w = static_cast<int>(info.image_width);
+  *h = static_cast<int>(info.image_height);
+  jpeg_destroy_decompress(&info);
+  return !err.fatal && *w > 0 && *h > 0;
 }
+
+// ============================================================
+// MockBackend -- in-memory IDbBackend for testing.
+//
+// All mutating methods are called under DetectionRecorder::mu_ so no
+// additional locking is needed here.
+// ============================================================
+struct MockBackend : onvif::DetectionRecorder::IDbBackend {
+  struct EventRow {
+    std::string id;
+    std::string camera_ip;
+    std::string sdt_json;   // e.g. '["person"]'
+    std::string thumb_id;
+    uint64_t    start_ms{0};
+    bool        ended{false};
+    uint64_t    end_ms{0};
+  };
+  struct SdoRow {
+    std::string id;
+    std::string event_id;
+    std::string camera_ip;
+    std::string obj_type;   // "person" or "vehicle"
+  };
+  struct SdrRow {
+    std::string id;
+    std::string camera_ip;
+    std::string obj_type;
+    uint64_t    ts_ms{0};
+  };
+
+  std::vector<EventRow> events;
+  std::vector<SdoRow>   sdos;
+  std::vector<SdrRow>   sdrs;
+
+  absl::Status create_schema() override { return absl::OkStatus(); }
+
+  void register_camera(const std::string&, const std::string&,
+                       const std::string&) override {}
+
+  std::string make_thumbnail_id(const std::string& ip, uint64_t ts_ms) override {
+    return ip + "-" + std::to_string(ts_ms);
+  }
+
+  bool needs_snapshot() const override { return true; }
+
+  void insert_event(const std::string& id, uint64_t ts_ms,
+                    const std::string& camera_ip, const std::string& sdt_json,
+                    const std::string& thumb_id,
+                    const std::string& /*now_str*/) override {
+    events.push_back({id, camera_ip, sdt_json, thumb_id, ts_ms, false, 0});
+  }
+
+  void insert_sdo(const std::string& id, const std::string& event_id,
+                  const std::string& /*thumb_id*/, const std::string& camera_ip,
+                  const std::string& obj_type, const std::string& /*attributes*/,
+                  uint64_t /*ts_ms*/, const std::string& /*now_str*/) override {
+    sdos.push_back({id, event_id, camera_ip, obj_type});
+  }
+
+  void update_event_end(const std::string& event_id, uint64_t end_ms,
+                        const std::string& /*now_str*/) override {
+    for (auto& e : events)
+      if (e.id == event_id) { e.ended = true; e.end_ms = end_ms; break; }
+  }
+
+  void write_thumbnail(const std::string& /*thumb_id*/,
+                       const std::string& /*event_id*/,
+                       const std::string& /*camera_ip*/,
+                       uint64_t           /*ts_ms*/,
+                       const std::string& /*now_str*/,
+                       const std::vector<unsigned char>& /*jpeg*/) override {}
+
+  void insert_smart_detect_raw(const std::string& id,
+                               const std::string& camera_ip,
+                               uint64_t ts_ms,
+                               const std::string& obj_type,
+                               const std::string& /*now_str*/) override {
+    sdrs.push_back({id, camera_ip, obj_type, ts_ms});
+  }
+};
 
 // ============================================================
 // Shared emulator / listener helper
 // ============================================================
 
 struct TestContext {
-  std::string                      db_path;
   std::string                      ubv_dir;
   onvif::CameraConfig              cfg108;
   onvif::CameraConfig              cfg109;
@@ -429,16 +569,16 @@ static bool run_standard_script(TestContext& ctx,
 // ============================================================
 // Tests
 // ============================================================
-static void test_detection_e2e(const std::string& db_path,
-                                const std::string& ubv_dir) {
+static void test_detection_e2e(const std::string& ubv_dir) {
   TestContext ctx;
-  ctx.db_path = db_path;
   ctx.ubv_dir = ubv_dir;
 
-  // 2 s pre + 2 s post (defaults)
-  auto rec_or = onvif::DetectionRecorder::Create(onvif::DbBackend::SQLite, db_path);
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
   if (!rec_or.ok()) {
-    CHECK(false, std::string("DetectionRecorder::Create failed: ")
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
                  + std::string(rec_or.status().message()));
     return;
   }
@@ -448,95 +588,103 @@ static void test_detection_e2e(const std::string& db_path,
   CHECK(ok, "timed out before all detection events arrived");
 
   // =========================================================
-  // Verify SQLite -- events table
+  // Verify events
   // =========================================================
-  sqlite3* db = nullptr;
-  sqlite3_open(db_path.c_str(), &db);
-
-  int total_events = db_count(db, "SELECT COUNT(*) FROM events;");
+  int total_events = static_cast<int>(bptr->events.size());
   CHECK(total_events == 3,
         "expected 3 event rows, got " + std::to_string(total_events));
 
-  int open_events = db_count(db,
-    "SELECT COUNT(*) FROM events WHERE \"end\" IS NULL;");
+  int open_events = 0;
+  for (auto& e : bptr->events) if (!e.ended) ++open_events;
   CHECK(open_events == 0,
         "expected 0 open events (no NULL end), got " + std::to_string(open_events));
 
-  int zone_events = db_count(db,
-    "SELECT COUNT(*) FROM events WHERE type='smartDetectZone';");
-  CHECK(zone_events == 3,
-        "expected 3 smartDetectZone events, got " + std::to_string(zone_events));
-
-  int person_events = db_count(db,
-    "SELECT COUNT(*) FROM events WHERE smartDetectTypes='[\"person\"]';");
+  int person_events = 0, vehicle_events = 0;
+  for (auto& e : bptr->events) {
+    if (e.sdt_json == "[\"person\"]")  ++person_events;
+    if (e.sdt_json == "[\"vehicle\"]") ++vehicle_events;
+  }
   CHECK(person_events == 2,
         "expected 2 person events, got " + std::to_string(person_events));
-
-  int vehicle_events = db_count(db,
-    "SELECT COUNT(*) FROM events WHERE smartDetectTypes='[\"vehicle\"]';");
   CHECK(vehicle_events == 1,
         "expected 1 vehicle event, got " + std::to_string(vehicle_events));
 
-  int no_thumb = db_count(db,
-    "SELECT COUNT(*) FROM events WHERE thumbnailId IS NULL;");
+  int no_thumb = 0;
+  for (auto& e : bptr->events) if (e.thumb_id.empty()) ++no_thumb;
   CHECK(no_thumb == 0,
         "expected all events to have thumbnailId, got "
         + std::to_string(no_thumb) + " without");
 
-  {
-    std::string sql = "SELECT COUNT(*) FROM events WHERE cameraId='"
-                      + ctx.cfg108.ip + "';";
-    int n = db_count(db, sql.c_str());
-    CHECK(n == 2, "expected 2 events for cam108, got " + std::to_string(n));
+  int cam108_events = 0, cam109_events = 0;
+  for (auto& e : bptr->events) {
+    if (e.camera_ip == ctx.cfg108.ip) ++cam108_events;
+    if (e.camera_ip == ctx.cfg109.ip) ++cam109_events;
   }
-  {
-    std::string sql = "SELECT COUNT(*) FROM events WHERE cameraId='"
-                      + ctx.cfg109.ip + "';";
-    int n = db_count(db, sql.c_str());
-    CHECK(n == 1, "expected 1 event for cam109, got " + std::to_string(n));
-  }
+  CHECK(cam108_events == 2,
+        "expected 2 events for cam108, got " + std::to_string(cam108_events));
+  CHECK(cam109_events == 1,
+        "expected 1 event for cam109, got " + std::to_string(cam109_events));
 
   // =========================================================
-  // Verify SQLite -- smartDetectObjects table
+  // Verify smartDetectObjects
   // =========================================================
-  int total_sdo = db_count(db, "SELECT COUNT(*) FROM smartDetectObjects;");
+  int total_sdo = static_cast<int>(bptr->sdos.size());
   CHECK(total_sdo == 3,
         "expected 3 smartDetectObject rows, got " + std::to_string(total_sdo));
 
-  int person_sdo = db_count(db,
-    "SELECT COUNT(*) FROM smartDetectObjects WHERE type='person';");
+  int person_sdo = 0, vehicle_sdo = 0;
+  for (auto& s : bptr->sdos) {
+    if (s.obj_type == "person")  ++person_sdo;
+    if (s.obj_type == "vehicle") ++vehicle_sdo;
+  }
   CHECK(person_sdo == 2,
         "expected 2 person SDOs, got " + std::to_string(person_sdo));
-
-  int vehicle_sdo = db_count(db,
-    "SELECT COUNT(*) FROM smartDetectObjects WHERE type='vehicle';");
   CHECK(vehicle_sdo == 1,
         "expected 1 vehicle SDO, got " + std::to_string(vehicle_sdo));
 
-  int zero_detect = db_count(db,
-    "SELECT COUNT(*) FROM smartDetectObjects WHERE detectedAt = 0;");
-  CHECK(zero_detect == 0,
-        "expected all SDOs to have non-zero detectedAt");
-
-  int orphan_sdo = db_count(db,
-    "SELECT COUNT(*) FROM smartDetectObjects"
-    " WHERE eventId NOT IN (SELECT id FROM events);");
+  // all eventIds must reference a known event
+  int orphan_sdo = 0;
+  for (auto& s : bptr->sdos) {
+    bool found = false;
+    for (auto& e : bptr->events) if (e.id == s.event_id) { found = true; break; }
+    if (!found) ++orphan_sdo;
+  }
   CHECK(orphan_sdo == 0,
         "expected no orphan SDO rows, got " + std::to_string(orphan_sdo));
+
+  // =========================================================
+  // Verify smartDetectRaws
+  // =========================================================
+  int total_sdr = static_cast<int>(bptr->sdrs.size());
+  CHECK(total_sdr == 3,
+        "expected 3 smartDetectRaws rows, got " + std::to_string(total_sdr));
+
+  int person_sdr = 0, vehicle_sdr = 0;
+  for (auto& s : bptr->sdrs) {
+    if (s.obj_type == "person")  ++person_sdr;
+    if (s.obj_type == "vehicle") ++vehicle_sdr;
+  }
+  CHECK(person_sdr == 2,
+        "expected 2 person smartDetectRaws rows, got " + std::to_string(person_sdr));
+  CHECK(vehicle_sdr == 1,
+        "expected 1 vehicle smartDetectRaws row, got " + std::to_string(vehicle_sdr));
+
+  int sdr_zero_ts = 0;
+  for (auto& s : bptr->sdrs) if (s.ts_ms == 0) ++sdr_zero_ts;
+  CHECK(sdr_zero_ts == 0,
+        "expected all smartDetectRaws rows to have non-zero timestamp");
 
   // =========================================================
   // Verify buffer padding: end - start >= pre_buffer + post_buffer (4000 ms)
   // =========================================================
   {
-    // With default 2 s pre + 2 s post the stored span must be >= 4000 ms.
-    int padded = db_count(db,
-      "SELECT COUNT(*) FROM events WHERE (\"end\" - start) >= 4000;");
+    int padded = 0;
+    for (auto& e : bptr->events)
+      if (e.ended && (e.end_ms - e.start_ms) >= 4000) ++padded;
     CHECK(padded == 3,
           "expected all 3 events to have end-start >= 4000 ms (2s pre + 2s post), got "
           + std::to_string(padded));
   }
-
-  sqlite3_close(db);
 
   // =========================================================
   // Verify UBV thumbnail files
@@ -586,51 +734,46 @@ static void test_detection_e2e(const std::string& db_path,
 // ============================================================
 // Buffer padding test -- custom pre/post values
 // ============================================================
-static void test_buffer_padding(const std::string& db_path,
-                                const std::string& ubv_dir) {
+static void test_buffer_padding(const std::string& ubv_dir) {
   TestContext ctx;
-  ctx.db_path = db_path;
   ctx.ubv_dir = ubv_dir;
 
   const uint32_t pre_sec  = 1;
   const uint32_t post_sec = 3;
   const uint64_t min_span = (pre_sec + post_sec) * 1000;  // 4000 ms
 
-  auto rec_or2 = onvif::DetectionRecorder::Create(onvif::DbBackend::SQLite, db_path);
-  if (!rec_or2.ok()) {
-    CHECK(false, std::string("DetectionRecorder::Create failed: ")
-                 + std::string(rec_or2.status().message()));
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
     return;
   }
-  onvif::DetectionRecorder& recorder = **rec_or2;
+  onvif::DetectionRecorder& recorder = **rec_or;
   recorder.set_buffer(pre_sec, post_sec);
 
   bool ok = run_standard_script(ctx, recorder);
   CHECK(ok, "buffer test: timed out before all events arrived");
 
-  sqlite3* db = nullptr;
-  sqlite3_open(db_path.c_str(), &db);
-
   // All events must have end-start >= pre+post ms.
-  std::string sql = "SELECT COUNT(*) FROM events"
-                    " WHERE (\"end\" - start) >= " + std::to_string(min_span) + ";";
-  int padded = db_count(db, sql.c_str());
+  int padded = 0;
+  for (auto& e : bptr->events)
+    if (e.ended && (e.end_ms - e.start_ms) >= min_span) ++padded;
   CHECK(padded == 3,
         "expected all 3 events span >= " + std::to_string(min_span)
         + " ms (1s pre + 3s post), got " + std::to_string(padded));
 
   // end-start should NOT be >= (pre+post+1)*1000 -- sanity upper-bound
   // (events arrive in rapid succession so the raw interval is well under 1 s).
-  std::string sql_upper = "SELECT COUNT(*) FROM events"
-                          " WHERE (\"end\" - start) >= "
-                          + std::to_string(min_span + 1000) + ";";
-  int over = db_count(db, sql_upper.c_str());
+  int over = 0;
+  for (auto& e : bptr->events)
+    if (e.ended && (e.end_ms - e.start_ms) >= min_span + 1000) ++over;
   CHECK(over == 0,
         "expected no events with span >= " + std::to_string(min_span + 1000)
         + " ms (raw detection too short to reach that), got "
         + std::to_string(over));
-
-  sqlite3_close(db);
 }
 
 // ============================================================
@@ -676,22 +819,20 @@ static bool run_single_camera(SnapshotSyntheticEmulator& emu,
 
 // ============================================================
 // CellMotionDetector classification test
-//
-// Verifies that tns1:RuleEngine/CellMotionDetector/Motion events are
-// classified as person detections (IsMotion=true → start, false → end).
 // ============================================================
-static void test_cell_motion_classification(const std::string& db_path,
-                                             const std::string& ubv_dir) {
-  auto rec_or = onvif::DetectionRecorder::Create(onvif::DbBackend::SQLite, db_path);
+static void test_cell_motion_classification(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
   if (!rec_or.ok()) {
-    CHECK(false, std::string("DetectionRecorder::Create failed: ")
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
                  + std::string(rec_or.status().message()));
     return;
   }
   onvif::DetectionRecorder& recorder = **rec_or;
   recorder.set_ubv_dir(ubv_dir);
 
-  // Single camera emulator with scripted cell-motion responses.
   const std::string real_ip = "192.168.1.200";
   auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
   SnapshotSyntheticEmulator emu(real_ip,
@@ -738,32 +879,30 @@ static void test_cell_motion_classification(const std::string& db_path,
   CHECK(!timed_out, "timed out waiting for cell-motion events");
   CHECK(events_seen.load() >= 2, "expected >= 2 cell-motion events");
 
-  sqlite3* db = nullptr;
-  sqlite3_open(db_path.c_str(), &db);
-
-  int events = db_count(db, "SELECT COUNT(*) FROM events;");
+  int events = static_cast<int>(bptr->events.size());
   CHECK(events == 1, "expected 1 detection interval, got " + std::to_string(events));
 
-  int person_sdo = db_count(db,
-    "SELECT COUNT(*) FROM smartDetectObjects WHERE type='person';");
+  int person_sdo = 0;
+  for (auto& s : bptr->sdos) if (s.obj_type == "person") ++person_sdo;
   CHECK(person_sdo == 1,
         "expected 1 person SDO from CellMotionDetector, got "
         + std::to_string(person_sdo));
 
-  sqlite3_close(db);
+  int sdr = static_cast<int>(bptr->sdrs.size());
+  CHECK(sdr == 1,
+        "cell_motion: expected 1 smartDetectRaws row, got " + std::to_string(sdr));
 }
 
 // ============================================================
 // MotionAlarm fallback test
-//
-// A camera that only emits VideoSource/MotionAlarm (no CellMotionDetector,
-// no AI events) should still produce a detection.
 // ============================================================
-static void test_motion_alarm_fallback(const std::string& db_path,
-                                        const std::string& ubv_dir) {
-  auto rec_or = onvif::DetectionRecorder::Create(onvif::DbBackend::SQLite, db_path);
+static void test_motion_alarm_fallback(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
   if (!rec_or.ok()) {
-    CHECK(false, std::string("DetectionRecorder::Create failed: ")
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
                  + std::string(rec_or.status().message()));
     return;
   }
@@ -780,41 +919,38 @@ static void test_motion_alarm_fallback(const std::string& db_path,
   bool ok = run_single_camera(emu, recorder, 2);
   CHECK(ok, "motion_alarm_fallback: timed out");
 
-  sqlite3* db = nullptr;
-  sqlite3_open(db_path.c_str(), &db);
-
-  int events = db_count(db, "SELECT COUNT(*) FROM events;");
+  int events = static_cast<int>(bptr->events.size());
   CHECK(events == 1,
         "motion_alarm_fallback: expected 1 detection, got " + std::to_string(events));
 
-  int person_sdo = db_count(db,
-    "SELECT COUNT(*) FROM smartDetectObjects WHERE type='person';");
+  int person_sdo = 0;
+  for (auto& s : bptr->sdos) if (s.obj_type == "person") ++person_sdo;
   CHECK(person_sdo == 1,
         "motion_alarm_fallback: expected 1 person SDO, got "
         + std::to_string(person_sdo));
 
-  sqlite3_close(db);
+  int sdr = static_cast<int>(bptr->sdrs.size());
+  CHECK(sdr == 1,
+        "motion_alarm_fallback: expected 1 smartDetectRaws row, got "
+        + std::to_string(sdr));
 }
 
 // ============================================================
 // CellMotionDetector suppresses MotionAlarm test
-//
-// When both CellMotionDetector and MotionAlarm fire for the same camera,
-// only CellMotionDetector should produce a detection (MotionAlarm is suppressed).
 // ============================================================
-static void test_cell_motion_suppresses_alarm(const std::string& db_path,
-                                               const std::string& ubv_dir) {
-  auto rec_or = onvif::DetectionRecorder::Create(onvif::DbBackend::SQLite, db_path);
+static void test_cell_motion_suppresses_alarm(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
   if (!rec_or.ok()) {
-    CHECK(false, std::string("DetectionRecorder::Create failed: ")
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
                  + std::string(rec_or.status().message()));
     return;
   }
   onvif::DetectionRecorder& recorder = **rec_or;
   recorder.set_ubv_dir(ubv_dir);
 
-  // Script: CellMotion(true) then MotionAlarm(true) then both false.
-  // MotionAlarm events should be silently ignored.
   auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
   SnapshotSyntheticEmulator emu("192.168.1.202",
     {make_cell_motion_response(true,  "2026-03-22T10:01:00Z"),
@@ -827,43 +963,39 @@ static void test_cell_motion_suppresses_alarm(const std::string& db_path,
   bool ok = run_single_camera(emu, recorder, 4);
   CHECK(ok, "cell_motion_suppresses_alarm: timed out");
 
-  sqlite3* db = nullptr;
-  sqlite3_open(db_path.c_str(), &db);
-
-  int events = db_count(db, "SELECT COUNT(*) FROM events;");
+  int events = static_cast<int>(bptr->events.size());
   CHECK(events == 1,
         "cell_motion_suppresses_alarm: expected 1 detection (not 2), got "
         + std::to_string(events));
 
-  int open_events = db_count(db,
-    "SELECT COUNT(*) FROM events WHERE \"end\" IS NULL;");
+  int open_events = 0;
+  for (auto& e : bptr->events) if (!e.ended) ++open_events;
   CHECK(open_events == 0,
         "cell_motion_suppresses_alarm: expected 0 open events, got "
         + std::to_string(open_events));
 
-  sqlite3_close(db);
+  int sdr = static_cast<int>(bptr->sdrs.size());
+  CHECK(sdr == 1,
+        "cell_motion_suppresses_alarm: expected 1 smartDetectRaws row (not 2), got "
+        + std::to_string(sdr));
 }
 
 // ============================================================
 // AI events suppress CellMotionDetector test
-//
-// When a camera emits both AI events (FieldDetector) and CellMotionDetector,
-// only the AI events should produce a detection (CellMotionDetector suppressed).
-// This exercises the PTZ-patrol false-positive suppression path.
 // ============================================================
-static void test_ai_suppresses_cell_motion(const std::string& db_path,
-                                            const std::string& ubv_dir) {
-  auto rec_or = onvif::DetectionRecorder::Create(onvif::DbBackend::SQLite, db_path);
+static void test_ai_suppresses_cell_motion(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
   if (!rec_or.ok()) {
-    CHECK(false, std::string("DetectionRecorder::Create failed: ")
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
                  + std::string(rec_or.status().message()));
     return;
   }
   onvif::DetectionRecorder& recorder = **rec_or;
   recorder.set_ubv_dir(ubv_dir);
 
-  // Script: AI event first, then CellMotion events.
-  // CellMotion should be suppressed after the first AI event is seen.
   auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
   SnapshotSyntheticEmulator emu("192.168.1.203",
     {make_field_detector_response("Human", true,  "2026-03-22T10:02:00Z"),
@@ -876,60 +1008,207 @@ static void test_ai_suppresses_cell_motion(const std::string& db_path,
   bool ok = run_single_camera(emu, recorder, 4);
   CHECK(ok, "ai_suppresses_cell_motion: timed out");
 
-  sqlite3* db = nullptr;
-  sqlite3_open(db_path.c_str(), &db);
-
-  int events = db_count(db, "SELECT COUNT(*) FROM events;");
+  int events = static_cast<int>(bptr->events.size());
   CHECK(events == 1,
         "ai_suppresses_cell_motion: expected 1 detection (AI only, not 2), got "
         + std::to_string(events));
 
-  int open_events = db_count(db,
-    "SELECT COUNT(*) FROM events WHERE \"end\" IS NULL;");
+  int open_events = 0;
+  for (auto& e : bptr->events) if (!e.ended) ++open_events;
   CHECK(open_events == 0,
         "ai_suppresses_cell_motion: expected 0 open events, got "
         + std::to_string(open_events));
 
-  int person_sdo = db_count(db,
-    "SELECT COUNT(*) FROM smartDetectObjects WHERE type='person';");
+  int person_sdo = 0;
+  for (auto& s : bptr->sdos) if (s.obj_type == "person") ++person_sdo;
   CHECK(person_sdo == 1,
         "ai_suppresses_cell_motion: expected 1 person SDO, got "
         + std::to_string(person_sdo));
 
-  sqlite3_close(db);
+  int sdr = static_cast<int>(bptr->sdrs.size());
+  CHECK(sdr == 1,
+        "ai_suppresses_cell_motion: expected 1 smartDetectRaws row (not 2), got "
+        + std::to_string(sdr));
+}
+
+// ============================================================
+// Thumbnail crop-dimension test
+//
+// Verifies that stored UBV thumbnails have the dimensions produced by
+// smart_crop (square with side == min(orig_w, orig_h)):
+//   snapshot_108.jpg  2560×1440 → 1440×1440
+//   snapshot_109.jpg   720×480  →  480×480
+// ============================================================
+static void test_thumbnail_crop_dimensions(const std::string& ubv_dir) {
+  TestContext ctx;
+  ctx.ubv_dir = ubv_dir;
+
+  auto backend = std::make_unique<MockBackend>();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+
+  bool ok = run_standard_script(ctx, recorder);
+  CHECK(ok, "thumb_crop_dims: timed out before all events arrived");
+  if (!ok) return;
+
+  // cam108: snapshot_108.jpg 2560×1440 → smart_crop → 1440×1440
+  {
+    const std::string ubv_path =
+        ubv_dir + "/" + ctx.cfg108.ip + "_thumbnails.ubv";
+    auto frames_or = ubv::decode(ubv_path);
+    if (!frames_or.ok()) {
+      CHECK(false, "thumb_crop_dims: ubv::decode failed for cam108: "
+                   + std::string(frames_or.status().message()));
+    } else {
+      const auto& frames = *frames_or;
+      CHECK(!frames.empty(), "thumb_crop_dims: cam108 has no UBV frames");
+      for (std::size_t i = 0; i < frames.size(); ++i) {
+        int w = 0, h = 0;
+        bool ok_d = jpeg_dims(frames[i].jpeg, &w, &h);
+        CHECK(ok_d, "thumb_crop_dims: cam108 frame " + std::to_string(i)
+                    + " not a valid JPEG");
+        CHECK(w == 1440 && h == 1440,
+              "thumb_crop_dims: cam108 frame " + std::to_string(i)
+              + " expected 1440×1440, got "
+              + std::to_string(w) + "×" + std::to_string(h));
+      }
+    }
+  }
+
+  // cam109: snapshot_109.jpg 720×480 → smart_crop → 480×480
+  {
+    const std::string ubv_path =
+        ubv_dir + "/" + ctx.cfg109.ip + "_thumbnails.ubv";
+    auto frames_or = ubv::decode(ubv_path);
+    if (!frames_or.ok()) {
+      CHECK(false, "thumb_crop_dims: ubv::decode failed for cam109: "
+                   + std::string(frames_or.status().message()));
+    } else {
+      const auto& frames = *frames_or;
+      CHECK(!frames.empty(), "thumb_crop_dims: cam109 has no UBV frames");
+      for (std::size_t i = 0; i < frames.size(); ++i) {
+        int w = 0, h = 0;
+        bool ok_d = jpeg_dims(frames[i].jpeg, &w, &h);
+        CHECK(ok_d, "thumb_crop_dims: cam109 frame " + std::to_string(i)
+                    + " not a valid JPEG");
+        CHECK(w == 480 && h == 480,
+              "thumb_crop_dims: cam109 frame " + std::to_string(i)
+              + " expected 480×480, got "
+              + std::to_string(w) + "×" + std::to_string(h));
+      }
+    }
+  }
+}
+
+// ============================================================
+// ONVIF BoundingBox crop test
+// ============================================================
+static void test_onvif_bbox_crop(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_ubv_dir(ubv_dir);
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+  SnapshotSyntheticEmulator emu("192.168.1.210",
+    {make_field_detector_with_bbox_response(
+         "Human", true,  "2026-03-24T10:00:00Z", -0.5f, -0.5f, 0.5f, 0.5f),
+     make_field_detector_with_bbox_response(
+         "Human", false, "2026-03-24T10:00:05Z", -0.5f, -0.5f, 0.5f, 0.5f)},
+    jpeg);
+  emu.start();
+
+  onvif::CameraConfig cfg;
+  cfg.ip                 = emu.local_address();
+  cfg.user               = "admin";
+  cfg.password           = "password";
+  cfg.snapshot_url       = emu.snapshot_url();
+  cfg.retry_interval_sec = 1;
+  recorder.set_snapshot(cfg);
+
+  std::mutex              mu;
+  std::condition_variable cv;
+  std::atomic<int>        events_seen{0};
+  const int               needed = 2;
+
+  onvif::OnvifListener listener;
+  listener.add_camera(cfg);
+
+  std::thread t([&] {
+    listener.run([&](const onvif::OnvifEvent& ev) {
+      recorder.on_event(ev);
+      if (!ev.topic.empty())
+        if (++events_seen >= needed) cv.notify_one();
+    });
+  });
+
+  bool timed_out;
+  {
+    std::unique_lock<std::mutex> lk(mu);
+    timed_out = !cv.wait_for(lk, std::chrono::seconds(30),
+                              [&] { return events_seen.load() >= needed; });
+  }
+  listener.stop();
+  t.join();
+
+  CHECK(!timed_out, "onvif_bbox_crop: timed out");
+  if (timed_out) return;
+
+  const std::string ubv_path = ubv_dir + "/" + cfg.ip + "_thumbnails.ubv";
+  auto frames_or = ubv::decode(ubv_path);
+  if (!frames_or.ok()) {
+    CHECK(false, "onvif_bbox_crop: ubv::decode failed: "
+                 + std::string(frames_or.status().message()));
+    return;
+  }
+  const auto& frames = *frames_or;
+  CHECK(frames.size() == 1,
+        "onvif_bbox_crop: expected 1 UBV frame, got "
+        + std::to_string(frames.size()));
+  if (frames.empty()) return;
+
+  int w = 0, h = 0;
+  bool ok_d = jpeg_dims(frames[0].jpeg, &w, &h);
+  CHECK(ok_d, "onvif_bbox_crop: stored frame is not a valid JPEG");
+
+  // smart_crop of 2560×1440 yields 1440×1440; bbox crop must differ
+  CHECK(!(w == 1440 && h == 1440),
+        "onvif_bbox_crop: got smart_crop dims 1440×1440 — bbox was ignored");
+  CHECK(w > 0 && h > 0, "onvif_bbox_crop: zero crop dimensions");
 }
 
 // ============================================================
 // main
 // ============================================================
 int main() {
-  const std::string db_path           = "/tmp/test_detections.db";
-  const std::string db_path_buf       = "/tmp/test_detections_buf.db";
-  const std::string db_path_cell      = "/tmp/test_detections_cell.db";
-  const std::string db_path_alarm     = "/tmp/test_detections_alarm.db";
-  const std::string db_path_suppress  = "/tmp/test_detections_suppress.db";
-  const std::string db_path_ai_sup    = "/tmp/test_detections_ai_sup.db";
-  const std::string ubv_dir           = "/tmp/test_dr_thumbs";
-
-  std::remove(db_path.c_str());
-  std::remove(db_path_buf.c_str());
-  std::remove(db_path_cell.c_str());
-  std::remove(db_path_alarm.c_str());
-  std::remove(db_path_suppress.c_str());
-  std::remove(db_path_ai_sup.c_str());
+  const std::string ubv_dir = "/tmp/test_dr_thumbs";
 
   onvif::global_init();
 
-  run_test("detection_e2e",             [&] { test_detection_e2e(db_path, ubv_dir); });
-  run_test("buffer_padding",            [&] { test_buffer_padding(db_path_buf, ubv_dir); });
+  run_test("detection_e2e",             [&] { test_detection_e2e(ubv_dir); });
+  run_test("buffer_padding",            [&] { test_buffer_padding(ubv_dir); });
   run_test("cell_motion_classification",
-           [&] { test_cell_motion_classification(db_path_cell, ubv_dir); });
+           [&] { test_cell_motion_classification(ubv_dir); });
   run_test("motion_alarm_fallback",
-           [&] { test_motion_alarm_fallback(db_path_alarm, ubv_dir); });
+           [&] { test_motion_alarm_fallback(ubv_dir); });
   run_test("cell_motion_suppresses_alarm",
-           [&] { test_cell_motion_suppresses_alarm(db_path_suppress, ubv_dir); });
+           [&] { test_cell_motion_suppresses_alarm(ubv_dir); });
   run_test("ai_suppresses_cell_motion",
-           [&] { test_ai_suppresses_cell_motion(db_path_ai_sup, ubv_dir); });
+           [&] { test_ai_suppresses_cell_motion(ubv_dir); });
+  run_test("thumbnail_crop_dimensions",
+           [&] { test_thumbnail_crop_dimensions(ubv_dir); });
+  run_test("onvif_bbox_crop",
+           [&] { test_onvif_bbox_crop(ubv_dir); });
 
   onvif::global_cleanup();
 

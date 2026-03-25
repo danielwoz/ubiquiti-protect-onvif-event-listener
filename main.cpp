@@ -17,7 +17,7 @@
  *
  * Uses onvif::OnvifListener to receive events from cameras and:
  *   - writes every raw event as a JSON Lines entry to a timestamped .jsonl file
- *   - records human/vehicle detection intervals to a SQLite database
+ *   - records human/vehicle detection intervals to the UniFi Protect PostgreSQL DB
  */
 
 #include <csignal>
@@ -38,6 +38,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "detection_recorder.hpp"
+#include "object_detect.hpp"
 #include "onvif_listener.hpp"
 #include "unifi_camera_config.hpp"
 
@@ -159,14 +160,11 @@ int main() {
   std::string output_path  = std::string("onvif_events_") + ts_buf + ".jsonl";
   std::string raw_path     = std::string("onvif_raw_")    + ts_buf + ".jsonl";
 
-  // Backend selection via environment variables:
-  //   ONVIF_DB_BACKEND = "sqlite" (default) | "postgres"
-  //   ONVIF_DB_CONN    = file path for SQLite (default: "onvif_detections.db")
-  //                    = libpq conninfo for PostgreSQL
-  //                      (default: local Protect socket on port 5433)
-  //   ONVIF_UBV_DIR    = directory for UBV thumbnail files (SQLite only)
-  //                      (default: "thumbnails"; ignored for postgres)
-  const char* env_backend    = std::getenv("ONVIF_DB_BACKEND");
+  // Configuration via environment variables:
+  //   ONVIF_DB_CONN  = libpq conninfo string
+  //                    (default: local Protect Unix socket on port 5433)
+  //   ONVIF_UBV_DIR  = directory for per-camera UBV thumbnail files
+  //                    (optional; thumbnails are also stored in the PG DB)
   const char* env_conn       = std::getenv("ONVIF_DB_CONN");
   const char* env_db_host    = std::getenv("ONVIF_DB_HOST");
   const char* env_ubv_dir    = std::getenv("ONVIF_UBV_DIR");
@@ -174,33 +172,21 @@ int main() {
   const char* env_post_buf   = std::getenv("ONVIF_POST_BUFFER_SEC");
   const char* env_verbose    = std::getenv("ONVIF_VERBOSE");
 
-  onvif::DbBackend db_backend  = onvif::DbBackend::SQLite;
-  std::string      db_conn     = "onvif_detections.db";
-  std::string      thumbs_dir;
-  uint32_t         pre_buf_sec  = env_pre_buf  ?
+  std::string db_conn = env_conn ? env_conn
+                                 : "host=/run/postgresql port=5433 "
+                                   "dbname=unifi-protect user=postgres";
+  std::string thumbs_dir = env_ubv_dir ? env_ubv_dir : "";
+  uint32_t    pre_buf_sec  = env_pre_buf  ?
     static_cast<uint32_t>(std::stoul(env_pre_buf))  : 2u;
-  uint32_t         post_buf_sec = env_post_buf ?
+  uint32_t    post_buf_sec = env_post_buf ?
     static_cast<uint32_t>(std::stoul(env_post_buf)) : 2u;
-
-  if (env_backend && std::string(env_backend) == "postgres") {
-    db_backend = onvif::DbBackend::PostgreSQL;
-    db_conn    = env_conn ? env_conn
-                          : "host=/run/postgresql port=5433 "
-                            "dbname=unifi-protect user=postgres";
-    // PG stores thumbnails in the database; UBV dir is not used.
-    thumbs_dir = env_ubv_dir ? env_ubv_dir : "";
-  } else {
-    if (env_conn)    db_conn    = env_conn;
-    thumbs_dir = env_ubv_dir ? env_ubv_dir : "thumbnails";
-  }
 
   const bool verbose = env_verbose && std::string(env_verbose) != "0";
 
   std::cerr << "ONVIF Event Recorder\n"
             << "Events file : " << output_path  << '\n'
             << "Raw file    : " << raw_path      << '\n'
-            << "DB backend  : " << (db_backend == onvif::DbBackend::PostgreSQL
-                                    ? "postgres" : "sqlite") << '\n'
+            << "DB backend  : postgres\n"
             << "DB conn     : " << db_conn       << '\n'
             << "DB host     : " << (env_db_host ? env_db_host : "(default)") << '\n'
             << "Pre-buffer  : " << pre_buf_sec   << " s\n"
@@ -222,7 +208,7 @@ int main() {
   EventRecorder& event_rec = **er_or;
 
   // DetectionRecorder
-  auto dr_or = onvif::DetectionRecorder::Create(db_backend, db_conn);
+  auto dr_or = onvif::DetectionRecorder::Create(db_conn);
   if (!dr_or.ok()) {
     std::cerr << "Fatal: " << dr_or.status().message() << '\n';
     onvif::global_cleanup();
@@ -230,6 +216,26 @@ int main() {
   }
   onvif::DetectionRecorder& det_rec = **dr_or;
   det_rec.set_buffer(pre_buf_sec, post_buf_sec);
+
+  // Optional: load NCNN object detector for thumbnail subject cropping.
+  std::unique_ptr<object_detect::ObjectDetector> detector;
+  const char* model_dir_cstr = std::getenv("ONVIF_MODEL_DIR");
+  if (model_dir_cstr) {
+    const std::string model_dir(model_dir_cstr);
+    auto det = object_detect::ObjectDetector::Load(
+        model_dir + "/nanodet_m.param",
+        model_dir + "/nanodet_m.bin");
+    if (det.ok()) {
+      detector = std::move(*det);
+      det_rec.set_detector(detector.get());
+      std::fprintf(stderr, "[detect] loaded nanodet_m from %s\n",
+                   model_dir.c_str());
+    } else {
+      std::fprintf(stderr,
+                   "[detect] model not loaded (smart-crop fallback): %s\n",
+                   std::string(det.status().message()).c_str());
+    }
+  }
 
   onvif::OnvifListener listener;
   g_listener = &listener;
@@ -241,13 +247,12 @@ int main() {
     det_rec.set_ubv_dir(thumbs_dir);
 
   // Camera configs are loaded from the UniFi Protect database.
-  // ONVIF_DB_HOST overrides the host (default: 127.0.0.1).
-  // When using the postgres backend without an explicit override, use the
-  // local Unix socket so no TCP listener is required on the router.
+  // ONVIF_DB_HOST overrides the host; default uses the local Unix socket
+  // so no TCP listener is required on the router.
   unifi::DbConfig cam_db;
   if (env_db_host)
     cam_db.host = env_db_host;
-  else if (db_backend == onvif::DbBackend::PostgreSQL)
+  else
     cam_db.host = "/run/postgresql";
 
   auto cams_or = unifi::load_cameras(cam_db);

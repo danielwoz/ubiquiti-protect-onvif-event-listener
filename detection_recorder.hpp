@@ -24,19 +24,18 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "object_detect.hpp"
 #include "onvif_listener.hpp"
 
 namespace onvif {
-
-enum class DbBackend { SQLite, PostgreSQL };
 
 /**
  * DetectionRecorder
  *
  * Translates raw ONVIF events into human/vehicle detections and persists them
- * to a SQLite or PostgreSQL database using a schema that mirrors the UniFi
- * Protect event tables, making third-party camera data structurally identical
- * to data produced by native Ubiquiti cameras.
+ * to a PostgreSQL database using a schema that mirrors the UniFi Protect event
+ * tables, making third-party camera data structurally identical to data
+ * produced by native Ubiquiti cameras.
  *
  * Supported ONVIF event formats
  * ------------------------------
@@ -63,11 +62,10 @@ enum class DbBackend { SQLite, PostgreSQL };
  *
  * Backend selection
  * -----------------
- *   DbBackend::SQLite     -- conn is a file path (e.g. "onvif_detections.db")
- *   DbBackend::PostgreSQL -- conn is a libpq conninfo string
- *                           (e.g. "host=localhost dbname=unifi user=protect")
+ *   conn is a libpq conninfo string
+ *   (e.g. "host=localhost dbname=unifi user=protect")
  *
- * Database schema (mirrors UniFi Protect, auto-created on construction)
+ * Database schema (mirrors UniFi Protect, tables must already exist)
  * -----------------------------------------------------------------------
  *
  *   events (
@@ -110,13 +108,13 @@ enum class DbBackend { SQLite, PostgreSQL };
  * -------------
  * on_event() is fully thread-safe; the OnvifListener may call it from
  * multiple camera threads simultaneously.
- * set_snapshot() and set_ubv_dir() must be called before the listener starts.
+ * set_snapshot() must be called before the listener starts.
  */
 class DetectionRecorder {
  public:
-  /// Factory: creates backend, runs create_schema(). Returns error on failure.
+  /// Factory: connects to PostgreSQL, verifies schema. Returns error on failure.
   static absl::StatusOr<std::unique_ptr<DetectionRecorder>> Create(
-      DbBackend backend, const std::string& conn);
+      const std::string& conn);
 
   ~DetectionRecorder();
 
@@ -145,6 +143,11 @@ class DetectionRecorder {
   /// detections. Thread-safe.
   void on_event(const OnvifEvent& ev);
 
+  /// Set the object detector used to locate subjects for thumbnail cropping.
+  /// If not called (or set to nullptr), falls back to the smart-crop heuristic.
+  /// The detector must outlive the DetectionRecorder.
+  void set_detector(const object_detect::ObjectDetector* detector);
+
   // Defined in detection_recorder.cpp -- public so concrete backends in the
   // .cpp translation unit can inherit from it without friendship.
   struct IDbBackend {
@@ -153,20 +156,16 @@ class DetectionRecorder {
     virtual absl::Status create_schema() = 0;
 
     /// Register a camera's identifiers before the listener starts.
-    /// SQLite: no-op.  PG: stores ip->id and ip->mac for later lookups.
+    /// Stores ip->id and ip->mac for later lookups.
     virtual void register_camera(const std::string& ip,
                                  const std::string& id,
                                  const std::string& mac) = 0;
 
     /// Compute the thumbnailId string for an event.
-    /// SQLite: "<camera_ip>-<ts_ms>"
-    /// PG:     "<MAC_UPPERCASE_NOCOLONS>-<ts_ms>"  (media server serves
-    ///         the thumbnail directly from the UBV recording on demand)
     virtual std::string make_thumbnail_id(const std::string& camera_ip,
                                           uint64_t           ts_ms) = 0;
 
     /// True when the backend needs a snapshot fetched on detection.
-    /// SQLite: true (written to UBV).  PG: false (media server has UBV).
     virtual bool needs_snapshot() const = 0;
 
     virtual void insert_event(const std::string& id,
@@ -189,15 +188,25 @@ class DetectionRecorder {
                                   uint64_t           end_ms,
                                   const std::string& now_str) = 0;
 
-    /// Store a JPEG thumbnail.  For PG: INSERT INTO thumbnails.
-    /// For SQLite: no-op (UBV appending is handled by DetectionRecorder).
+    /// Store a JPEG thumbnail: INSERT INTO thumbnails.
     virtual void write_thumbnail(const std::string&              thumb_id,
                                  const std::string&              event_id,
                                  const std::string&              camera_ip,
                                  uint64_t                        ts_ms,
                                  const std::string&              now_str,
                                  const std::vector<unsigned char>& jpeg) = 0;
+
+    /// Insert one row into smartDetectRaws with a minimal payload JSON.
+    virtual void insert_smart_detect_raw(const std::string& /*id*/,
+                                         const std::string& /*camera_ip*/,
+                                         uint64_t           /*ts_ms*/,
+                                         const std::string& /*obj_type*/,
+                                         const std::string& /*now_str*/) {}
   };
+
+  /// Factory for testing: injects a custom backend (skips PostgreSQL connect).
+  static absl::StatusOr<std::unique_ptr<DetectionRecorder>> CreateWithBackend(
+      std::unique_ptr<IDbBackend> backend);
 
  private:
   DetectionRecorder() = default;
@@ -233,6 +242,10 @@ class DetectionRecorder {
   // VideoSource/MotionAlarm events from these cameras are suppressed to
   // avoid double-counting (both topics fire simultaneously on most cameras).
   std::set<std::string> cell_motion_cameras_;
+
+  // Optional object detector for thumbnail subject cropping.
+  // Set before run(); read-only (non-owning pointer) after that.
+  const object_detect::ObjectDetector* detector_{nullptr};
 };
 
 }  // namespace onvif

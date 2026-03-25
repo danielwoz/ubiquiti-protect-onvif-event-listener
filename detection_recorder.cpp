@@ -16,8 +16,10 @@
 
 #include <curl/curl.h>
 #include <libpq-fe.h>
-#include <sqlite3.h>
+#include <stddef.h>   // jpeglib.h needs size_t
+#include <stdio.h>    // jpeglib.h needs FILE
 #include <sys/stat.h>
+#include <jpeglib.h>
 
 #include <chrono>
 #include <cinttypes>
@@ -34,6 +36,8 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "jpeg_crop.hpp"
+#include "object_detect.hpp"
 #include "ubv_thumbnail.hpp"
 
 namespace onvif {
@@ -223,193 +227,46 @@ static std::vector<unsigned char> fetch_snapshot(const std::string& url,
   return buf;
 }
 
-}  // anonymous namespace
-
-// ============================================================
-// SQLite backend
-// ============================================================
-namespace {
-
-struct SqliteBackend final : DetectionRecorder::IDbBackend {
-  sqlite3* db_{nullptr};
-
-  static absl::StatusOr<std::unique_ptr<SqliteBackend>> Create(
-      const std::string& path) {
-    auto b = std::make_unique<SqliteBackend>(path);
-    if (!b->db_) {
-      return absl::InternalError("SQLite open failed: " + path);
-    }
-    return b;
-  }
-
-  explicit SqliteBackend(const std::string& path) {
-    int rc = sqlite3_open(path.c_str(), &db_);
-    if (rc != SQLITE_OK) {
-      // Store error; db_ may still need closing
-      if (db_) {
-        sqlite3_close(db_);
-        db_ = nullptr;
-      }
-      return;
-    }
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-  }
-
-  ~SqliteBackend() override {
-    if (db_) sqlite3_close(db_);
-  }
-
-  absl::Status create_schema() override {
-    const char* sql =
-      "CREATE TABLE IF NOT EXISTS events ("
-      "  id                        TEXT PRIMARY KEY,"
-      "  type                      TEXT,"
-      "  start                     INTEGER,"
-      "  \"end\"                   INTEGER,"
-      "  cameraId                  TEXT,"
-      "  score                     INTEGER NOT NULL DEFAULT 0,"
-      "  smartDetectTypes          TEXT    NOT NULL DEFAULT '[]',"
-      "  metadata                  TEXT    NOT NULL DEFAULT '{}',"
-      "  locked                    INTEGER NOT NULL DEFAULT 0,"
-      "  thumbnailId               TEXT,"
-      "  thumbnailFullfovId        TEXT,"
-      "  packageThumbnailId        TEXT,"
-      "  packageThumbnailFullfovId TEXT,"
-      "  deletedAt                 TEXT,"
-      "  deletionType              TEXT,"
-      "  userId                    TEXT,"
-      "  partitionId               TEXT,"
-      "  createdAt                 TEXT NOT NULL,"
-      "  updatedAt                 TEXT NOT NULL"
-      ");"
-      "CREATE INDEX IF NOT EXISTS events_cameraId_idx"
-      "  ON events(cameraId);"
-      "CREATE INDEX IF NOT EXISTS events_start_idx"
-      "  ON events(start DESC) WHERE deletedAt IS NULL;"
-      "CREATE INDEX IF NOT EXISTS events_type_end_idx"
-      "  ON events(type, \"end\", deletedAt);"
-
-      "CREATE TABLE IF NOT EXISTS smartDetectObjects ("
-      "  id                        TEXT PRIMARY KEY,"
-      "  eventId                   TEXT NOT NULL,"
-      "  thumbnailId               TEXT,"
-      "  cameraId                  TEXT NOT NULL,"
-      "  type                      TEXT NOT NULL,"
-      "  attributes                TEXT NOT NULL DEFAULT '{}',"
-      "  smartDetectObjectGroupId  TEXT,"
-      "  detectedAt                INTEGER NOT NULL,"
-      "  metadata                  TEXT NOT NULL DEFAULT '{}',"
-      "  createdAt                 TEXT NOT NULL,"
-      "  updatedAt                 TEXT NOT NULL"
-      ");"
-      "CREATE INDEX IF NOT EXISTS sdo_eventId_idx"
-      "  ON smartDetectObjects(eventId);"
-      "CREATE INDEX IF NOT EXISTS sdo_cameraId_idx"
-      "  ON smartDetectObjects(cameraId);"
-      "CREATE INDEX IF NOT EXISTS sdo_type_idx"
-      "  ON smartDetectObjects(type);"
-      "CREATE INDEX IF NOT EXISTS sdo_detectedAt_idx"
-      "  ON smartDetectObjects(detectedAt);";
-
-    char* errmsg = nullptr;
-    int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &errmsg);
-    if (rc != SQLITE_OK) {
-      std::string msg = errmsg ? errmsg : "unknown error";
-      sqlite3_free(errmsg);
-      return absl::InternalError("SQLite schema creation failed: " + msg);
-    }
-    return absl::OkStatus();
-  }
-
-  void register_camera(const std::string& /*ip*/,
-                       const std::string& /*id*/,
-                       const std::string& /*mac*/) override {}
-
-  std::string make_thumbnail_id(const std::string& camera_ip,
-                                uint64_t           ts_ms) override {
-    return camera_ip + "-" + std::to_string(ts_ms);
-  }
-
-  bool needs_snapshot() const override { return true; }
-
-  void insert_event(const std::string& id,
-                    uint64_t           ts_ms,
-                    const std::string& camera_ip,
-                    const std::string& sdt_json,
-                    const std::string& thumb_id,
-                    const std::string& now_str) override {
-    const char* sql =
-      "INSERT INTO events"
-      " (id, type, start, cameraId, score, smartDetectTypes,"
-      "  metadata, locked, thumbnailId, createdAt, updatedAt)"
-      " VALUES (?, 'smartDetectZone', ?, ?, 0, ?,"
-      "         '{}', 0, ?, ?, ?);";
-    sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
-    sqlite3_bind_text(stmt,  1, id.c_str(),        -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(ts_ms));
-    sqlite3_bind_text(stmt,  3, camera_ip.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  4, sdt_json.c_str(),  -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  5, thumb_id.c_str(),  -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  6, now_str.c_str(),   -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  7, now_str.c_str(),   -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-  }
-
-  void insert_sdo(const std::string& id,
-                  const std::string& event_id,
-                  const std::string& thumb_id,
-                  const std::string& camera_ip,
-                  const std::string& obj_type,
-                  const std::string& attributes,
-                  uint64_t           ts_ms,
-                  const std::string& now_str) override {
-    const char* sql =
-      "INSERT INTO smartDetectObjects"
-      " (id, eventId, thumbnailId, cameraId, type, attributes,"
-      "  detectedAt, metadata, createdAt, updatedAt)"
-      " VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?, ?);";
-    sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
-    sqlite3_bind_text(stmt,  1, id.c_str(),         -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  2, event_id.c_str(),   -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  3, thumb_id.c_str(),   -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  4, camera_ip.c_str(),  -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  5, obj_type.c_str(),   -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  6, attributes.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 7, static_cast<sqlite3_int64>(ts_ms));
-    sqlite3_bind_text(stmt,  8, now_str.c_str(),    -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  9, now_str.c_str(),    -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-  }
-
-  void update_event_end(const std::string& event_id,
-                        uint64_t           end_ms,
-                        const std::string& now_str) override {
-    const char* sql =
-      "UPDATE events SET \"end\" = ?, updatedAt = ? WHERE id = ?;";
-    sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
-    sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(end_ms));
-    sqlite3_bind_text(stmt,  2, now_str.c_str(),   -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt,  3, event_id.c_str(),  -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-  }
-
-  void write_thumbnail(const std::string& /*thumb_id*/,
-                       const std::string& /*event_id*/,
-                       const std::string& /*camera_ip*/,
-                       uint64_t           /*ts_ms*/,
-                       const std::string& /*now_str*/,
-                       const std::vector<unsigned char>& /*jpeg*/) override {}
+// JPEG error manager for header-only dimension reads.
+struct JpegDimErr {
+  jpeg_error_mgr base;  // must be first
+  bool           fatal;
 };
+
+static void jpeg_dim_err_exit(j_common_ptr cinfo) {
+  reinterpret_cast<JpegDimErr*>(cinfo->err)->fatal = true;
+}
+static void jpeg_dim_out_msg(j_common_ptr /*cinfo*/) {}
+
+// Read JPEG image dimensions from header only (no full decompress).
+// Returns false on error.
+static bool jpeg_read_dimensions(const std::vector<unsigned char>& data,
+                                  int* out_w, int* out_h) {
+  JpegDimErr err{};
+  err.fatal = false;
+  jpeg_decompress_struct info{};
+  info.err = jpeg_std_error(&err.base);
+  err.base.error_exit     = jpeg_dim_err_exit;
+  err.base.output_message = jpeg_dim_out_msg;
+  jpeg_create_decompress(&info);
+  jpeg_mem_src(&info,
+               const_cast<unsigned char*>(
+                   reinterpret_cast<const unsigned char*>(data.data())),
+               static_cast<unsigned long>(data.size()));  // NOLINT(runtime/int)
+  jpeg_read_header(&info, TRUE);
+  *out_w = static_cast<int>(info.image_width);
+  *out_h = static_cast<int>(info.image_height);
+  jpeg_destroy_decompress(&info);
+  return !err.fatal && *out_w > 0 && *out_h > 0;
+}
+
+}  // anonymous namespace
 
 // ============================================================
 // PostgreSQL backend
 // ============================================================
+namespace {
+
 struct PgBackend final : DetectionRecorder::IDbBackend {
   PGconn* conn_{nullptr};
 
@@ -445,6 +302,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     PGresult* res = PQexec(conn_,
       "SELECT 1 FROM events LIMIT 0;"
       "SELECT 1 FROM \"smartDetectObjects\" LIMIT 0;"
+      "SELECT 1 FROM \"smartDetectRaws\" LIMIT 0;"
       "SELECT 1 FROM thumbnails LIMIT 0;");
     ExecStatusType st = PQresultStatus(res);
     if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK) {
@@ -479,17 +337,38 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     return (it != ip_to_id_.end()) ? it->second : ip;
   }
 
+  // Attempt to restore a broken connection.  Called before every query.
+  // PQreset() re-uses the same conninfo string; safe to call on a live conn.
+  void maybe_reconnect() {
+    if (PQstatus(conn_) != CONNECTION_BAD) return;
+    std::fprintf(stderr, "[pg] connection lost — attempting reconnect\n");
+    PQreset(conn_);
+    if (PQstatus(conn_) == CONNECTION_OK)
+      std::fprintf(stderr, "[pg] reconnected\n");
+    else
+      std::fprintf(stderr, "[pg] reconnect failed: %s\n", PQerrorMessage(conn_));
+  }
+
+  // Return the best available error string for a failed query.
+  const char* pg_errmsg(PGresult* res) const {
+    // PQresultErrorMessage is empty for connection-drop failures;
+    // fall back to the connection-level error string.
+    const char* msg = res ? PQresultErrorMessage(res) : nullptr;
+    return (msg && *msg) ? msg : PQerrorMessage(conn_);
+  }
+
   // Execute a parameterized DML statement; logs errors to stderr (non-fatal).
   void exec_params(const char*        sql,
                    int                nparams,
                    const char* const* params,
                    const int*         lengths = nullptr,
                    const int*         formats = nullptr) {
+    maybe_reconnect();
     PGresult* res = PQexecParams(conn_, sql, nparams, nullptr,
                                  params, lengths, formats, 0);
     ExecStatusType st = PQresultStatus(res);
     if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK)
-      std::fprintf(stderr, "[pg] query failed: %s\n", PQresultErrorMessage(res));
+      std::fprintf(stderr, "[pg] query failed: %s\n", pg_errmsg(res));
     PQclear(res);
   }
 
@@ -552,6 +431,62 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
 
   // Insert JPEG thumbnail directly into Protect's thumbnails table.
   // Protect serves 24-char thumbnailIds from this table (not via msp TCP).
+  void insert_smart_detect_raw(const std::string& id,
+                               const std::string& camera_ip,
+                               uint64_t           ts_ms,
+                               const std::string& obj_type,
+                               const std::string& now_str) override {
+    const std::string& cam_id = camera_id(camera_ip);
+    const std::string  ts = std::to_string(ts_ms);
+    // Minimal payload matching the Protect smartDetectRaws schema.
+    // coord [-1,-1,-1,-1] signals "no pixel-space bounding box available".
+    const std::string payload =
+        std::string("{")
+        + "\"attributesForTracks\":null,"
+        + "\"clockStream\":" + ts + ","
+        + "\"clockStreamRate\":1000,"
+        + "\"clockWall\":" + ts + ","
+        + "\"descriptors\":[{"
+        + "\"attributes\":null,"
+        + "\"confidence\":75,"
+        + "\"coord\":[-1.0,-1.0,-1.0,-1.0],"
+        + "\"coord3d\":[-1.0,-1.0],"
+        + "\"depth\":null,"
+        + "\"duration\":0,"
+        + "\"firstShownTimeMs\":" + ts + ","
+        + "\"id\":\"1\","
+        + "\"idleSinceTimeMs\":" + ts + ","
+        + "\"licensePlate\":null,"
+        + "\"lines\":[],"
+        + "\"loiterZones\":[],"
+        + "\"matchedId\":null,"
+        + "\"name\":\"\","
+        + "\"objectType\":\"" + obj_type + "\","
+        + "\"speed\":null,"
+        + "\"stationary\":false,"
+        + "\"timestamp\":" + ts + ","
+        + "\"zones\":[]"
+        + "}],"
+        + "\"edgeType\":\"none\","
+        + "\"linesStatus\":null,"
+        + "\"loiterZonesStatus\":null,"
+        + "\"smartDetectSnapshotFullFoV\":\"\","
+        + "\"smartDetectSnapshots\":null,"
+        + "\"tamperStatus\":null,"
+        + "\"trackerIdAttrMap\":null,"
+        + "\"zonesStatus\":{}"
+        + "}";
+    const char* params[] = {
+      id.c_str(), cam_id.c_str(), payload.c_str(),
+      ts.c_str(), now_str.c_str(), now_str.c_str()
+    };
+    exec_params(
+      "INSERT INTO \"smartDetectRaws\""
+      " (id, \"cameraId\", payload, timestamp, \"createdAt\", \"updatedAt\")"
+      " VALUES ($1, $2, $3::json, $4::bigint, $5, $6)",
+      6, params);
+  }
+
   void write_thumbnail(const std::string&              thumb_id,
                        const std::string&              event_id,
                        const std::string&              camera_ip,
@@ -580,6 +515,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     };
     const int formats[7] = { 0, 0, 0, 0, 0, 0, 1 };  // $7 is binary
 
+    maybe_reconnect();
     PGresult* res = PQexecParams(conn_,
       "INSERT INTO thumbnails"
       " (id, \"cameraId\", \"eventId\", timestamp, \"createdAt\","
@@ -589,8 +525,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
       7, nullptr, params, lengths, formats, 0);
     ExecStatusType st = PQresultStatus(res);
     if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK)
-      std::fprintf(stderr, "[pg] thumbnail insert failed: %s\n",
-                   PQresultErrorMessage(res));
+      std::fprintf(stderr, "[pg] thumbnail insert failed: %s\n", pg_errmsg(res));
     PQclear(res);
   }
 };
@@ -603,22 +538,21 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
 
 // static factory
 absl::StatusOr<std::unique_ptr<DetectionRecorder>> DetectionRecorder::Create(
-    DbBackend backend, const std::string& conn) {
+    const std::string& conn) {
   auto dr = std::unique_ptr<DetectionRecorder>(new DetectionRecorder());
-  switch (backend) {
-    case DbBackend::SQLite: {
-      auto b_or = SqliteBackend::Create(conn);
-      if (!b_or.ok()) return b_or.status();
-      dr->db_ = std::move(*b_or);
-      break;
-    }
-    case DbBackend::PostgreSQL: {
-      auto b_or = PgBackend::Create(conn);
-      if (!b_or.ok()) return b_or.status();
-      dr->db_ = std::move(*b_or);
-      break;
-    }
-  }
+  auto b_or = PgBackend::Create(conn);
+  if (!b_or.ok()) return b_or.status();
+  dr->db_ = std::move(*b_or);
+  absl::Status s = dr->db_->create_schema();
+  if (!s.ok()) return s;
+  return dr;
+}
+
+// static factory for testing
+absl::StatusOr<std::unique_ptr<DetectionRecorder>>
+DetectionRecorder::CreateWithBackend(std::unique_ptr<IDbBackend> backend) {
+  auto dr = std::unique_ptr<DetectionRecorder>(new DetectionRecorder());
+  dr->db_ = std::move(backend);
   absl::Status s = dr->db_->create_schema();
   if (!s.ok()) return s;
   return dr;
@@ -630,6 +564,12 @@ void DetectionRecorder::set_snapshot(const CameraConfig& cam) {
   std::lock_guard<std::mutex> lk(mu_);
   snapshot_info_[cam.ip] = {cam.snapshot_url, cam.user, cam.password};
   db_->register_camera(cam.ip, cam.id, cam.mac);
+}
+
+void DetectionRecorder::set_detector(
+    const object_detect::ObjectDetector* detector) {
+  std::lock_guard<std::mutex> lk(mu_);
+  detector_ = detector;
 }
 
 void DetectionRecorder::set_buffer(uint32_t pre_sec, uint32_t post_sec) {
@@ -677,6 +617,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // 1. Look up snapshot + UBV config and buffer settings (brief lock, no I/O).
     std::string snap_url, snap_user, snap_pass, ubv_dir;
     uint64_t pre_ms;
+    const object_detect::ObjectDetector* det_ptr;
     {
       std::lock_guard<std::mutex> lk(mu_);
       auto it = snapshot_info_.find(ev.camera_ip);
@@ -687,6 +628,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       }
       ubv_dir = ubv_dir_;
       pre_ms  = pre_buffer_ms_;
+      det_ptr = detector_;
     }
 
     // 2. Compute timestamps and IDs (no lock -- needs ip_to_mac_ which is read-only).
@@ -694,15 +636,36 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     const std::string now_str    = utc_now_iso8601();
     const std::string event_id   = generate_uuid();
     const std::string sdo_id     = generate_uuid();
+    const std::string sdr_id     = generate_uuid();
     const std::string thumb_id   = db_->make_thumbnail_id(ev.camera_ip, ts_ms);
     const std::string sdt_json   = smart_detect_types_json(det->type);
     const std::string obj_type   = sdo_type(det->type);
     const std::string attributes = "{\"confidence\":0}";
 
-    // 3. Fetch snapshot only if the backend needs it (SQLite UBV; not PG).
+    // 3. Fetch snapshot if the backend needs it.
     std::vector<unsigned char> snapshot;
-    if (db_->needs_snapshot() && !snap_url.empty())
+    if (db_->needs_snapshot() && !snap_url.empty()) {
       snapshot = fetch_snapshot(snap_url, snap_user, snap_pass);
+      // Crop snapshot: prefer ONVIF bbox, then on-device detection,
+      // then fall back to the smart-crop heuristic.
+      if (!snapshot.empty()) {
+        int img_w = 0, img_h = 0;
+        if (jpeg_read_dimensions(snapshot, &img_w, &img_h)) {
+          const jpeg_crop::BoundingBox* onvif_bbox =
+              ev.bbox ? &*ev.bbox : nullptr;
+          std::optional<jpeg_crop::BoundingBox> det_result;
+          if (!onvif_bbox && det_ptr)
+            det_result = det_ptr->detect(snapshot);
+          const jpeg_crop::BoundingBox* det_bbox =
+              det_result ? &*det_result : nullptr;
+          const jpeg_crop::BoundingBox box =
+              jpeg_crop::select_crop_box(img_w, img_h, onvif_bbox, det_bbox);
+          auto cropped = jpeg_crop::crop(snapshot, box);
+          if (!cropped.empty())
+            snapshot = std::move(cropped);
+        }
+      }
+    }
 
     // 4. INSERT into both tables, write thumbnail -- all under lock.
     std::lock_guard<std::mutex> lk(mu_);
@@ -710,9 +673,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     db_->insert_event(event_id, ts_ms, ev.camera_ip, sdt_json, thumb_id, now_str);
     db_->insert_sdo(sdo_id, event_id, thumb_id, ev.camera_ip,
                     obj_type, attributes, ts_ms, now_str);
+    db_->insert_smart_detect_raw(sdr_id, ev.camera_ip, ts_ms, obj_type, now_str);
     open_[key] = event_id;
 
-    // 4d. Thumbnail: UBV file (SQLite). PG write_thumbnail is a no-op.
+    // 4d. Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.
     if (!snapshot.empty()) {
       if (!ubv_dir.empty()) {
         const std::string ubv_path =

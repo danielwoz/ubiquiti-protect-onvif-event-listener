@@ -1,0 +1,17 @@
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "cmake")
+
+cmake(
+    name = "ncnn",
+    lib_source = "@ncnn//:all",
+    out_static_libs = ["libncnn.a"],
+    cache_entries = {
+        "NCNN_BUILD_TOOLS": "OFF",
+        "NCNN_BUILD_EXAMPLES": "OFF",
+        "NCNN_VULKAN": "OFF",
+        "NCNN_BUILD_TESTS": "OFF",
+        "NCNN_BUILD_BENCHMARK": "OFF",
+        "NCNN_OPENMP": "OFF",
+        "NCNN_SHARED_LIB": "OFF",
+    },
+    visibility = ["//visibility:public"],
+)

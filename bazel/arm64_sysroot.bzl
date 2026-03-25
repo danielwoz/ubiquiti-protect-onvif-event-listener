@@ -36,14 +36,14 @@ _PACKAGES = [
     (_PORTS + "pool/main/g/gcc-9-cross/libstdc++-9-dev-arm64-cross_9.4.0-1ubuntu1~20.04.2cross2_all.deb",
      "17b0294c70127eeeaa38a334f4fd13971bdf9c6a26a26489f9ea3e049a0fc848"),
     # --- Native arm64 runtime libraries ------------------------------------
+    (_PORTS + "pool/main/libj/libjpeg-turbo/libjpeg-turbo8_2.0.3-0ubuntu1_arm64.deb",
+     "cd6588ac233b9c1385ae6490e1969f15fe87b88b4f554dff0504eb4067edeb63"),
     (_PORTS + "pool/main/libx/libxml2/libxml2_2.9.10+dfsg-5ubuntu0.20.04.10_arm64.deb",
      "709c2d78a585c0280296f9d0136c71319ba4dcf06e72ffc18687747771ea2009"),
     (_PORTS + "pool/main/c/curl/libcurl4_7.68.0-1ubuntu2.25_arm64.deb",
      "ac1248efbe550c89838ec178ff560b0aabb64071924131a59ea9f54713ee6c35"),
     (_PORTS + "pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2.24_arm64.deb",
      "dded4572af8b0a9e0310909f211a519cc6409fda31ea81132a77e268b0ec0f2f"),
-    (_PORTS + "pool/main/s/sqlite3/libsqlite3-0_3.31.1-4ubuntu0.7_arm64.deb",
-     "e502ae78438a48d777029a22160bf08a0167607878d03b0cb59e30957ffdcc62"),
     (_PORTS + "pool/universe/libm/libmicrohttpd/libmicrohttpd12_0.9.66-1_arm64.deb",
      "00ecf8da0d7595ff15c3f171cc774f08a9b6e28883417529d59b7874b11b01f0"),
     (_PORTS + "pool/main/p/postgresql-12/libpq5_12.22-0ubuntu0.20.04.4_arm64.deb",
@@ -52,14 +52,14 @@ _PACKAGES = [
     (_PORTS + "pool/main/i/icu/libicu66_66.1-2ubuntu2.1_arm64.deb",
      "ccfbd8e68fadcf4cc3975cdae42d1786733963f75d0b180f96c13782e185635b"),
     # --- Native arm64 dev packages (headers + stub .so) --------------------
+    (_PORTS + "pool/main/libj/libjpeg-turbo/libjpeg-turbo8-dev_2.0.3-0ubuntu1_arm64.deb",
+     "b2f20f3cc2147e387718ab3e3762833585de172353a9fca7c5f64842ab74304a"),
     (_PORTS + "pool/main/libx/libxml2/libxml2-dev_2.9.10+dfsg-5ubuntu0.20.04.10_arm64.deb",
      "0f222bdda6831bfa605b7c0fbbdce26c26bb844d34de1430b177ff9c9a5a9c92"),
     (_PORTS + "pool/main/c/curl/libcurl4-openssl-dev_7.68.0-1ubuntu2.25_arm64.deb",
      "499d2a6526765266d79d8f10169078ae4538d9333225afc595d59f9a9b238596"),
     (_PORTS + "pool/main/o/openssl/libssl-dev_1.1.1f-1ubuntu2.24_arm64.deb",
      "a664d282a0b19fb687c1b9f5a06abcf879bc5643c6e8be435f13c187d13a5b6a"),
-    (_PORTS + "pool/main/s/sqlite3/libsqlite3-dev_3.31.1-4ubuntu0.7_arm64.deb",
-     "d19491a1931f36e9b46e1ec52c3614c91372735e1eb72a40054fc8c23da8ff6d"),
     (_PORTS + "pool/universe/libm/libmicrohttpd/libmicrohttpd-dev_0.9.66-1_arm64.deb",
      "f39debe221a2424e3aca23dca099e07c766d5a161aa399c579bb1ef8c186ebd0"),
     (_PORTS + "pool/main/p/postgresql-12/libpq-dev_12.22-0ubuntu0.20.04.4_arm64.deb",
@@ -521,9 +521,9 @@ toolchain(
 cc_library(name = "libxml2",       linkopts = ["-lxml2", "-licui18n", "-licuuc", "-licudata", "-llzma", "-lz"])
 cc_library(name = "libcurl",       linkopts = ["-Wl,--allow-multiple-definition", "-lcurl", "-lnghttp2", "-lidn2", "-lunistring", "-lrtmp", "-lssh", "-lpsl", "-lzstd", "-lbrotlidec", "-lbrotlicommon", "-lldap", "-llber", "-lsasl2", "-lgnutls", "-lhogweed", "-lnettle", "-lgmp", "-ltasn1", "-lp11-kit", "-lgssapi_krb5", "-lssl", "-lcrypto", "-lz"])
 cc_library(name = "openssl",       linkopts = ["-lssl", "-lcrypto"])
-cc_library(name = "sqlite3",       linkopts = ["-lsqlite3"])
 cc_library(name = "libmicrohttpd", linkopts = ["-lmicrohttpd", "-lgnutls", "-lhogweed", "-lnettle", "-lgmp", "-ltasn1", "-lunistring", "-lp11-kit"])
 cc_library(name = "libpq",         linkopts = ["-lpq", "-lpgcommon", "-lpgport", "-lgssapi_krb5", "-lssl", "-lcrypto"])
+cc_library(name = "libjpeg",       linkopts = ["-ljpeg"])
 """)
 
 arm64_sysroot = repository_rule(

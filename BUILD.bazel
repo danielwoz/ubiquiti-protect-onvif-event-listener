@@ -5,18 +5,30 @@ _CURL   = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libcurl"],
                   "//conditions:default":    ["@libcurl"]})
 _SSL    = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:openssl"],
                   "//conditions:default":    ["@openssl"]})
-_SQLITE = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:sqlite3"],
-                  "//conditions:default":    ["@sqlite3"]})
 _MHD    = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libmicrohttpd"],
                   "//conditions:default":    ["@libmicrohttpd"]})
 _PQ     = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libpq"],
                   "//conditions:default":    ["@libpq"]})
+_JPEG   = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libjpeg"],
+                  "//conditions:default":    ["@libjpeg"]})
+
+# NCNN dependency: host builds use rules_foreign_cc CMake; ARM64 has no NCNN yet.
+_NCNN_DEPS = select({
+    "@platforms//cpu:aarch64": [],
+    "//conditions:default":    ["//third_party:ncnn"],
+})
+
+_NCNN_DEFS = select({
+    "@platforms//cpu:aarch64": [],
+    "//conditions:default":    ["WITH_NCNN"],
+})
 
 cc_library(
     name = "onvif_listener",
     srcs = ["onvif_listener.cpp"],
     hdrs = ["onvif_listener.hpp"],
     deps = _CURL + _XML2 + _SSL + [
+        ":jpeg_crop",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
     ],
@@ -35,15 +47,38 @@ cc_library(
 )
 
 cc_library(
+    name = "jpeg_crop",
+    srcs = ["jpeg_crop.cpp"],
+    hdrs = ["jpeg_crop.hpp"],
+    deps = _JPEG,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "object_detect",
+    srcs = ["object_detect.cpp"],
+    hdrs = ["object_detect.hpp"],
+    defines = _NCNN_DEFS,
+    deps = [
+        ":jpeg_crop",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:statusor",
+    ] + _JPEG + _NCNN_DEPS,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "detection_recorder",
     srcs = ["detection_recorder.cpp"],
     hdrs = ["detection_recorder.hpp"],
     deps = [
+        ":jpeg_crop",
+        ":object_detect",
         ":onvif_listener",
         ":ubv_thumbnail",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
-    ] + _CURL + _SQLITE + _PQ,
+    ] + _CURL + _JPEG + _PQ,
     visibility = ["//visibility:public"],
 )
 
@@ -62,10 +97,11 @@ cc_library(
 cc_binary(
     name = "onvif_recorder",
     srcs = ["main.cpp"],
+    linkstatic = True,
     deps = [
         ":detection_recorder",
+        ":object_detect",
         ":onvif_listener",
         ":unifi_camera_config",
     ],
 )
-

@@ -17,8 +17,11 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
+
+#include "jpeg_crop.hpp"
 
 namespace onvif {
 
@@ -33,13 +36,17 @@ struct OnvifEvent {
     std::string property_op;   // "Initialized", "Changed", or "Deleted"
     std::map<std::string, std::string> source;
     std::map<std::string, std::string> data;
+    // Bounding box of detected object in normalised [0,1] coordinates.
+    // Set only for cameras that include <tt:BoundingBox> in their ONVIF analytics
+    // events (e.g. tns1:VideoAnalytics/ObjectDetector).  Most cameras do not.
+    std::optional<jpeg_crop::BoundingBox> bbox;
 };
 
 // ---------------------------------------------------------------
 // Camera credentials / address
 // ---------------------------------------------------------------
 struct CameraConfig {
-    std::string id;           ///< UUID from the cameras table (empty for SQLite-only use)
+    std::string id;           ///< UUID from the cameras table (empty = not registered)
     std::string mac;          ///< MAC address, uppercase no colons e.g. "FC5F49CA68D4"
     std::string ip;
     std::string user;
