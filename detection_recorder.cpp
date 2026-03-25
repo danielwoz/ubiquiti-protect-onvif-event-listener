@@ -572,6 +572,11 @@ void DetectionRecorder::set_detector(
   detector_ = detector;
 }
 
+void DetectionRecorder::set_detect_override(bool override) {
+  std::lock_guard<std::mutex> lk(mu_);
+  detect_override_ = override;
+}
+
 void DetectionRecorder::set_buffer(uint32_t pre_sec, uint32_t post_sec) {
   std::lock_guard<std::mutex> lk(mu_);
   pre_buffer_ms_  = static_cast<uint64_t>(pre_sec)  * 1000;
@@ -618,6 +623,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     std::string snap_url, snap_user, snap_pass, ubv_dir;
     uint64_t pre_ms;
     const object_detect::ObjectDetector* det_ptr;
+    bool det_override;
     {
       std::lock_guard<std::mutex> lk(mu_);
       auto it = snapshot_info_.find(ev.camera_ip);
@@ -626,9 +632,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         snap_user = it->second.user;
         snap_pass = it->second.password;
       }
-      ubv_dir = ubv_dir_;
-      pre_ms  = pre_buffer_ms_;
-      det_ptr = detector_;
+      ubv_dir      = ubv_dir_;
+      pre_ms       = pre_buffer_ms_;
+      det_ptr      = detector_;
+      det_override = detect_override_;
     }
 
     // 2. Compute timestamps and IDs (no lock -- needs ip_to_mac_ which is read-only).
@@ -646,15 +653,16 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     std::vector<unsigned char> snapshot;
     if (db_->needs_snapshot() && !snap_url.empty()) {
       snapshot = fetch_snapshot(snap_url, snap_user, snap_pass);
-      // Crop snapshot: prefer ONVIF bbox, then on-device detection,
-      // then fall back to the smart-crop heuristic.
+      // Crop snapshot.  Priority:
+      //   det_override=false: ONVIF bbox → detector → smart-crop heuristic
+      //   det_override=true : detector → smart-crop heuristic (ONVIF bbox ignored)
       if (!snapshot.empty()) {
         int img_w = 0, img_h = 0;
         if (jpeg_read_dimensions(snapshot, &img_w, &img_h)) {
           const jpeg_crop::BoundingBox* onvif_bbox =
-              ev.bbox ? &*ev.bbox : nullptr;
+              (ev.bbox && !det_override) ? &*ev.bbox : nullptr;
           std::optional<jpeg_crop::BoundingBox> det_result;
-          if (!onvif_bbox && det_ptr)
+          if ((!onvif_bbox || det_override) && det_ptr)
             det_result = det_ptr->detect(snapshot);
           const jpeg_crop::BoundingBox* det_bbox =
               det_result ? &*det_result : nullptr;

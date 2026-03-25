@@ -148,6 +148,10 @@ class DetectionRecorder {
   /// The detector must outlive the DetectionRecorder.
   void set_detector(const object_detect::ObjectDetector* detector);
 
+  /// When override is true the detector is always run, ignoring any ONVIF
+  /// bounding box provided by the camera. Has no effect if no detector is set.
+  void set_detect_override(bool override);
+
   // Defined in detection_recorder.cpp -- public so concrete backends in the
   // .cpp translation unit can inherit from it without friendship.
   struct IDbBackend {
@@ -246,6 +250,9 @@ class DetectionRecorder {
   // Optional object detector for thumbnail subject cropping.
   // Set before run(); read-only (non-owning pointer) after that.
   const object_detect::ObjectDetector* detector_{nullptr};
+
+  // When true the detector is preferred over ONVIF-provided bounding boxes.
+  bool detect_override_{false};
 };
 
 }  // namespace onvif

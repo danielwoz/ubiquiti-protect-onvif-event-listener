@@ -62,8 +62,14 @@ ABSL_FLAG(int32_t, post_buffer_sec, 2,
 ABSL_FLAG(bool, verbose, false,
     "Enable verbose logging (lifecycle, events, renewals).");
 ABSL_FLAG(std::string, model_dir, "",
-    "Directory containing nanodet_m.param and nanodet_m.bin; "
-    "if empty, smart-crop heuristic is used.");
+    "Directory containing nanodet_m.param and nanodet_m.bin.");
+ABSL_FLAG(bool, detect, false,
+    "Enable NanoDet-M object detection for thumbnail cropping "
+    "(requires --model_dir). Runs as fallback when the camera provides "
+    "no ONVIF bounding box.");
+ABSL_FLAG(bool, detect_override, false,
+    "Run NanoDet-M on every thumbnail regardless of whether the camera "
+    "provides an ONVIF bounding box. Implies --detect.");
 
 // ============================================================
 // JSON helpers (used only by EventRecorder)
@@ -228,18 +234,26 @@ int main(int argc, char* argv[]) {
   onvif::DetectionRecorder& det_rec = **dr_or;
   det_rec.set_buffer(pre_buf_sec, post_buf_sec);
 
-  // Optional: load NCNN object detector for thumbnail subject cropping.
+  // Optional: load NanoDet-M for thumbnail subject cropping.
   std::unique_ptr<object_detect::ObjectDetector> detector;
-  const std::string model_dir = absl::GetFlag(FLAGS_model_dir);
-  if (!model_dir.empty()) {
+  const std::string model_dir      = absl::GetFlag(FLAGS_model_dir);
+  const bool        detect         = absl::GetFlag(FLAGS_detect);
+  const bool        detect_override = absl::GetFlag(FLAGS_detect_override);
+  if ((detect || detect_override) && !model_dir.empty()) {
     auto det = object_detect::ObjectDetector::Load(
         model_dir + "/nanodet_m.param",
         model_dir + "/nanodet_m.bin");
     if (det.ok()) {
       detector = std::move(*det);
       det_rec.set_detector(detector.get());
-      std::fprintf(stderr, "[detect] loaded nanodet_m from %s\n",
-                   model_dir.c_str());
+      if (detect_override) {
+        det_rec.set_detect_override(true);
+        std::fprintf(stderr, "[detect] override mode: NanoDet-M from %s\n",
+                     model_dir.c_str());
+      } else {
+        std::fprintf(stderr, "[detect] fallback mode: NanoDet-M from %s\n",
+                     model_dir.c_str());
+      }
     } else {
       std::fprintf(stderr,
                    "[detect] model not loaded (smart-crop fallback): %s\n",
