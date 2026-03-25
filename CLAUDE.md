@@ -172,3 +172,25 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 
 `ubv_extract` accepts `--db_host` (default `127.0.0.1`) to override the Protect DB host.
 `gen_examples` accepts `--model_dir` for the NanoDet-M model path.
+
+## Deploying to a Dream Router / NVR
+
+```bash
+# 1. Cross-compile for ARM64
+bazel build --config=arm64 //:onvif_recorder
+
+# 2. Copy binary to router (replace <router-ip> with your device's IP)
+scp bazel-bin/onvif_recorder root@<router-ip>:/root/onvif_recorder
+
+# 3. Copy (or update) the systemd service file
+scp onvif-recorder.service root@<router-ip>:/etc/systemd/system/onvif-recorder.service
+
+# 4. Reload systemd and restart the service on the router
+ssh root@<router-ip> "systemctl daemon-reload && systemctl restart onvif-recorder"
+
+# 5. Verify it is running
+ssh root@<router-ip> "systemctl status onvif-recorder"
+```
+
+The binary lives at `/root/onvif_recorder` and the service file at
+`/etc/systemd/system/onvif-recorder.service` on UniFi Dream Routers and NVRs.
