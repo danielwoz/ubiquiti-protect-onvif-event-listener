@@ -40,12 +40,21 @@ namespace onvif {
  * Supported ONVIF event formats
  * ------------------------------
  * AI events (suppress basic motion from the same camera once seen):
- *   tns1:RuleEngine/FieldDetector/ObjectsInside  (Hikvision)
+ *   tns1:RuleEngine/FieldDetector/ObjectsInside  (Hikvision IVS)
  *     source["Rule"]   = "Human" | "Vehicle"
  *     data["IsInside"] = "true"  | "false"
  *
- *   tns1:UserAlarm/IVA/HumanShapeDetect  (Dahua)
+ *   tns1:UserAlarm/IVA/HumanShapeDetect  (Hikvision knockoff / Dahua)
  *     data["State"]    = "true"  | "false"   (always maps to "person")
+ *
+ *   tns1:VehicleAlarm/IVB/VehicleDetect  (Hikvision knockoff / Dahua)
+ *     data["State"]    = "true"  | "false"   (always maps to "vehicle")
+ *
+ *   tns1:RuleEngine/MyRuleDetector/PeopleDetect  (Reolink)
+ *     data["State"]    = "true"  | "false"   (maps to "person")
+ *
+ *   tns1:RuleEngine/MyRuleDetector/VehicleDetect  (Reolink)
+ *     data["State"]    = "true"  | "false"   (maps to "vehicle")
  *
  * Basic motion events (suppressed when camera emits AI events):
  *   tns1:RuleEngine/CellMotionDetector/Motion  (Amcrest, Lorex, UNVR etc.)

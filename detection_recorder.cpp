@@ -70,11 +70,32 @@ std::optional<Detection> classify(const OnvifEvent& ev) {
     return Detection{type, inside_it->second == "true", ev.event_time};
   }
 
-  // --- Camera 109 style: HumanShapeDetect ---
+  // --- HumanShapeDetect (Hikvision knockoff / Dahua) ---
   if (ev.topic == "tns1:UserAlarm/IVA/HumanShapeDetect") {
     auto it = ev.data.find("State");
     if (it == ev.data.end()) return {};
     return Detection{"human", it->second == "true", ev.event_time};
+  }
+
+  // --- VehicleDetect (Hikvision knockoff / Dahua) ---
+  if (ev.topic == "tns1:VehicleAlarm/IVB/VehicleDetect") {
+    auto it = ev.data.find("State");
+    if (it == ev.data.end()) return {};
+    return Detection{"vehicle", it->second == "true", ev.event_time};
+  }
+
+  // --- Reolink: person detection (MyRuleDetector) ---
+  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/PeopleDetect") {
+    auto it = ev.data.find("State");
+    if (it == ev.data.end()) return {};
+    return Detection{"human", it->second == "true", ev.event_time};
+  }
+
+  // --- Reolink: vehicle detection (MyRuleDetector) ---
+  if (ev.topic == "tns1:RuleEngine/MyRuleDetector/VehicleDetect") {
+    auto it = ev.data.find("State");
+    if (it == ev.data.end()) return {};
+    return Detection{"vehicle", it->second == "true", ev.event_time};
   }
 
   // --- Generic CellMotionDetector/Motion (Amcrest, Lorex, Dahua, etc.) ---
@@ -395,7 +416,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
       "INSERT INTO events"
       " (id, type, start, \"cameraId\", score, \"smartDetectTypes\","
       "  metadata, locked, \"thumbnailId\", \"createdAt\", \"updatedAt\")"
-      " VALUES ($1, 'smartDetectZone', $2::bigint, $3, 0, $4::json,"
+      " VALUES ($1, 'smartDetectZone', $2::bigint, $3, 100, $4::json,"
       "         '{}'::json, false, $5, $6, $7)",
       7, params);
   }
@@ -671,13 +692,19 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
   // it is only used as a fallback for cameras that have neither.
   {
     std::lock_guard<std::mutex> lk(mu_);
-    if (ev.topic == "tns1:RuleEngine/FieldDetector/ObjectsInside" ||
-        ev.topic == "tns1:UserAlarm/IVA/HumanShapeDetect") {
+    if ((ev.topic == "tns1:RuleEngine/FieldDetector/ObjectsInside" ||
+         ev.topic == "tns1:UserAlarm/IVA/HumanShapeDetect"         ||
+         ev.topic == "tns1:VehicleAlarm/IVB/VehicleDetect"         ||
+         ev.topic == "tns1:RuleEngine/MyRuleDetector/PeopleDetect"  ||
+         ev.topic == "tns1:RuleEngine/MyRuleDetector/VehicleDetect") &&
+        ev.property_op != "Initialized") {
       ai_capable_cameras_.insert(ev.camera_ip);
-    } else if (ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion") {
+    } else if (ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion" &&
+               ev.property_op != "Initialized") {
       if (ai_capable_cameras_.count(ev.camera_ip)) return;
       cell_motion_cameras_.insert(ev.camera_ip);
-    } else if (ev.topic == "tns1:VideoSource/MotionAlarm") {
+    } else if (ev.topic == "tns1:VideoSource/MotionAlarm" &&
+               ev.property_op != "Initialized") {
       if (ai_capable_cameras_.count(ev.camera_ip) ||
           cell_motion_cameras_.count(ev.camera_ip)) return;
     }
