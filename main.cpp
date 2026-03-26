@@ -16,7 +16,8 @@
  * main.cpp -- ONVIF event recorder binary.
  *
  * Uses onvif::OnvifListener to receive events from cameras and:
- *   - writes every raw event as a JSON Lines entry to a timestamped .jsonl file
+ *   - optionally writes every parsed event as JSON Lines (--event_log)
+ *   - optionally writes every raw SOAP exchange as JSON Lines (--raw_log)
  *   - records human/vehicle detection intervals to the UniFi Protect PostgreSQL DB
  */
 
@@ -27,7 +28,6 @@
 #include <ctime>
 #include <fstream>
 #include <iomanip>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -37,6 +37,9 @@
 
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
+#include "absl/log/globals.h"
+#include "absl/log/initialize.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "detection_recorder.hpp"
@@ -60,7 +63,8 @@ ABSL_FLAG(int32_t, pre_buffer_sec, 2,
 ABSL_FLAG(int32_t, post_buffer_sec, 2,
     "Seconds to buffer after the last detection event.");
 ABSL_FLAG(bool, verbose, false,
-    "Enable verbose logging (lifecycle, events, renewals).");
+    "Enable verbose logging (INFO level): subscription lifecycle, "
+    "events received, and renewals. Default logs errors only.");
 ABSL_FLAG(std::string, model_dir, "",
     "Directory containing nanodet_m.param and nanodet_m.bin.");
 ABSL_FLAG(bool, detect, false,
@@ -70,6 +74,14 @@ ABSL_FLAG(bool, detect, false,
 ABSL_FLAG(bool, detect_override, false,
     "Run NanoDet-M on every thumbnail regardless of whether the camera "
     "provides an ONVIF bounding box. Implies --detect.");
+ABSL_FLAG(std::string, event_log, "",
+    "Path for the parsed-event JSON Lines log file. "
+    "Each line is one ONVIF event with topic, source, data, and timestamp. "
+    "Empty (default) disables this log.");
+ABSL_FLAG(std::string, raw_log, "",
+    "Path for the raw SOAP exchange JSON Lines log file. "
+    "Each line is one full HTTP request/response pair (large). "
+    "Empty (default) disables this log.");
 
 // ============================================================
 // JSON helpers (used only by EventRecorder)
@@ -137,7 +149,7 @@ class EventRecorder {
     auto r = std::unique_ptr<EventRecorder>(new EventRecorder(path));
     if (!r->file_.is_open())
       return absl::InternalError("Cannot open: " + path);
-    std::cerr << "[recorder] output -> " << path << '\n';
+    LOG(INFO) << "[recorder] event log -> " << path;
     return r;
   }
 
@@ -182,52 +194,55 @@ static void signal_handler(int) {
 // ============================================================
 int main(int argc, char* argv[]) {
   absl::ParseCommandLine(argc, argv);
+  absl::InitializeLog();
 
-  std::time_t t0 = std::time(nullptr);
-  std::tm tm0{};
-  gmtime_r(&t0, &tm0);
-  char ts_buf[32];
-  std::strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", &tm0);
-  std::string output_path  = std::string("onvif_events_") + ts_buf + ".jsonl";
-  std::string raw_path     = std::string("onvif_raw_")    + ts_buf + ".jsonl";
+  const bool verbose = absl::GetFlag(FLAGS_verbose);
+  if (verbose) {
+    absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfo);
+  } else {
+    absl::SetMinLogLevel(absl::LogSeverityAtLeast::kError);
+  }
 
   const std::string db_conn     = absl::GetFlag(FLAGS_db_conn);
   const std::string db_host     = absl::GetFlag(FLAGS_db_host);
   const std::string thumbs_dir  = absl::GetFlag(FLAGS_ubv_dir);
+  const std::string event_log   = absl::GetFlag(FLAGS_event_log);
+  const std::string raw_log     = absl::GetFlag(FLAGS_raw_log);
   const uint32_t pre_buf_sec    =
       static_cast<uint32_t>(absl::GetFlag(FLAGS_pre_buffer_sec));
   const uint32_t post_buf_sec   =
       static_cast<uint32_t>(absl::GetFlag(FLAGS_post_buffer_sec));
-  const bool verbose            = absl::GetFlag(FLAGS_verbose);
 
-  std::cerr << "ONVIF Event Recorder\n"
-            << "Events file : " << output_path  << '\n'
-            << "Raw file    : " << raw_path      << '\n'
-            << "DB backend  : postgres\n"
-            << "DB conn     : " << db_conn       << '\n'
-            << "DB host     : " << (db_host.empty() ? "(default)" : db_host) << '\n'
-            << "Pre-buffer  : " << pre_buf_sec   << " s\n"
-            << "Post-buffer : " << post_buf_sec  << " s\n"
-            << "Verbose     : " << (verbose ? "yes" : "no") << '\n';
+  LOG(INFO) << "ONVIF Event Recorder starting";
+  LOG(INFO) << "DB conn     : " << db_conn;
+  LOG(INFO) << "DB host     : " << (db_host.empty() ? "(default)" : db_host);
+  LOG(INFO) << "Pre-buffer  : " << pre_buf_sec << " s";
+  LOG(INFO) << "Post-buffer : " << post_buf_sec << " s";
+  LOG(INFO) << "Event log   : " << (event_log.empty() ? "(disabled)" : event_log);
+  LOG(INFO) << "Raw log     : " << (raw_log.empty() ? "(disabled)" : raw_log);
   if (!thumbs_dir.empty())
-    std::cerr << "UBV dir     : " << thumbs_dir << '\n';
-  std::cerr << "Press Ctrl+C to stop\n\n";
+    LOG(INFO) << "UBV dir     : " << thumbs_dir;
 
   onvif::global_init();
 
-  // EventRecorder
-  auto er_or = EventRecorder::Create(output_path);
-  if (!er_or.ok()) {
-    std::cerr << "Fatal: " << er_or.status().message() << '\n';
-    onvif::global_cleanup();
-    return 1;
+  // EventRecorder (optional)
+  std::unique_ptr<EventRecorder> event_rec_storage;
+  EventRecorder* event_rec = nullptr;
+  if (!event_log.empty()) {
+    auto er_or = EventRecorder::Create(event_log);
+    if (!er_or.ok()) {
+      LOG(ERROR) << "Fatal: " << er_or.status().message();
+      onvif::global_cleanup();
+      return 1;
+    }
+    event_rec_storage = std::move(*er_or);
+    event_rec = event_rec_storage.get();
   }
-  EventRecorder& event_rec = **er_or;
 
   // DetectionRecorder
   auto dr_or = onvif::DetectionRecorder::Create(db_conn);
   if (!dr_or.ok()) {
-    std::cerr << "Fatal: " << dr_or.status().message() << '\n';
+    LOG(ERROR) << "Fatal: " << dr_or.status().message();
     onvif::global_cleanup();
     return 1;
   }
@@ -236,8 +251,8 @@ int main(int argc, char* argv[]) {
 
   // Optional: load NanoDet-M for thumbnail subject cropping.
   std::unique_ptr<object_detect::ObjectDetector> detector;
-  const std::string model_dir      = absl::GetFlag(FLAGS_model_dir);
-  const bool        detect         = absl::GetFlag(FLAGS_detect);
+  const std::string model_dir       = absl::GetFlag(FLAGS_model_dir);
+  const bool        detect          = absl::GetFlag(FLAGS_detect);
   const bool        detect_override = absl::GetFlag(FLAGS_detect_override);
   if ((detect || detect_override) && !model_dir.empty()) {
     auto det = object_detect::ObjectDetector::Load(
@@ -248,16 +263,13 @@ int main(int argc, char* argv[]) {
       det_rec.set_detector(detector.get());
       if (detect_override) {
         det_rec.set_detect_override(true);
-        std::fprintf(stderr, "[detect] override mode: NanoDet-M from %s\n",
-                     model_dir.c_str());
+        LOG(INFO) << "[detect] override mode: NanoDet-M from " << model_dir;
       } else {
-        std::fprintf(stderr, "[detect] fallback mode: NanoDet-M from %s\n",
-                     model_dir.c_str());
+        LOG(INFO) << "[detect] fallback mode: NanoDet-M from " << model_dir;
       }
     } else {
-      std::fprintf(stderr,
-                   "[detect] model not loaded (smart-crop fallback): %s\n",
-                   std::string(det.status().message()).c_str());
+      LOG(WARNING) << "[detect] model not loaded (no ML crop): "
+                   << det.status().message();
     }
   }
 
@@ -265,7 +277,6 @@ int main(int argc, char* argv[]) {
   g_listener = &listener;
   std::signal(SIGINT,  signal_handler);
   std::signal(SIGTERM, signal_handler);
-  if (verbose) listener.enable_verbose_logging();
 
   if (!thumbs_dir.empty())
     det_rec.set_ubv_dir(thumbs_dir);
@@ -277,14 +288,14 @@ int main(int argc, char* argv[]) {
 
   auto cams_or = unifi::load_cameras(cam_db);
   if (!cams_or.ok()) {
-    std::cerr << "Fatal: " << cams_or.status().message() << '\n';
+    LOG(ERROR) << "Fatal: " << cams_or.status().message();
     onvif::global_cleanup();
     return 1;
   }
   auto cameras = std::move(*cams_or);
 
   if (auto s = unifi::enable_smart_detect(cameras, cam_db); !s.ok()) {
-    std::cerr << "Fatal: " << s.message() << '\n';
+    LOG(ERROR) << "Fatal: " << s.message();
     onvif::global_cleanup();
     return 1;
   }
@@ -293,20 +304,19 @@ int main(int argc, char* argv[]) {
     cam.max_consecutive_failures = 3;
     listener.add_camera(cam);
     det_rec.set_snapshot(cam);
+    LOG(INFO) << "Watching camera " << cam.ip;
   }
-  listener.enable_raw_recording(raw_path);
 
-  listener.run([&event_rec, &det_rec](const onvif::OnvifEvent& ev) {
-    event_rec.write(ev);
+  if (!raw_log.empty())
+    listener.enable_raw_recording(raw_log);
+
+  listener.run([event_rec, &det_rec](const onvif::OnvifEvent& ev) {
+    if (event_rec) event_rec->write(ev);
     det_rec.on_event(ev);
   });
 
   g_listener = nullptr;
   onvif::global_cleanup();
-  std::cerr << "\nDone.\n"
-            << "  Events     : " << output_path << '\n'
-            << "  Raw        : " << raw_path    << '\n'
-            << "  Database   : " << db_conn     << '\n'
-            << "  Thumbnails : " << thumbs_dir  << "/\n";
+  LOG(INFO) << "Done";
   return 0;
 }

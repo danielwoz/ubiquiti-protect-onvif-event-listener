@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "jpeg_crop.hpp"
@@ -341,12 +342,12 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   // PQreset() re-uses the same conninfo string; safe to call on a live conn.
   void maybe_reconnect() {
     if (PQstatus(conn_) != CONNECTION_BAD) return;
-    std::fprintf(stderr, "[pg] connection lost — attempting reconnect\n");
+    LOG(WARNING) << "[pg] connection lost — attempting reconnect";
     PQreset(conn_);
     if (PQstatus(conn_) == CONNECTION_OK)
-      std::fprintf(stderr, "[pg] reconnected\n");
+      LOG(INFO) << "[pg] reconnected";
     else
-      std::fprintf(stderr, "[pg] reconnect failed: %s\n", PQerrorMessage(conn_));
+      LOG(ERROR) << "[pg] reconnect failed: " << PQerrorMessage(conn_);
   }
 
   // Return the best available error string for a failed query.
@@ -368,7 +369,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
                                  params, lengths, formats, 0);
     ExecStatusType st = PQresultStatus(res);
     if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK)
-      std::fprintf(stderr, "[pg] query failed: %s\n", pg_errmsg(res));
+      LOG(ERROR) << "[pg] query failed: " << pg_errmsg(res);
     PQclear(res);
   }
 
@@ -525,7 +526,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
       7, nullptr, params, lengths, formats, 0);
     ExecStatusType st = PQresultStatus(res);
     if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK)
-      std::fprintf(stderr, "[pg] thumbnail insert failed: %s\n", pg_errmsg(res));
+      LOG(ERROR) << "[pg] thumbnail insert failed: " << pg_errmsg(res);
     PQclear(res);
   }
 };
@@ -697,8 +698,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           ubv_dir + "/" + ev.camera_ip + "_thumbnails.ubv";
         auto s = ubv::append(ubv_path, {ts_ms, snapshot});
         if (!s.ok()) {
-          std::fprintf(stderr, "[ubv] append failed (non-fatal): %s\n",
-                       std::string(s.message()).c_str());
+          LOG(WARNING) << "[ubv] append failed (non-fatal): " << s.message();
         }
       }
       db_->write_thumbnail(thumb_id, event_id, ev.camera_ip,

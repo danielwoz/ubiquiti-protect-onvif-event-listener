@@ -111,12 +111,6 @@ class OnvifListener {
     ///   response_status (HTTP code), response (full SOAP XML string)
     void enable_raw_recording(const std::string& path);
 
-    /// Enable verbose logging to stderr. By default only errors and give-up
-    /// events are logged. With verbose enabled, lifecycle events (subscription
-    /// established, renewed, events received) are also printed.
-    /// Can also be enabled at runtime via the ONVIF_VERBOSE=1 env var.
-    void enable_verbose_logging();
-
     /// Spawn one thread per camera. Invoke cb for every received event
     /// (from the camera's own thread -- cb must be thread-safe).
     /// Blocks until stop() is called and all threads have joined.
@@ -130,7 +124,6 @@ class OnvifListener {
     std::atomic<bool>         running_{false};
     std::vector<CameraConfig> cameras_;
     std::string               raw_path_;   // empty = raw recording disabled
-    bool                      verbose_{false};
 };
 
 }  // namespace onvif

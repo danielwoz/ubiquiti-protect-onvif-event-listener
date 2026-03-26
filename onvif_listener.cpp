@@ -45,6 +45,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 
@@ -445,12 +446,11 @@ class CameraWorker {
   CameraWorker(const CameraConfig& cfg,
                const EventCallback& cb,
                const std::atomic<bool>& running,
-               RawRecorder* raw,
-               bool verbose)
-    : cfg_(cfg), cb_(cb), running_(running), raw_(raw), verbose_(verbose) {}
+               RawRecorder* raw)
+    : cfg_(cfg), cb_(cb), running_(running), raw_(raw) {}
 
   void run() {
-    vlog("started");
+    LOG(INFO) << '[' << cfg_.ip << "] started";
     const int max_failures = cfg_.max_consecutive_failures;  // 0 = unlimited
     const int window_sec   = cfg_.failure_window_sec;
     int consecutive_failures = 0;
@@ -464,16 +464,20 @@ class CameraWorker {
         ++consecutive_failures;
         if (max_failures > 0 && consecutive_failures >= max_failures) {
           pause_and_reset(&consecutive_failures, streak_start, window_sec,
-              std::string("camera unreachable after ") +
+              std::string("[") + cfg_.ip +
+              "] camera unreachable after " +
               std::to_string(consecutive_failures) +
               " consecutive failures -- pausing before retry"
               " (last error: " + std::string(sub_or.status().message()) + ")");
           continue;
         }
-        log(std::string("error: ") + std::string(sub_or.status().message()) +
-            ", reconnecting in " + std::to_string(cfg_.retry_interval_sec) + "s" +
-            (max_failures > 0 ? " (" + std::to_string(consecutive_failures) +
-             "/" + std::to_string(max_failures) + ")" : ""));
+        LOG(ERROR) << '[' << cfg_.ip << "] error: "
+                   << sub_or.status().message()
+                   << ", reconnecting in " << cfg_.retry_interval_sec << "s"
+                   << (max_failures > 0
+                         ? " (" + std::to_string(consecutive_failures) +
+                           "/" + std::to_string(max_failures) + ")"
+                         : "");
         sleep_interruptible(cfg_.retry_interval_sec);
         continue;
       }
@@ -485,22 +489,25 @@ class CameraWorker {
         ++consecutive_failures;
         if (max_failures > 0 && consecutive_failures >= max_failures) {
           pause_and_reset(&consecutive_failures, streak_start, window_sec,
-              "failed to get subscription URL after " +
+              std::string("[") + cfg_.ip +
+              "] failed to get subscription URL after " +
               std::to_string(consecutive_failures) +
               " consecutive attempts -- pausing before retry");
           continue;
         }
-        log("failed to get subscription URL, retrying in " +
-            std::to_string(cfg_.retry_interval_sec) + "s" +
-            (max_failures > 0 ? " (" + std::to_string(consecutive_failures) +
-             "/" + std::to_string(max_failures) + ")" : ""));
+        LOG(ERROR) << '[' << cfg_.ip << "] failed to get subscription URL"
+                   << ", retrying in " << cfg_.retry_interval_sec << "s"
+                   << (max_failures > 0
+                         ? " (" + std::to_string(consecutive_failures) +
+                           "/" + std::to_string(max_failures) + ")"
+                         : "");
         sleep_interruptible(cfg_.retry_interval_sec);
         continue;
       }
 
       // Successful subscription -- reset the failure counter.
       consecutive_failures = 0;
-      vlog("subscription -> " + sub_url);
+      LOG(INFO) << '[' << cfg_.ip << "] subscription -> " << sub_url;
 
       auto renew_at =
         std::chrono::steady_clock::now() + std::chrono::seconds(90);
@@ -510,7 +517,7 @@ class CameraWorker {
         if (std::chrono::steady_clock::now() >= renew_at) {
           absl::Status rs = renew(sub_url);
           if (!rs.ok())
-            log("renew error: " + std::string(rs.message()));
+            LOG(WARNING) << '[' << cfg_.ip << "] renew error: " << rs.message();
           renew_at = std::chrono::steady_clock::now()
                      + std::chrono::seconds(90);
         }
@@ -521,33 +528,28 @@ class CameraWorker {
           ++consecutive_failures;
           if (max_failures > 0 && consecutive_failures >= max_failures) {
             pause_and_reset(&consecutive_failures, streak_start, window_sec,
-                std::string("camera unreachable after ") +
+                std::string("[") + cfg_.ip +
+                "] camera unreachable after " +
                 std::to_string(consecutive_failures) +
                 " consecutive failures -- pausing before retry"
                 " (last error: " + std::string(ps.message()) + ")");
           } else {
-            log(std::string("error: ") + std::string(ps.message()) +
-                ", reconnecting in " + std::to_string(cfg_.retry_interval_sec) + "s" +
-                (max_failures > 0 ? " (" + std::to_string(consecutive_failures) +
-                 "/" + std::to_string(max_failures) + ")" : ""));
+            LOG(ERROR) << '[' << cfg_.ip << "] error: " << ps.message()
+                       << ", reconnecting in " << cfg_.retry_interval_sec << "s"
+                       << (max_failures > 0
+                             ? " (" + std::to_string(consecutive_failures) +
+                               "/" + std::to_string(max_failures) + ")"
+                             : "");
             sleep_interruptible(cfg_.retry_interval_sec);
           }
           inner_ok = false;
         }
       }
     }
-    vlog("stopped");
+    LOG(INFO) << '[' << cfg_.ip << "] stopped";
   }
 
  private:
-  void log(const std::string& msg) const {
-    std::cerr << '[' << cfg_.ip << "] " << msg << '\n';
-  }
-
-  void vlog(const std::string& msg) const {
-    if (verbose_) std::cerr << '[' << cfg_.ip << "] " << msg << '\n';
-  }
-
   void sleep_interruptible(int secs) {
     for (int i = 0; i < secs && running_; ++i)
       std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -564,7 +566,7 @@ class CameraWorker {
                          deadline - Clk::now());
     int pause_sec  = remaining.count() > 0
                      ? static_cast<int>(remaining.count()) : 0;
-    log(msg + " (retry in " + std::to_string(pause_sec) + "s)");
+    LOG(WARNING) << msg << " (retry in " << pause_sec << "s)";
     sleep_interruptible(pause_sec);
     *failures = 0;
   }
@@ -603,15 +605,15 @@ class CameraWorker {
 
     const HttpResponse& resp = *resp_or;
     if (resp.status_code != 200) {
-      vlog("CreatePullPointSubscription HTTP " +
-           std::to_string(resp.status_code) +
-           ": " + resp.body.substr(0, 300));
+      LOG(INFO) << '[' << cfg_.ip << "] CreatePullPointSubscription HTTP "
+                << resp.status_code << ": " << resp.body.substr(0, 300);
       return std::string{};
     }
 
     auto doc_or = XmlDoc::Create(resp.body);
     if (!doc_or.ok()) {
-      log(std::string("parse sub URL: ") + std::string(doc_or.status().message()));
+      LOG(ERROR) << '[' << cfg_.ip << "] parse sub URL: "
+                 << doc_or.status().message();
       return std::string{};
     }
     return XmlDoc::trim(
@@ -632,9 +634,9 @@ class CameraWorker {
     auto resp_or = soap_post_r(sub_url, soap, ACTION, 15);
     if (!resp_or.ok()) return resp_or.status();
     if (resp_or->status_code == 200)
-      vlog("subscription renewed");
+      LOG(INFO) << '[' << cfg_.ip << "] subscription renewed";
     else
-      log("renew HTTP " + std::to_string(resp_or->status_code));
+      LOG(WARNING) << '[' << cfg_.ip << "] renew HTTP " << resp_or->status_code;
     return absl::OkStatus();
   }
 
@@ -662,12 +664,11 @@ class CameraWorker {
 
     auto events = parse_notifications(resp.body);
     if (!events.empty())
-      vlog("received " + std::to_string(events.size()) + " event(s)");
+      LOG(INFO) << '[' << cfg_.ip << "] received " << events.size() << " event(s)";
 
     for (auto& n : events) {
-      vlog("  topic=" + n.topic +
-           " op="    + n.property_op +
-           " t="     + n.event_time);
+      LOG(INFO) << '[' << cfg_.ip << "]   topic=" << n.topic
+                << " op=" << n.property_op << " t=" << n.event_time;
       cb_(OnvifEvent{
         cfg_.ip, cfg_.user,
         n.topic, n.event_time, n.property_op,
@@ -765,7 +766,6 @@ class CameraWorker {
   const EventCallback&      cb_;
   const std::atomic<bool>&  running_;
   RawRecorder*              raw_;      // nullable; not owned
-  bool                      verbose_;
 };
 
 }  // anonymous namespace
@@ -782,10 +782,6 @@ void OnvifListener::add_camera(const CameraConfig& cfg) {
 
 void OnvifListener::enable_raw_recording(const std::string& path) {
   raw_path_ = path;
-}
-
-void OnvifListener::enable_verbose_logging() {
-  verbose_ = true;
 }
 
 void OnvifListener::run(EventCallback cb) {
@@ -809,7 +805,7 @@ void OnvifListener::run(EventCallback cb) {
   workers.reserve(cameras_.size());
   for (const auto& cam : cameras_)
     workers.push_back(
-      std::make_unique<CameraWorker>(cam, cb, running_, raw, verbose_));
+      std::make_unique<CameraWorker>(cam, cb, running_, raw));
 
   // Launch one thread per camera
   std::vector<std::thread> threads;

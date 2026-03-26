@@ -120,8 +120,8 @@ Optionally, per-camera UBV thumbnail files are also written to `ONVIF_UBV_DIR` i
   with `--detect` (or `--detect_override`) to enable on-device detection.
 - Thumbnail crop modes (default → ONVIF bbox only; no bbox → full image stored uncropped):
   - default: ONVIF bbox → crop; no bbox → full image
-  - `--detect`: ONVIF bbox → crop; no bbox → NanoDet-M → smart_crop
-  - `--detect_override`: always NanoDet-M → smart_crop (ONVIF bbox discarded)
+  - `--detect`: ONVIF bbox → crop; no bbox → NanoDet-M → full image
+  - `--detect_override`: always NanoDet-M → full image (ONVIF bbox discarded)
 - NCNN is built from source via `rules_foreign_cc` cmake(); model files are downloaded
   by Bazel `http_file` rules (`nanodet_m_param`, `nanodet_m_bin`).
 
@@ -165,10 +165,15 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--ubv_dir` | _(empty)_ | Directory for per-camera UBV thumbnail files (optional) |
 | `--pre_buffer_sec` | `2` | Seconds to buffer before the first detection event |
 | `--post_buffer_sec` | `2` | Seconds to buffer after the last detection event |
-| `--verbose` | `false` | Enable verbose logging (lifecycle, events, renewals) |
+| `--verbose` | `false` | Set absl log level to INFO (lifecycle, events, renewals). Default: ERROR only |
+| `--event_log` | _(disabled)_ | Path for parsed-event JSON Lines log; one line per ONVIF event |
+| `--raw_log` | _(disabled)_ | Path for raw SOAP exchange JSON Lines log; one line per HTTP request/response |
 | `--model_dir` | _(empty)_ | Directory containing `nanodet_m.param` and `nanodet_m.bin` |
 | `--detect` | `false` | Enable NanoDet-M as fallback when the camera provides no ONVIF bbox (requires `--model_dir`) |
 | `--detect_override` | `false` | Always run NanoDet-M, ignoring the ONVIF bbox entirely (implies `--detect`) |
+
+Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default is `kError`.
+`enable_verbose_logging()` has been removed from `OnvifListener`; set log level via absl before calling `run()`.
 
 `ubv_extract` accepts `--db_host` (default `127.0.0.1`) to override the Protect DB host.
 `gen_examples` accepts `--model_dir` for the NanoDet-M model path.

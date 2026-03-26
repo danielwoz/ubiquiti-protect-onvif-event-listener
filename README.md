@@ -38,7 +38,67 @@ systemctl status onvif-recorder
 ```
 
 Detections will appear in UniFi Protect within seconds of the first motion event.
-Logs are written to `/var/log/onvif-recorder.log`.
+Service logs are written to `/var/log/onvif-recorder.log` (errors only by default).
+
+---
+
+## Configuration flags
+
+All options are set via command-line flags. The service file passes no flags by
+default, so all behaviour described below is the out-of-the-box default.
+
+To change a flag for the service, edit `/etc/systemd/system/onvif-recorder.service`
+and append flags to the `ExecStart` line, then reload:
+
+```bash
+# Example: enable verbose logging and write a raw diagnostic log
+ExecStart=/root/onvif_recorder --verbose --raw_log=/var/log/onvif-raw.jsonl
+```
+
+```bash
+systemctl daemon-reload && systemctl restart onvif-recorder
+```
+
+### Database
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--db_conn` | `host=/run/postgresql port=5433 dbname=unifi-protect user=postgres` | libpq connection string for the UniFi Protect database. You only need to change this if your database is on a different host or port. |
+| `--db_host` | _(empty = Unix socket)_ | Override only the PostgreSQL host used when loading camera credentials from the database. Useful when running the recorder on a different machine than the Dream Router. |
+
+### Detection buffers
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--pre_buffer_sec` | `2` | How many seconds before the first detection event to mark as the start of a clip. |
+| `--post_buffer_sec` | `2` | How many seconds after the last detection event to mark as the end of a clip. |
+
+### Logging
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--verbose` | `false` | Enable informational logging: subscription established, events received, renewals. Without this flag only errors are logged. |
+| `--event_log` | _(disabled)_ | Path to write each parsed ONVIF event as a JSON Lines entry. One line per event with topic, source, data, and timestamp. Useful for understanding what your cameras are reporting. |
+| `--raw_log` | _(disabled)_ | Path to write every raw SOAP HTTP exchange as a JSON Lines entry. One line per request/response pair — these files are large. Used for deep diagnostics and bug reports. |
+
+**Log levels** (controlled via `--verbose`):
+- **Default (errors only):** Connection failures, database errors, and other problems that need attention.
+- **Verbose (`--verbose`):** Everything above, plus subscription lifecycle (connected, renewed, disconnected) and event counts per poll cycle.
+
+### Thumbnails (optional)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--ubv_dir` | _(disabled)_ | Directory for per-camera UBV thumbnail files. Each camera gets its own file: `<dir>/<camera_ip>_thumbnails.ubv`. If not set, thumbnails are only written to the PostgreSQL `thumbnails` table. |
+| `--model_dir` | _(disabled)_ | Directory containing `nanodet_m.param` and `nanodet_m.bin` for on-device NanoDet-M object detection. Required for `--detect` and `--detect_override`. |
+| `--detect` | `false` | When the camera provides no ONVIF bounding box, run NanoDet-M to find the subject and crop the thumbnail. Falls back to the full uncropped image if detection finds nothing. Requires `--model_dir`. |
+| `--detect_override` | `false` | Always run NanoDet-M for thumbnail cropping, ignoring any ONVIF bounding box the camera provides. Implies `--detect`. Requires `--model_dir`. |
+
+**Thumbnail crop priority:**
+1. `--detect_override` set → always use NanoDet-M
+2. Camera provides an ONVIF bounding box → crop to that box
+3. `--detect` set and no ONVIF box → run NanoDet-M, fall back to full image
+4. Default (neither flag) → full uncropped image when no ONVIF box
 
 ---
 
@@ -55,7 +115,7 @@ The recorder uses negligible CPU at normal camera workloads:
 
 ## Troubleshooting
 
-**Check the log:**
+**Check the log for errors:**
 ```bash
 tail -f /var/log/onvif-recorder.log
 ```
@@ -63,14 +123,21 @@ tail -f /var/log/onvif-recorder.log
 **Enable verbose output** to see per-camera lifecycle events:
 ```bash
 systemctl stop onvif-recorder
-ONVIF_VERBOSE=1 /root/onvif_recorder
+/root/onvif_recorder --verbose
 ```
 
-**Camera not working?** Capture a diagnostic log and open a GitHub issue:
+**Camera not working?** Capture a raw diagnostic log and open a GitHub issue:
 ```bash
-ONVIF_VERBOSE=1 /root/onvif_recorder
+/root/onvif_recorder --verbose --raw_log=/tmp/onvif-raw.jsonl
 # Let it run 60+ seconds (one full subscribe → pull → renew cycle), then Ctrl+C
-# Attach the onvif_raw_<timestamp>.jsonl file to your issue
+# Attach /tmp/onvif-raw.jsonl to your issue
+```
+
+**Camera went offline and did not reconnect?** The recorder automatically retries.
+After 3 consecutive failures it pauses for up to 1 hour, then resumes. If a camera
+reboot takes longer than expected, restart the service:
+```bash
+systemctl restart onvif-recorder
 ```
 
 ---
