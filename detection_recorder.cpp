@@ -276,6 +276,10 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   std::map<std::string, std::string> ip_to_id_;
   std::map<std::string, std::string> ip_to_mac_;
 
+  // Cache of label name -> serial lid value from the `labels` table.
+  // Populated lazily by upsert_label(); avoids redundant DB queries.
+  std::map<std::string, int> label_cache_;
+
   static absl::StatusOr<std::unique_ptr<PgBackend>> Create(
       const std::string& conninfo) {
     auto b = std::make_unique<PgBackend>(conninfo);
@@ -488,6 +492,70 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
       6, params);
   }
 
+  // Upsert one label name; return its serial lid, or 0 on failure.
+  int upsert_label(const std::string& name, const std::string& now_str) {
+    auto it = label_cache_.find(name);
+    if (it != label_cache_.end()) return it->second;
+
+    maybe_reconnect();
+    const std::string label_id = generate_uuid();
+    const char* params[] = {
+      label_id.c_str(), name.c_str(), now_str.c_str()
+    };
+    PGresult* res = PQexecParams(conn_,
+      "INSERT INTO labels (id, name, \"createdAt\", \"updatedAt\")"
+      " VALUES ($1, $2, $3, $3)"
+      " ON CONFLICT (name) DO UPDATE SET \"updatedAt\" = EXCLUDED.\"updatedAt\""
+      " RETURNING lid",
+      3, nullptr, params, nullptr, nullptr, 0);
+    int lid = 0;
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+      lid = std::atoi(PQgetvalue(res, 0, 0));
+      label_cache_[name] = lid;
+    } else {
+      LOG(ERROR) << "[pg] upsert label failed: " << pg_errmsg(res);
+    }
+    PQclear(res);
+    return lid;
+  }
+
+  std::vector<int> upsert_labels(const std::vector<std::string>& names,
+                                  const std::string& now_str) override {
+    std::vector<int> lids;
+    for (const auto& name : names) {
+      int lid = upsert_label(name, now_str);
+      if (lid > 0) lids.push_back(lid);
+    }
+    return lids;
+  }
+
+  void insert_detection_label(const std::string&      event_id,
+                              const std::string&      object_id,
+                              const std::vector<int>& lids,
+                              const std::string&      now_str) override {
+    if (lids.empty()) return;
+
+    // Build PostgreSQL integer array literal: {1,2,3}
+    std::string arr = "{";
+    for (std::size_t i = 0; i < lids.size(); ++i) {
+      if (i > 0) arr += ',';
+      arr += std::to_string(lids[i]);
+    }
+    arr += '}';
+
+    const std::string dl_id = generate_uuid();
+    // Pass empty string for NULL object_id; NULLIF converts it to SQL NULL.
+    const char* params[] = {
+      dl_id.c_str(), event_id.c_str(), object_id.c_str(),
+      arr.c_str(), now_str.c_str(), now_str.c_str()
+    };
+    exec_params(
+      "INSERT INTO \"detectionLabels\""
+      " (id, \"eventId\", \"objectId\", labels, \"createdAt\", \"updatedAt\")"
+      " VALUES ($1, $2, NULLIF($3, ''), $4::integer[], $5, $6)",
+      6, params);
+  }
+
   void write_thumbnail(const std::string&              thumb_id,
                        const std::string&              event_id,
                        const std::string&              camera_ip,
@@ -565,6 +633,7 @@ void DetectionRecorder::set_snapshot(const CameraConfig& cam) {
   std::lock_guard<std::mutex> lk(mu_);
   snapshot_info_[cam.ip] = {cam.snapshot_url, cam.user, cam.password};
   db_->register_camera(cam.ip, cam.id, cam.mac);
+  if (!cam.id.empty()) camera_ids_[cam.ip] = cam.id;
 }
 
 void DetectionRecorder::set_detector(
@@ -621,7 +690,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
 
   if (det->started) {
     // 1. Look up snapshot + UBV config and buffer settings (brief lock, no I/O).
-    std::string snap_url, snap_user, snap_pass, ubv_dir;
+    std::string snap_url, snap_user, snap_pass, ubv_dir, cam_uuid;
     uint64_t pre_ms;
     const object_detect::ObjectDetector* det_ptr;
     bool det_override;
@@ -633,6 +702,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         snap_user = it->second.user;
         snap_pass = it->second.password;
       }
+      auto cit = camera_ids_.find(ev.camera_ip);
+      if (cit != camera_ids_.end()) cam_uuid = cit->second;
       ubv_dir      = ubv_dir_;
       pre_ms       = pre_buffer_ms_;
       det_ptr      = detector_;
@@ -689,6 +760,23 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     db_->insert_sdo(sdo_id, event_id, thumb_id, ev.camera_ip,
                     obj_type, attributes, ts_ms, now_str);
     db_->insert_smart_detect_raw(sdr_id, ev.camera_ip, ts_ms, obj_type, now_str);
+
+    // Insert detectionLabels rows so events appear in Protect's find-anything
+    // endpoint (which does INNER JOIN on detectionLabels WHERE objectId IS NULL).
+    {
+      std::vector<std::string> label_names = {
+        "eventType:smartDetectZone",
+        "smartDetectType:" + obj_type,
+      };
+      if (!cam_uuid.empty())
+        label_names.push_back("camera:" + cam_uuid);
+      const std::vector<int> lids = db_->upsert_labels(label_names, now_str);
+      if (!lids.empty()) {
+        db_->insert_detection_label(event_id, "",      lids, now_str);
+        db_->insert_detection_label(event_id, sdo_id, lids, now_str);
+      }
+    }
+
     open_[key] = event_id;
 
     // 4d. Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.

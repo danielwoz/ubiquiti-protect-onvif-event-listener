@@ -60,6 +60,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -430,10 +431,17 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
     std::string obj_type;
     uint64_t    ts_ms{0};
   };
+  struct DetLabelRow {
+    std::string      event_id;
+    std::string      object_id;  // empty = NULL
+    std::vector<int> lids;
+  };
 
-  std::vector<EventRow> events;
-  std::vector<SdoRow>   sdos;
-  std::vector<SdrRow>   sdrs;
+  std::vector<EventRow>   events;
+  std::vector<SdoRow>     sdos;
+  std::vector<SdrRow>     sdrs;
+  std::map<std::string, int> labels;      // name -> simulated lid
+  std::vector<DetLabelRow>   det_labels;
 
   absl::Status create_schema() override { return absl::OkStatus(); }
 
@@ -481,6 +489,30 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
                                const std::string& obj_type,
                                const std::string& /*now_str*/) override {
     sdrs.push_back({id, camera_ip, obj_type, ts_ms});
+  }
+
+  std::vector<int> upsert_labels(
+      const std::vector<std::string>& names,
+      const std::string& /*now_str*/) override {
+    std::vector<int> lids;
+    for (const auto& name : names) {
+      auto it = labels.find(name);
+      if (it == labels.end()) {
+        int lid = static_cast<int>(labels.size()) + 1;
+        labels[name] = lid;
+        lids.push_back(lid);
+      } else {
+        lids.push_back(it->second);
+      }
+    }
+    return lids;
+  }
+
+  void insert_detection_label(const std::string&      event_id,
+                              const std::string&      object_id,
+                              const std::vector<int>& lids,
+                              const std::string& /*now_str*/) override {
+    det_labels.push_back({event_id, object_id, lids});
   }
 };
 
@@ -680,6 +712,98 @@ static void test_detection_e2e(const std::string& ubv_dir) {
   for (auto& s : bptr->sdrs) if (s.ts_ms == 0) ++sdr_zero_ts;
   CHECK(sdr_zero_ts == 0,
         "expected all smartDetectRaws rows to have non-zero timestamp");
+
+  // =========================================================
+  // Verify labels table
+  // =========================================================
+  // Expected label names: eventType:smartDetectZone, smartDetectType:person,
+  // smartDetectType:vehicle (camera:<uuid> omitted -- test configs have no id).
+  {
+    bool has_event_type = false, has_person = false, has_vehicle = false;
+    for (const auto& kv : bptr->labels) {
+      if (kv.first == "eventType:smartDetectZone") has_event_type = true;
+      if (kv.first == "smartDetectType:person")    has_person     = true;
+      if (kv.first == "smartDetectType:vehicle")   has_vehicle    = true;
+    }
+    CHECK(has_event_type,
+          "expected 'eventType:smartDetectZone' label in labels table");
+    CHECK(has_person,
+          "expected 'smartDetectType:person' label in labels table");
+    CHECK(has_vehicle,
+          "expected 'smartDetectType:vehicle' label in labels table");
+  }
+
+  // =========================================================
+  // Verify detectionLabels rows
+  // =========================================================
+  // Each detection event needs one event-level row (objectId empty) so that
+  // Protect's find-anything INNER JOIN on detectionLabels returns the event.
+  {
+    int dl_event_rows = 0;
+    for (const auto& dl : bptr->det_labels)
+      if (dl.object_id.empty()) ++dl_event_rows;
+    CHECK(dl_event_rows == 3,
+          "expected 3 event-level detectionLabels rows (objectId NULL), got "
+          + std::to_string(dl_event_rows));
+  }
+
+  // Each SDO also needs an object-level row (objectId = sdo.id).
+  {
+    int dl_sdo_rows = 0;
+    for (const auto& dl : bptr->det_labels)
+      if (!dl.object_id.empty()) ++dl_sdo_rows;
+    CHECK(dl_sdo_rows == 3,
+          "expected 3 object-level detectionLabels rows (objectId = sdo.id), got "
+          + std::to_string(dl_sdo_rows));
+  }
+
+  // Every detectionLabels row must carry at least 2 label lids
+  // (eventType:smartDetectZone + smartDetectType:<type>).
+  {
+    int dl_few_labels = 0;
+    for (const auto& dl : bptr->det_labels)
+      if (dl.lids.size() < 2) ++dl_few_labels;
+    CHECK(dl_few_labels == 0,
+          "expected all detectionLabels rows to carry >= 2 label lids, "
+          + std::to_string(dl_few_labels) + " had fewer");
+  }
+
+  // All detectionLabels rows must reference a known event.
+  {
+    int orphan_dl = 0;
+    for (const auto& dl : bptr->det_labels) {
+      bool found = false;
+      for (const auto& e : bptr->events) {
+        if (e.id == dl.event_id) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) ++orphan_dl;
+    }
+    CHECK(orphan_dl == 0,
+          "expected no orphan detectionLabels rows, got "
+          + std::to_string(orphan_dl));
+  }
+
+  // Object-level rows must reference a known SDO.
+  {
+    int orphan_sdo_dl = 0;
+    for (const auto& dl : bptr->det_labels) {
+      if (dl.object_id.empty()) continue;
+      bool found = false;
+      for (const auto& s : bptr->sdos) {
+        if (s.id == dl.object_id) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) ++orphan_sdo_dl;
+    }
+    CHECK(orphan_sdo_dl == 0,
+          "expected no detectionLabels rows with unknown objectId, got "
+          + std::to_string(orphan_sdo_dl));
+  }
 
   // =========================================================
   // Verify buffer padding: end - start >= pre_buffer + post_buffer (4000 ms)

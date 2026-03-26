@@ -206,6 +206,22 @@ class DetectionRecorder {
                                          uint64_t           /*ts_ms*/,
                                          const std::string& /*obj_type*/,
                                          const std::string& /*now_str*/) {}
+
+    /// Upsert label names into the `labels` table and return their serial lid
+    /// values. Existing names are returned from cache to avoid redundant queries.
+    /// Returns an empty vector on failure or if not implemented.
+    virtual std::vector<int> upsert_labels(
+        const std::vector<std::string>& /*names*/,
+        const std::string& /*now_str*/) { return {}; }
+
+    /// Insert one row into `detectionLabels`.
+    /// Pass object_id empty to store NULL (event-level row).
+    /// The event-level row (objectId IS NULL) is required for the INNER JOIN
+    /// in Protect's find-anything / detection-search endpoint.
+    virtual void insert_detection_label(const std::string&      /*event_id*/,
+                                        const std::string&      /*object_id*/,
+                                        const std::vector<int>& /*lids*/,
+                                        const std::string&      /*now_str*/) {}
   };
 
   /// Factory for testing: injects a custom backend (skips PostgreSQL connect).
@@ -229,6 +245,10 @@ class DetectionRecorder {
 
   // Snapshot info per camera IP -- written before run(), read-only after.
   std::map<std::string, SnapshotInfo> snapshot_info_;
+
+  // Camera IP -> UniFi Protect UUID (from register_camera).
+  // Written before run(); read-only after that.
+  std::map<std::string, std::string> camera_ids_;
 
   // Directory for per-camera UBV thumbnail files; empty = disabled.
   std::string ubv_dir_;
