@@ -452,18 +452,23 @@ class CameraWorker {
   void run() {
     vlog("started");
     const int max_failures = cfg_.max_consecutive_failures;  // 0 = unlimited
+    const int window_sec   = cfg_.failure_window_sec;
     int consecutive_failures = 0;
+    std::chrono::steady_clock::time_point streak_start;
 
     while (running_) {
       auto sub_or = create_subscription();
       if (!sub_or.ok()) {
+        if (consecutive_failures == 0)
+          streak_start = std::chrono::steady_clock::now();
         ++consecutive_failures;
         if (max_failures > 0 && consecutive_failures >= max_failures) {
-          log(std::string("giving up after ") +
+          pause_and_reset(&consecutive_failures, streak_start, window_sec,
+              std::string("camera unreachable after ") +
               std::to_string(consecutive_failures) +
-              " consecutive failures -- camera may not support ONVIF pull-point events"
+              " consecutive failures -- pausing before retry"
               " (last error: " + std::string(sub_or.status().message()) + ")");
-          return;
+          continue;
         }
         log(std::string("error: ") + std::string(sub_or.status().message()) +
             ", reconnecting in " + std::to_string(cfg_.retry_interval_sec) + "s" +
@@ -475,12 +480,15 @@ class CameraWorker {
 
       const std::string& sub_url = *sub_or;
       if (sub_url.empty()) {
+        if (consecutive_failures == 0)
+          streak_start = std::chrono::steady_clock::now();
         ++consecutive_failures;
         if (max_failures > 0 && consecutive_failures >= max_failures) {
-          log("giving up after " + std::to_string(consecutive_failures) +
-              " consecutive subscription failures"
-              " -- camera may not support ONVIF pull-point events");
-          return;
+          pause_and_reset(&consecutive_failures, streak_start, window_sec,
+              "failed to get subscription URL after " +
+              std::to_string(consecutive_failures) +
+              " consecutive attempts -- pausing before retry");
+          continue;
         }
         log("failed to get subscription URL, retrying in " +
             std::to_string(cfg_.retry_interval_sec) + "s" +
@@ -508,19 +516,22 @@ class CameraWorker {
         }
         absl::Status ps = pull(sub_url);
         if (!ps.ok()) {
+          if (consecutive_failures == 0)
+            streak_start = std::chrono::steady_clock::now();
           ++consecutive_failures;
           if (max_failures > 0 && consecutive_failures >= max_failures) {
-            log(std::string("giving up after ") +
+            pause_and_reset(&consecutive_failures, streak_start, window_sec,
+                std::string("camera unreachable after ") +
                 std::to_string(consecutive_failures) +
-                " consecutive failures -- camera may not support ONVIF pull-point events"
+                " consecutive failures -- pausing before retry"
                 " (last error: " + std::string(ps.message()) + ")");
-            return;
+          } else {
+            log(std::string("error: ") + std::string(ps.message()) +
+                ", reconnecting in " + std::to_string(cfg_.retry_interval_sec) + "s" +
+                (max_failures > 0 ? " (" + std::to_string(consecutive_failures) +
+                 "/" + std::to_string(max_failures) + ")" : ""));
+            sleep_interruptible(cfg_.retry_interval_sec);
           }
-          log(std::string("error: ") + std::string(ps.message()) +
-              ", reconnecting in " + std::to_string(cfg_.retry_interval_sec) + "s" +
-              (max_failures > 0 ? " (" + std::to_string(consecutive_failures) +
-               "/" + std::to_string(max_failures) + ")" : ""));
-          sleep_interruptible(cfg_.retry_interval_sec);
           inner_ok = false;
         }
       }
@@ -540,6 +551,22 @@ class CameraWorker {
   void sleep_interruptible(int secs) {
     for (int i = 0; i < secs && running_; ++i)
       std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+
+  // Log msg, sleep for the remainder of the failure window, then reset *failures.
+  void pause_and_reset(int* failures,
+                       const std::chrono::steady_clock::time_point& streak_start,
+                       int window_sec,
+                       const std::string& msg) {
+    using Clk = std::chrono::steady_clock;
+    auto deadline  = streak_start + std::chrono::seconds(window_sec);
+    auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+                         deadline - Clk::now());
+    int pause_sec  = remaining.count() > 0
+                     ? static_cast<int>(remaining.count()) : 0;
+    log(msg + " (retry in " + std::to_string(pause_sec) + "s)");
+    sleep_interruptible(pause_sec);
+    *failures = 0;
   }
 
   std::string event_url() const {

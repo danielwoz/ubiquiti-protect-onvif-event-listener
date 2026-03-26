@@ -290,7 +290,7 @@ int main(int argc, char* argv[]) {
   }
 
   for (auto cam : cameras) {
-    cam.max_consecutive_failures = 5;
+    cam.max_consecutive_failures = 3;
     listener.add_camera(cam);
     det_rec.set_snapshot(cam);
   }

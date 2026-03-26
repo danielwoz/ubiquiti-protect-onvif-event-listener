@@ -53,8 +53,11 @@ struct CameraConfig {
     std::string password;
     std::string snapshot_url;  ///< Optional HTTP URL used to capture a snapshot image
     int retry_interval_sec{10};      ///< Seconds to wait before retrying a failed subscription
-    ///< Give up after this many consecutive failures (0 = unlimited)
+    ///< Pause and reset after this many consecutive failures (0 = unlimited)
     int max_consecutive_failures{0};
+    ///< After hitting max_consecutive_failures, wait this long before resetting
+    ///< the failure counter and retrying. Default: 3600 s (1 hour).
+    int failure_window_sec{3600};
 };
 
 using EventCallback = std::function<void(const OnvifEvent&)>;
