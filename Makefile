@@ -8,7 +8,7 @@ LDFLAGS  := $(shell pkg-config --libs   libxml-2.0 libcurl openssl sqlite3) \
 TARGET := onvif_recorder
 OBJS   := onvif_listener.o detection_recorder.o unifi_camera_config.o ubv_thumbnail.o main.o
 
-.PHONY: all clean
+.PHONY: all clean install-hooks
 
 all: $(TARGET)
 
@@ -32,6 +32,10 @@ main.o: main.cpp onvif_listener.hpp detection_recorder.hpp unifi_camera_config.h
 
 clean:
 	rm -f $(TARGET) $(OBJS) onvif_events_*.jsonl
+
+install-hooks:
+	git config core.hooksPath .githooks
+	@echo "Git hooks installed. Pre-push hook will run lint, tests, and PGO bench."
 
 # ---------------------------------------------------------------------------
 # PGO + LTO benchmark workflow

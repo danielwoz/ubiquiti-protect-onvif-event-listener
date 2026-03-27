@@ -73,6 +73,10 @@ object_detect.hpp/.cpp        — NanoDet-M on-device object detection via NCNN
 unifi_camera_config.hpp/.cpp  — Load camera credentials from UniFi Protect DB
 main.cpp                      — Binary entry point
 
+.githooks/
+  pre-push                    — shared pre-push hook (lint + tests + PGO bench)
+                                Activate with: make install-hooks
+
 third_party/
   ncnn.BUILD                  — filegroup for NCNN source archive
   BUILD.bazel                 — rules_foreign_cc cmake() target building libncnn.a
@@ -141,18 +145,16 @@ make pgo-bench-x86
 ```
 
 > **Note:** these steps are a manual checklist for Claude to follow in conversation.
-> To enforce them automatically on every push, configure a git pre-push hook:
+> To enforce them automatically on every push, install the shared git hooks (tracked
+> in `.githooks/`):
 >
 > ```bash
-> cat > .git/hooks/pre-push << 'EOF'
-> #!/bin/bash
-> set -e
-> python3 -m cpplint *.cpp *.hpp test/*.cpp test/*.hpp
-> ~/.local/bin/bazel test //test:all
-> make pgo-bench-x86
-> EOF
-> chmod +x .git/hooks/pre-push
+> make install-hooks
 > ```
+>
+> This runs `git config core.hooksPath .githooks` so Git uses the `.githooks/pre-push`
+> file that is checked into the repository. Anyone who clones the repo runs the same
+> one-time command to activate the hooks.
 
 ## Command-line flags (runtime)
 
