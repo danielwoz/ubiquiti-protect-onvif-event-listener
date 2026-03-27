@@ -34,3 +34,4 @@ thumbnails/
 *.profraw
 *.profdata
 .claude/
+dist/
