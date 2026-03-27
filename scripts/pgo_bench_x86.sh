@@ -20,7 +20,9 @@ LLVM_PROFILE_FILE="$PROFRAW" \
     bazel-bin/test/bench_onvif_listener \
     "$BENCH_JSONL" "$PGO_EVENTS" 2>/dev/null
 echo "=== [4/6] Merge profile ==="
-llvm-profdata-14 merge -output="$PROFDATA" "$PROFRAW"
+# llvm-profdata-18 on Ubuntu 24.04; llvm-profdata-14 on Ubuntu 22.04.
+LLVM_PROFDATA=$(command -v llvm-profdata-18 || command -v llvm-profdata-14 || echo llvm-profdata)
+"$LLVM_PROFDATA" merge -output="$PROFDATA" "$PROFRAW"
 echo "=== [5/6] Build PGO + LTO optimised binary ==="
 $BAZEL build --config=clang --config=lto \
     --copt=-fprofile-instr-use="$PROFDATA" \

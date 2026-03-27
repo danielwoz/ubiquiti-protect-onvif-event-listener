@@ -146,52 +146,94 @@ systemctl restart onvif-recorder
 
 ### Prerequisites
 
-- Ubuntu 22.04 x86_64 build host
-- Clang 14 + LLD: `sudo apt install clang-14 lld`
-- [Bazelisk](https://github.com/bazelbuild/bazelisk) at `~/.local/bin/bazel`
-- Host library packages (x86 native build only):
+- **Ubuntu 24.04** x86_64 build host (Ubuntu 22.04 also works; see note below)
+- [Bazelisk](https://github.com/bazelbuild/bazelisk) installed at `~/.local/bin/bazel`
+- Git with submodule support
+
+### 1. Clone with submodules
 
 ```bash
-sudo apt install \
-  libxml2-dev libcurl4-openssl-dev libssl-dev libsqlite3-dev \
-  libmicrohttpd-dev libpq-dev libicu-dev liblzma-dev libzstd-dev \
-  libnghttp2-dev libidn2-dev librtmp-dev libssh-dev libpsl-dev \
-  libbrotli-dev libldap-dev libgnutls28-dev libgmp-dev nettle-dev \
-  libtasn1-6-dev libunistring-dev libgcrypt20-dev libgpg-error-dev
+git clone --recurse-submodules https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener.git
+cd ubiquiti-protect-onvif-event-listener
 ```
 
-### Build
+If you already cloned without `--recurse-submodules`:
 
 ```bash
-# ARM64 (for Dream Router / Dream Machine)
-bazel build --config=arm64 //:onvif_recorder
+git submodule update --init --recursive
+```
 
-# x86_64 (native)
-bazel build //:onvif_recorder
+### 2. Install Bazelisk
+
+```bash
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64 \
+  -o ~/.local/bin/bazel
+chmod +x ~/.local/bin/bazel
+```
+
+### 3. Install apt dependencies
+
+Most C libraries (OpenSSL, libcurl, libxml2, libjpeg-turbo) are built from source
+via the git submodules. Only a small set of system packages is required:
+
+```bash
+# Ubuntu 24.04
+sudo apt-get install -y \
+  build-essential clang-18 cmake ninja-build perl \
+  libmicrohttpd-dev \
+  libpq-dev postgresql-server-dev-16 libkrb5-dev libldap-dev \
+  libgnutls28-dev libgmp-dev nettle-dev libtasn1-6-dev \
+  libunistring-dev libp11-kit-dev \
+  python3-cpplint
+```
+
+> **Ubuntu 22.04 note:** Replace `clang-18` with `clang-14`, and
+> `postgresql-server-dev-16` with `postgresql-server-dev-14`.
+> The `.bazelrc` `--config=clang` flag already handles the version difference.
+
+### 4. Build
+
+```bash
+# x86_64 native binary
+~/.local/bin/bazel build //:onvif_recorder
+
+# ARM64 cross-compiled binary (for Dream Router / Dream Machine)
+~/.local/bin/bazel build --config=arm64 //:onvif_recorder
 
 # Run all tests
-bazel test //test:all
+~/.local/bin/bazel test //test:all
 
 # Throughput benchmark
-bazel run //test:bench_onvif_listener
+~/.local/bin/bazel run //test:bench_onvif_listener
 
-# PGO + ThinLTO optimised build
-make pgo-bench-x86
+# PGO + ThinLTO optimised build (x86)
+~/.local/bin/bazel run //:pgo_bench_x86
 ```
 
 The ARM64 build downloads its own sysroot automatically — no manual cross-toolchain
-setup required.
+setup is required.
 
 ### Runtime dependencies (ARM64)
 
-The binary is almost entirely statically linked:
+The ARM64 binary is almost entirely statically linked:
 
 ```
 libm.so.6  libc.so.6  ld-linux-aarch64.so.1  libgcc_s.so.1
 ```
 
-All other libraries (libcurl, OpenSSL, libxml2, libpq, libsqlite3, GnuTLS, ICU,
-etc.) are compiled in.
+All other libraries (libcurl, OpenSSL, libxml2, libjpeg-turbo, GnuTLS, etc.) are
+compiled in from the git submodules or the ARM64 sysroot.
+
+### Runtime dependencies (x86_64)
+
+The x86 binary links most libraries statically but keeps a few system libraries
+dynamic (LDAP, LBER — standard packages present on any Ubuntu system):
+
+```
+libm.so.6  libc.so.6  ld-linux-x86-64.so.1  libgcc_s.so.1
+libldap.so.2  liblber.so.2
+```
 
 ---
 

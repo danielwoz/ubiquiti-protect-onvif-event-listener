@@ -12,10 +12,11 @@ build --cxxopt=-fno-rtti
 build:arm64 --platforms=//platforms:linux_arm64
 build:arm64 --extra_toolchains=@arm64_sysroot//:aarch64_toolchain
 
-# Use clang-14 for x86 builds (consistent compiler family with the ARM64
+# Use clang for x86 builds (consistent compiler family with the ARM64
 # cross-toolchain; required for LLVM PGO instrumentation/profile format).
-build:clang --repo_env=CC=clang-14
-build:clang --repo_env=CXX=clang++-14
+# Ubuntu 24.04 ships clang-18; Ubuntu 22.04 ships clang-14.
+build:clang --repo_env=CC=clang-18
+build:clang --repo_env=CXX=clang++-18
 
 # PGO step 1 -- instrument the binary to collect a profile.
 # Use with --config=clang for x86; the ARM64 toolchain already uses clang.

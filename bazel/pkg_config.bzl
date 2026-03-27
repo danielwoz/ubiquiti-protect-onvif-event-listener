@@ -12,7 +12,8 @@ resolves -lXXX to full .a paths where available for static linking.
 # Directories to search for static .a files on the x86_64 host.
 _STATIC_LIB_DIRS = [
     "/usr/lib/x86_64-linux-gnu",
-    "/usr/lib/postgresql/14/lib",  # pgcommon, pgport for libpq static
+    "/usr/lib/postgresql/16/lib",  # pgcommon, pgport for libpq static (Ubuntu 24.04)
+    "/usr/lib/postgresql/14/lib",  # pgcommon, pgport for libpq static (Ubuntu 22.04)
     "/usr/lib",
 ]
 
@@ -81,8 +82,10 @@ def _pkg_config_impl(rctx):
             rctx.symlink(abs_path, local)
             includes.append(local)
 
-    # Libraries that must remain dynamic (glibc internals, or .a has IFUNC issues).
-    _ALWAYS_DYNAMIC = ["m", "c", "dl", "pthread", "rt", "resolv", "nsl", "util"]
+    # Libraries that must remain dynamic (glibc internals, or .a has complex
+    # transitive dep chains that are impractical to fully vendor statically).
+    _ALWAYS_DYNAMIC = ["m", "c", "dl", "pthread", "rt", "resolv", "nsl", "util",
+                       "ldap", "lber"]
 
     # Parse lib flags: resolve -lXXX to full .a paths where possible.
     # This gives static linking without needing -Wl,-Bstatic.
@@ -128,6 +131,11 @@ def _pkg_config_impl(rctx):
         else:
             linkopts.append(flag)
 
+    # Wrap the archives in --start-group/--end-group so the linker makes
+    # multiple passes over the group and resolves circular/forward references
+    # (e.g. libhogweed → libgmp where pkg-config places gmp before hogweed).
+    final_linkopts = ["-Wl,--start-group"] + linkopts + ["-Wl,--end-group"]
+
     # Build the hdrs glob expression.
     if includes:
         glob_patterns = (
@@ -150,7 +158,7 @@ cc_library(
         name     = name,
         hdrs     = hdrs_expr,
         includes = str(includes),
-        linkopts = str(linkopts),
+        linkopts = str(final_linkopts),
     ))
 
 pkg_config_library = repository_rule(

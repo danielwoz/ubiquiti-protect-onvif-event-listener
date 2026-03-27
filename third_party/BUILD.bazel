@@ -1,5 +1,6 @@
-load("@rules_foreign_cc//foreign_cc:defs.bzl", "cmake")
+load("@rules_foreign_cc//foreign_cc:defs.bzl", "cmake", "configure_make")
 
+# ---- NCNN (downloaded via http_archive) ----
 cmake(
     name = "ncnn",
     lib_source = "@ncnn//:all",
@@ -12,6 +13,103 @@ cmake(
         "NCNN_BUILD_BENCHMARK": "OFF",
         "NCNN_OPENMP": "OFF",
         "NCNN_SHARED_LIB": "OFF",
+    },
+    visibility = ["//visibility:public"],
+)
+
+# ---- libjpeg-turbo (git submodule: third_party/libjpeg-turbo) ----
+cmake(
+    name = "libjpeg_turbo",
+    lib_source = "@libjpeg_turbo//:all",
+    out_static_libs = ["libjpeg.a"],
+    cache_entries = {
+        "ENABLE_SHARED": "OFF",
+        "WITH_TURBOJPEG": "OFF",
+        "WITH_JAVA": "OFF",
+        "CMAKE_INSTALL_LIBDIR": "lib",
+    },
+    visibility = ["//visibility:public"],
+)
+
+# ---- OpenSSL (git submodule: third_party/openssl) ----
+# Uses OpenSSL's Perl-based Configure script via rules_foreign_cc configure_make.
+configure_make(
+    name = "openssl",
+    lib_source = "@openssl_src//:all",
+    configure_command = "Configure",
+    configure_in_place = True,
+    configure_options = [
+        "linux-x86_64",
+        "--libdir=lib",
+        "no-shared",
+        "no-tests",
+        "no-apps",
+        "no-docs",
+    ],
+    env = {"PERL": "perl"},
+    out_static_libs = [
+        "libssl.a",
+        "libcrypto.a",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+# ---- libxml2 (git submodule: third_party/libxml2) ----
+# Minimal build: no Python, ICU, lzma, zlib, or CLI programs.
+# Headers install to include/libxml2/libxml/; set out_include_dir accordingly
+# so <libxml/parser.h> resolves without an extra path prefix.
+cmake(
+    name = "libxml2",
+    lib_source = "@libxml2_src//:all",
+    out_static_libs = ["libxml2.a"],
+    out_include_dir = "include/libxml2",
+    cache_entries = {
+        "BUILD_SHARED_LIBS": "OFF",
+        "LIBXML2_WITH_PYTHON": "OFF",
+        "LIBXML2_WITH_ICU": "OFF",
+        "LIBXML2_WITH_LZMA": "OFF",
+        "LIBXML2_WITH_ZLIB": "OFF",
+        "LIBXML2_WITH_TESTS": "OFF",
+        "LIBXML2_WITH_PROGRAMS": "OFF",
+        "CMAKE_INSTALL_LIBDIR": "lib",
+    },
+    visibility = ["//visibility:public"],
+)
+
+# ---- libcurl (git submodule: third_party/curl) ----
+# HTTP/HTTPS only; OpenSSL backend; all other protocols and optional libs disabled.
+cmake(
+    name = "libcurl",
+    lib_source = "@curl_src//:all",
+    deps = [":openssl"],
+    out_static_libs = ["libcurl.a"],
+    cache_entries = {
+        "BUILD_SHARED_LIBS": "OFF",
+        "BUILD_TESTING": "OFF",
+        "CURL_USE_PKGCONFIG": "OFF",
+        "CURL_USE_OPENSSL": "ON",
+        "CURL_USE_GNUTLS": "OFF",
+        "CURL_USE_MBEDTLS": "OFF",
+        "CURL_USE_LIBSSH2": "OFF",
+        "CURL_USE_LIBPSL": "OFF",
+        "CURL_ZLIB": "OFF",
+        "CURL_DISABLE_FTP": "ON",
+        "CURL_DISABLE_SMTP": "ON",
+        "CURL_DISABLE_IMAP": "ON",
+        "CURL_DISABLE_POP3": "ON",
+        "CURL_DISABLE_TELNET": "ON",
+        "CURL_DISABLE_TFTP": "ON",
+        "CURL_DISABLE_MQTT": "ON",
+        "CURL_DISABLE_DICT": "ON",
+        "CURL_DISABLE_GOPHER": "ON",
+        "CURL_DISABLE_LDAP": "ON",
+        "CURL_DISABLE_LDAPS": "ON",
+        "CURL_DISABLE_RTSP": "ON",
+        "CURL_DISABLE_SMB": "ON",
+        "CURL_DISABLE_WEBSOCKETS": "ON",
+        "USE_LIBIDN2": "OFF",
+        "OPENSSL_ROOT_DIR": "$$EXT_BUILD_DEPS$$/openssl",
+        "CMAKE_INSTALL_LIBDIR": "lib",
     },
     visibility = ["//visibility:public"],
 )

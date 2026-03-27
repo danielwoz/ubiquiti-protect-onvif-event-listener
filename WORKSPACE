@@ -13,24 +13,56 @@ http_archive(
 load("//bazel:pkg_config.bzl", "pkg_config_library")
 load("//bazel:arm64_sysroot.bzl", "arm64_sysroot")
 
-# Host (x86-64) system libraries via pkg-config.
-# extra_linkopts supplies transitive static deps that pkg-config --static misses.
-pkg_config_library(name = "libxml2", pkg = "libxml-2.0",
-    extra_linkopts = ["-licui18n", "-licuuc", "-licudata", "-llzma", "-lz"])
-pkg_config_library(name = "libcurl", pkg = "libcurl",
-    extra_linkopts = ["-lunistring", "-lrtmp", "-lnettle", "-lhogweed", "-lgmp",
-                      "-lgnutls", "-ltasn1", "-lp11-kit",
-                      "-lgcrypt", "-lgpg-error",
-                      "-lsasl2", "-lbrotlicommon",
-                      "-lgssapi_krb5", "-lssl", "-lcrypto",
-                      "-Wl,--allow-multiple-definition"])
-pkg_config_library(name = "openssl",       pkg = "openssl")
+# ---------------------------------------------------------------------------
+# Git submodule source trees.
+# After cloning, run: git submodule update --init --recursive
+# Each entry creates an external repository from the submodule directory.
+# The cmake()/configure_make() build rules live in //third_party:BUILD.bazel.
+# ---------------------------------------------------------------------------
+
+_FILEGROUP_BUILD = """
+filegroup(
+    name = "all",
+    srcs = glob(["**"], exclude = ["**/.git/**"]),
+    visibility = ["//visibility:public"],
+)
+"""
+
+new_local_repository(
+    name = "libjpeg_turbo",
+    path = "third_party/libjpeg-turbo",
+    build_file_content = _FILEGROUP_BUILD,
+)
+
+new_local_repository(
+    name = "libxml2_src",
+    path = "third_party/libxml2",
+    build_file_content = _FILEGROUP_BUILD,
+)
+
+new_local_repository(
+    name = "openssl_src",
+    path = "third_party/openssl",
+    build_file_content = _FILEGROUP_BUILD,
+)
+
+new_local_repository(
+    name = "curl_src",
+    path = "third_party/curl",
+    build_file_content = _FILEGROUP_BUILD,
+)
+
+# ---------------------------------------------------------------------------
+# Host (x86-64) system libraries that still require apt packages.
+# libpq: PostgreSQL client (part of PostgreSQL source — impractical to vendor).
+# libmicrohttpd: test-only fake camera server.
+# ---------------------------------------------------------------------------
 pkg_config_library(name = "libmicrohttpd", pkg = "libmicrohttpd",
     extra_linkopts = ["-lgnutls", "-lhogweed", "-lnettle", "-lgmp",
                       "-ltasn1", "-lunistring", "-lp11-kit"])
 pkg_config_library(name = "libpq", pkg = "libpq",
-    extra_linkopts = ["-lpgcommon", "-lpgport", "-lgssapi_krb5", "-lssl", "-lcrypto"])
-pkg_config_library(name = "libjpeg", pkg = "libjpeg")
+    extra_linkopts = ["-lpgcommon", "-lpgport", "-lgssapi_krb5", "-lssl", "-lcrypto",
+                      "-lldap", "-llber", "-lsasl2"])
 
 # NCNN — lightweight neural network inference for on-device object detection.
 http_archive(
@@ -54,6 +86,5 @@ http_file(
 )
 
 # arm64 cross-compilation sysroot + toolchain.
-# Declares the repository; packages are downloaded only when --config=arm64
-# is used (via --extra_toolchains in .bazelrc), not on every host build.
+# Packages are downloaded on first use and cached in Bazel's output base.
 arm64_sysroot(name = "arm64_sysroot")

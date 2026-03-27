@@ -1,16 +1,18 @@
-# Platform-select helpers: pick host pkg-config libs or arm64 sysroot stubs.
+# Platform-select helpers.
+# x86 host: built from source via git submodules (//third_party:...).
+# ARM64: pre-built sysroot downloaded by arm64_sysroot repository rule.
 _XML2   = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libxml2"],
-                  "//conditions:default":    ["@libxml2"]})
+                  "//conditions:default":    ["//third_party:libxml2"]})
 _CURL   = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libcurl"],
-                  "//conditions:default":    ["@libcurl"]})
+                  "//conditions:default":    ["//third_party:libcurl"]})
 _SSL    = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:openssl"],
-                  "//conditions:default":    ["@openssl"]})
+                  "//conditions:default":    ["//third_party:openssl"]})
 _MHD    = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libmicrohttpd"],
                   "//conditions:default":    ["@libmicrohttpd"]})
 _PQ     = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libpq"],
                   "//conditions:default":    ["@libpq"]})
 _JPEG   = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libjpeg"],
-                  "//conditions:default":    ["@libjpeg"]})
+                  "//conditions:default":    ["//third_party:libjpeg_turbo"]})
 
 # NCNN dependency: host builds use rules_foreign_cc CMake; ARM64 has no NCNN yet.
 _NCNN_DEPS = select({

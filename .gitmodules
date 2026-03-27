@@ -1,0 +1,12 @@
+[submodule "third_party/libjpeg-turbo"]
+	path = third_party/libjpeg-turbo
+	url = https://github.com/libjpeg-turbo/libjpeg-turbo
+[submodule "third_party/libxml2"]
+	path = third_party/libxml2
+	url = https://github.com/GNOME/libxml2
+[submodule "third_party/openssl"]
+	path = third_party/openssl
+	url = https://github.com/openssl/openssl
+[submodule "third_party/curl"]
+	path = third_party/curl
+	url = https://github.com/curl/curl
