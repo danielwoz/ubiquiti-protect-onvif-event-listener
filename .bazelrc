@@ -14,8 +14,6 @@ build:arm64 --extra_toolchains=@arm64_sysroot//:aarch64_toolchain
 
 # Use clang for x86 builds (consistent compiler family with the ARM64
 # cross-toolchain; required for LLVM PGO instrumentation/profile format).
-# `apt install clang` sets up /usr/bin/clang and /usr/bin/clang++ via
-# update-alternatives, so no version suffix is needed.
 build:clang --repo_env=CC=clang
 build:clang --repo_env=CXX=clang++
 

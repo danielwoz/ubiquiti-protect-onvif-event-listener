@@ -185,9 +185,6 @@ sudo apt-get install -y \
   python3-cpplint
 ```
 
-> **Ubuntu 22.04 note:** Works as-is — `apt install clang` sets up the
-> unversioned `/usr/bin/clang` symlink via `update-alternatives` on both
-> 22.04 (clang-14) and 24.04 (clang-18).
 
 ### 4. Build
 
