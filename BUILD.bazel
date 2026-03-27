@@ -8,9 +8,9 @@ _CURL   = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libcurl"],
 _SSL    = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:openssl"],
                   "//conditions:default":    ["//third_party:openssl"]})
 _MHD    = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libmicrohttpd"],
-                  "//conditions:default":    ["@libmicrohttpd"]})
+                  "//conditions:default":    ["//third_party:libmicrohttpd"]})
 _PQ     = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libpq"],
-                  "//conditions:default":    ["@libpq"]})
+                  "//conditions:default":    ["//third_party:libpq"]})
 _JPEG   = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libjpeg"],
                   "//conditions:default":    ["//third_party:libjpeg_turbo"]})
 
@@ -154,7 +154,6 @@ sh_binary(
 cc_binary(
     name = "ubv_extract",
     srcs = ["ubv_extract.cpp"],
-    linkopts = ["-lldap", "-llber"],
     deps = [
         ":ubv_thumbnail",
         "@com_google_absl//absl/flags:flag",

@@ -1,5 +1,121 @@
 load("@rules_foreign_cc//foreign_cc:defs.bzl", "cmake", "configure_make")
 
+# ---- GMP 6.3.0 (http_archive) ----
+# Arbitrary-precision arithmetic library; used by Nettle/hogweed.
+configure_make(
+    name = "gmp",
+    lib_source = "@gmp_src//:all",
+    configure_options = [
+        "--enable-static",
+        "--disable-shared",
+        "--disable-cxx",
+        "--with-pic",
+    ],
+    out_static_libs = ["libgmp.a"],
+    visibility = ["//visibility:public"],
+)
+
+# ---- libtasn1 4.19.0 (http_archive) ----
+# ASN.1 parsing library; used by GnuTLS.
+configure_make(
+    name = "libtasn1",
+    lib_source = "@libtasn1_src//:all",
+    configure_options = [
+        "--enable-static",
+        "--disable-shared",
+        "--with-pic",
+    ],
+    out_static_libs = ["libtasn1.a"],
+    visibility = ["//visibility:public"],
+)
+
+# ---- Nettle 3.9.1 (http_archive) ----
+# Cryptographic library; used by GnuTLS.  Requires GMP.
+configure_make(
+    name = "nettle",
+    lib_source = "@nettle_src//:all",
+    configure_options = [
+        "--enable-static",
+        "--disable-shared",
+        "--disable-documentation",
+        "--with-pic",
+    ],
+    env = {
+        # Nettle discovers GMP via CPPFLAGS/LDFLAGS (no --with-gmp-* flags).
+        "CPPFLAGS": "-I$$EXT_BUILD_DEPS$$/gmp/include",
+        "LDFLAGS": "-L$$EXT_BUILD_DEPS$$/gmp/lib",
+    },
+    deps = [":gmp"],
+    out_static_libs = ["libnettle.a", "libhogweed.a"],
+    visibility = ["//visibility:public"],
+)
+
+# ---- GNU libmicrohttpd 1.0.1 (http_archive) ----
+# Embedded HTTP server used for the fake camera in tests.
+# Built without HTTPS (--disable-https) so GnuTLS, GMP, Nettle, libtasn1,
+# libunistring, and libp11-kit are NOT required — only pthreads (dynamic/system).
+configure_make(
+    name = "libmicrohttpd",
+    lib_source = "@libmicrohttpd_src//:all",
+    configure_options = [
+        "--enable-static",
+        "--disable-shared",
+        "--disable-https",
+        "--disable-doc",
+        "--with-pic",
+    ],
+    out_static_libs = ["libmicrohttpd.a"],
+    visibility = ["//visibility:public"],
+)
+
+# ---- PostgreSQL 16.13 client libraries (http_archive) ----
+# We build only the three client-side static libraries by setting targets = []
+# (skip the default make+install) and using postfix_script to do a selective build.
+#
+#   libpq       — C client API
+#   libpgcommon — internal utilities shared between client and server
+#   libpgport   — platform-portability helpers
+#
+# Configured without Kerberos (--without-gssapi) and without LDAP
+# (--without-ldap), so libkrb5-dev and libldap-dev are NOT required.
+# TLS for database connections is provided by the vendored OpenSSL.
+#
+# libpgcommon.a and libpgport.a install to lib/postgresql/; the postfix_script
+# copies them to lib/ where rules_foreign_cc expects out_static_libs.
+configure_make(
+    name = "libpq",
+    lib_source = "@postgres_src//:all",
+    configure_options = [
+        "--without-readline",
+        "--without-icu",
+        "--without-zlib",
+        "--without-openssl",
+        "--without-gssapi",
+        "--without-ldap",
+    ],
+    targets = [],
+    postfix_script = """
+make -C src/common all
+make -C src/port all
+make -C src/interfaces/libpq all
+make -C src/common install
+make -C src/port install
+make -C src/interfaces/libpq install
+make -C src/include install
+# rules_foreign_cc copies BUILD_TMPDIR/INSTALL_PREFIX → INSTALLDIR *before*
+# postfix_script runs (targets=[] so nothing was installed yet at that point).
+# Re-sync INSTALLDIR so Bazel finds the archives it declared in out_static_libs.
+cp -rp "$$BUILD_TMPDIR/$$INSTALL_PREFIX/." "$$INSTALLDIR/"
+# libpgcommon.a and libpgport.a install to lib/postgresql/; copy to lib/
+for a in libpgcommon.a libpgport.a; do
+  src="$$INSTALLDIR/lib/postgresql/$$a"
+  if [ -f "$$src" ]; then cp "$$src" "$$INSTALLDIR/lib/"; fi
+done
+""",
+    out_static_libs = ["libpq.a", "libpgcommon.a", "libpgport.a"],
+    visibility = ["//visibility:public"],
+)
+
 # ---- NCNN (downloaded via http_archive) ----
 cmake(
     name = "ncnn",

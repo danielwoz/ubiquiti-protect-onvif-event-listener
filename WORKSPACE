@@ -10,14 +10,12 @@ http_archive(
     urls = ["https://github.com/abseil/abseil-cpp/archive/refs/tags/20240722.0.tar.gz"],
 )
 
-load("//bazel:pkg_config.bzl", "pkg_config_library")
 load("//bazel:arm64_sysroot.bzl", "arm64_sysroot")
 
 # ---------------------------------------------------------------------------
-# Git submodule source trees.
+# Git submodule source trees (built from source via rules_foreign_cc).
 # After cloning, run: git submodule update --init --recursive
-# Each entry creates an external repository from the submodule directory.
-# The cmake()/configure_make() build rules live in //third_party:BUILD.bazel.
+# Build rules live in //third_party:BUILD.bazel.
 # ---------------------------------------------------------------------------
 
 _FILEGROUP_BUILD = """
@@ -53,16 +51,59 @@ new_local_repository(
 )
 
 # ---------------------------------------------------------------------------
-# Host (x86-64) system libraries that still require apt packages.
-# libpq: PostgreSQL client (part of PostgreSQL source — impractical to vendor).
-# libmicrohttpd: test-only fake camera server.
+# HTTP archive source trees (downloaded by Bazel on first use, SHA-verified).
+# Libraries not hosted on GitHub/GitLab, or whose git history is too large.
+# Build rules live in //third_party:BUILD.bazel.
 # ---------------------------------------------------------------------------
-pkg_config_library(name = "libmicrohttpd", pkg = "libmicrohttpd",
-    extra_linkopts = ["-lgnutls", "-lhogweed", "-lnettle", "-lgmp",
-                      "-ltasn1", "-lunistring", "-lp11-kit"])
-pkg_config_library(name = "libpq", pkg = "libpq",
-    extra_linkopts = ["-lpgcommon", "-lpgport", "-lgssapi_krb5", "-lssl", "-lcrypto",
-                      "-lldap", "-llber", "-lsasl2"])
+
+# GMP 6.3.0 — arbitrary precision arithmetic (dependency of Nettle).
+http_archive(
+    name = "gmp_src",
+    sha256 = "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898",
+    strip_prefix = "gmp-6.3.0",
+    urls = ["https://gmplib.org/download/gmp/gmp-6.3.0.tar.xz"],
+    build_file_content = _FILEGROUP_BUILD,
+)
+
+# libtasn1 4.19.0 — ASN.1 parsing (dependency of GnuTLS).
+http_archive(
+    name = "libtasn1_src",
+    sha256 = "1613f0ac1cf484d6ec0ce3b8c06d56263cc7242f1c23b30d82d23de345a63f7a",
+    strip_prefix = "libtasn1-4.19.0",
+    urls = ["https://ftp.gnu.org/gnu/libtasn1/libtasn1-4.19.0.tar.gz"],
+    build_file_content = _FILEGROUP_BUILD,
+)
+
+# Nettle 3.9.1 — symmetric crypto + public-key (dependency of GnuTLS).
+http_archive(
+    name = "nettle_src",
+    sha256 = "ccfeff981b0ca71bbd6fbcb054f407c60ffb644389a5be80d6716d5b550c6ce3",
+    strip_prefix = "nettle-3.9.1",
+    urls = ["https://ftp.gnu.org/gnu/nettle/nettle-3.9.1.tar.gz"],
+    build_file_content = _FILEGROUP_BUILD,
+)
+
+# GNU libmicrohttpd 1.0.1 — embedded HTTP server (test-only fake camera).
+# Built without HTTPS (--disable-https) so GnuTLS/GMP/Nettle/tasn1 are not
+# required at all; only pthreads (always dynamic/system) is needed.
+http_archive(
+    name = "libmicrohttpd_src",
+    sha256 = "a89e09fc9b4de34dde19f4fcb4faaa1ce10299b9908db1132bbfa1de47882b94",
+    strip_prefix = "libmicrohttpd-1.0.1",
+    urls = ["https://ftp.gnu.org/gnu/libmicrohttpd/libmicrohttpd-1.0.1.tar.gz"],
+    build_file_content = _FILEGROUP_BUILD,
+)
+
+# PostgreSQL 16.13 source — we build only the client library subset:
+# libpq (client API), libpgcommon (shared utilities), libpgport (portability).
+# Built with --without-gssapi (no Kerberos) and --without-ldap (no LDAP).
+http_archive(
+    name = "postgres_src",
+    sha256 = "9b767d0dfd156424b0b8f02b65eebb4b6958ef6413ebf7c8349e28b0b91e6b09",
+    strip_prefix = "postgresql-16.13",
+    urls = ["https://ftp.postgresql.org/pub/source/v16.13/postgresql-16.13.tar.gz"],
+    build_file_content = _FILEGROUP_BUILD,
+)
 
 # NCNN — lightweight neural network inference for on-device object detection.
 http_archive(

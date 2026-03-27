@@ -12,8 +12,6 @@ resolves -lXXX to full .a paths where available for static linking.
 # Directories to search for static .a files on the x86_64 host.
 _STATIC_LIB_DIRS = [
     "/usr/lib/x86_64-linux-gnu",
-    "/usr/lib/postgresql/16/lib",  # pgcommon, pgport for libpq static (Ubuntu 24.04)
-    "/usr/lib/postgresql/14/lib",  # pgcommon, pgport for libpq static (Ubuntu 22.04)
     "/usr/lib",
 ]
 
@@ -84,8 +82,7 @@ def _pkg_config_impl(rctx):
 
     # Libraries that must remain dynamic (glibc internals, or .a has complex
     # transitive dep chains that are impractical to fully vendor statically).
-    _ALWAYS_DYNAMIC = ["m", "c", "dl", "pthread", "rt", "resolv", "nsl", "util",
-                       "ldap", "lber"]
+    _ALWAYS_DYNAMIC = ["m", "c", "dl", "pthread", "rt", "resolv", "nsl", "util"]
 
     # Parse lib flags: resolve -lXXX to full .a paths where possible.
     # This gives static linking without needing -Wl,-Bstatic.

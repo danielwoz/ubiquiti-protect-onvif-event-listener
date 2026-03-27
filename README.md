@@ -174,22 +174,19 @@ chmod +x ~/.local/bin/bazel
 
 ### 3. Install apt dependencies
 
-Most C libraries (OpenSSL, libcurl, libxml2, libjpeg-turbo) are built from source
-via the git submodules. Only a small set of system packages is required:
+All C libraries (OpenSSL, libcurl, libxml2, libjpeg-turbo, libmicrohttpd,
+libpq/libpgcommon/libpgport, GMP, Nettle, libtasn1) are built from source via
+Bazel — either git submodules or HTTP archives. Only build tools are required
+from apt:
 
 ```bash
 # Ubuntu 24.04
 sudo apt-get install -y \
   build-essential clang-18 cmake ninja-build perl \
-  libmicrohttpd-dev \
-  libpq-dev postgresql-server-dev-16 libkrb5-dev libldap-dev \
-  libgnutls28-dev libgmp-dev nettle-dev libtasn1-6-dev \
-  libunistring-dev libp11-kit-dev \
   python3-cpplint
 ```
 
-> **Ubuntu 22.04 note:** Replace `clang-18` with `clang-14`, and
-> `postgresql-server-dev-16` with `postgresql-server-dev-14`.
+> **Ubuntu 22.04 note:** Replace `clang-18` with `clang-14`.
 > The `.bazelrc` `--config=clang` flag already handles the version difference.
 
 ### 4. Build

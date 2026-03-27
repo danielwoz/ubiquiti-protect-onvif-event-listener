@@ -9,7 +9,7 @@ cc_library(
     hdrs = ["onvif_camera_emulator.hpp"],
     deps = select({
         ":is_arm64": ["@arm64_sysroot//:libmicrohttpd"],
-        "//conditions:default": ["@libmicrohttpd"],
+        "//conditions:default": ["//third_party:libmicrohttpd"],
     }),
     visibility = ["//visibility:public"],
 )
