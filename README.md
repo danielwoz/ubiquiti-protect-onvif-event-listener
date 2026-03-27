@@ -180,14 +180,14 @@ Bazel — either git submodules or HTTP archives. Only build tools are required
 from apt:
 
 ```bash
-# Ubuntu 24.04
 sudo apt-get install -y \
-  build-essential clang-18 cmake ninja-build perl \
+  build-essential clang cmake ninja-build perl \
   python3-cpplint
 ```
 
-> **Ubuntu 22.04 note:** Replace `clang-18` with `clang-14`.
-> The `.bazelrc` `--config=clang` flag already handles the version difference.
+> **Ubuntu 22.04 note:** Works as-is — `apt install clang` sets up the
+> unversioned `/usr/bin/clang` symlink via `update-alternatives` on both
+> 22.04 (clang-14) and 24.04 (clang-18).
 
 ### 4. Build
 

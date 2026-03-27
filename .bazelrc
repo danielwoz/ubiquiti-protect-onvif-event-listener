@@ -14,9 +14,10 @@ build:arm64 --extra_toolchains=@arm64_sysroot//:aarch64_toolchain
 
 # Use clang for x86 builds (consistent compiler family with the ARM64
 # cross-toolchain; required for LLVM PGO instrumentation/profile format).
-# Ubuntu 24.04 ships clang-18; Ubuntu 22.04 ships clang-14.
-build:clang --repo_env=CC=clang-18
-build:clang --repo_env=CXX=clang++-18
+# `apt install clang` sets up /usr/bin/clang and /usr/bin/clang++ via
+# update-alternatives, so no version suffix is needed.
+build:clang --repo_env=CC=clang
+build:clang --repo_env=CXX=clang++
 
 # PGO step 1 -- instrument the binary to collect a profile.
 # Use with --config=clang for x86; the ARM64 toolchain already uses clang.
