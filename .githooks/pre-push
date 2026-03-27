@@ -2,4 +2,4 @@
 set -e
 python3 -m cpplint *.cpp *.hpp test/*.cpp test/*.hpp
 ~/.local/bin/bazel test //test:all
-make pgo-bench-x86
+~/.local/bin/bazel run //:pgo_bench_x86

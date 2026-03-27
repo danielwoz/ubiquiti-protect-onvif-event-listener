@@ -113,6 +113,42 @@ cc_binary(
     ],
 )
 
+sh_binary(
+    name = "install_hooks",
+    srcs = ["scripts/install_hooks.sh"],
+)
+
+# ---------------------------------------------------------------------------
+# PGO + ThinLTO benchmark workflow
+#
+# x86_64 (full instrumented PGO):
+#   bazel run //:pgo_bench_x86               # baseline → instrument → profile → optimised
+#   bazel run //:pgo_bench_x86 -- 100000     # custom event count
+#
+# ARM64 (cross-PGO -- reuses the x86 profile, runs under QEMU):
+#   sudo apt-get install qemu-user-static
+#   bazel run //:pgo_bench_x86               # collect x86 profile first
+#   bazel run //:pgo_bench_arm64
+#
+# Clean generated profile data:
+#   bazel run //:pgo_clean
+# ---------------------------------------------------------------------------
+
+sh_binary(
+    name = "pgo_bench_x86",
+    srcs = ["scripts/pgo_bench_x86.sh"],
+)
+
+sh_binary(
+    name = "pgo_bench_arm64",
+    srcs = ["scripts/pgo_bench_arm64.sh"],
+)
+
+sh_binary(
+    name = "pgo_clean",
+    srcs = ["scripts/pgo_clean.sh"],
+)
+
 cc_binary(
     name = "ubv_extract",
     srcs = ["ubv_extract.cpp"],

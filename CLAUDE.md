@@ -33,13 +33,13 @@ bazel run //test:bench_jpeg_crop                  # uses security_cam_outdoor.jp
 bazel run //test:bench_object_detect
 
 # PGO + ThinLTO optimised build (x86)
-make pgo-bench-x86                   # baseline → instrument → profile → optimised
-make pgo-bench-x86 PGO_EVENTS=100000
+bazel run //:pgo_bench_x86                   # baseline → instrument → profile → optimised
+bazel run //:pgo_bench_x86 -- 100000         # custom event count
 
 # ARM64 benchmark under QEMU (cross-PGO reuses x86 profile)
 # Prerequisite: sudo apt-get install qemu-user-static
-# Prerequisite: run pgo-bench-x86 first to generate pgo.profdata
-make pgo-bench-arm64
+# Prerequisite: run pgo_bench_x86 first to generate pgo.profdata
+bazel run //:pgo_bench_arm64
 ```
 
 Bazelisk is at `~/.local/bin/bazel` (auto-downloads Bazel 7.4.1 per `.bazelversion`).
@@ -75,7 +75,7 @@ main.cpp                      — Binary entry point
 
 .githooks/
   pre-push                    — shared pre-push hook (lint + tests + PGO bench)
-                                Activate with: make install-hooks
+                                Activate with: bazel run //:install_hooks
 
 third_party/
   ncnn.BUILD                  — filegroup for NCNN source archive
@@ -141,7 +141,7 @@ python3 -m cpplint *.cpp *.hpp test/*.cpp test/*.hpp
 bazel test //test:all
 
 # 3. Regenerate PGO profiles (keeps the optimised binary current)
-make pgo-bench-x86
+bazel run //:pgo_bench_x86
 ```
 
 > **Note:** these steps are a manual checklist for Claude to follow in conversation.
@@ -149,7 +149,7 @@ make pgo-bench-x86
 > in `.githooks/`):
 >
 > ```bash
-> make install-hooks
+> bazel run //:install_hooks
 > ```
 >
 > This runs `git config core.hooksPath .githooks` so Git uses the `.githooks/pre-push`
