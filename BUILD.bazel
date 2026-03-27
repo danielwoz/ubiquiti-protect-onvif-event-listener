@@ -127,8 +127,12 @@ sh_binary(
 #   bazel run //:pgo_bench_x86               # baseline → instrument → profile → optimised
 #   bazel run //:pgo_bench_x86 -- 100000     # custom event count
 #
-# ARM64 (cross-PGO -- reuses the x86 profile, runs under QEMU):
+# ARM64 release profile (native, QEMU-collected):
 #   sudo apt-get install qemu-user-static
+#   bazel run //:pgo_collect_arm64           # baseline → instrument → profile → benchmark
+#   git commit pgo_arm64.profdata            # profile is staged automatically
+#
+# ARM64 benchmark (cross-PGO, reuses x86 profile):
 #   bazel run //:pgo_bench_x86               # collect x86 profile first
 #   bazel run //:pgo_bench_arm64
 #
@@ -144,6 +148,11 @@ sh_binary(
 sh_binary(
     name = "pgo_bench_arm64",
     srcs = ["scripts/pgo_bench_arm64.sh"],
+)
+
+sh_binary(
+    name = "pgo_collect_arm64",
+    srcs = ["scripts/pgo_collect_arm64.sh"],
 )
 
 sh_binary(

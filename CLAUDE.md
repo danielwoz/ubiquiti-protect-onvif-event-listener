@@ -36,8 +36,15 @@ bazel run //test:bench_object_detect
 bazel run //:pgo_bench_x86                   # baseline → instrument → profile → optimised
 bazel run //:pgo_bench_x86 -- 100000         # custom event count
 
-# ARM64 benchmark under QEMU (cross-PGO reuses x86 profile)
+# ARM64 release build (PGO + LTO, uses committed pgo_arm64.profdata)
+bazel build --config=arm64_release //:onvif_recorder
+
+# Collect/refresh the ARM64 PGO profile (native profile via QEMU)
 # Prerequisite: sudo apt-get install qemu-user-static
+# Stages pgo_arm64.profdata automatically; commit it afterwards.
+bazel run //:pgo_collect_arm64
+
+# ARM64 benchmark under QEMU (cross-PGO reuses x86 profile)
 # Prerequisite: run pgo_bench_x86 first to generate pgo.profdata
 bazel run //:pgo_bench_arm64
 ```
