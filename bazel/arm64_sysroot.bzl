@@ -213,7 +213,7 @@ OM_uint32 gss_inquire_cred_by_mech(OM_uint32*m,gss_cred_id_t c,gss_OID mech,gss_
 static gss_OID_desc _un = {0,0};
 gss_OID GSS_C_NT_USER_NAME = &_un;
 GSSAPI_EOF
-/usr/bin/clang-14 -target aarch64-linux-gnu --sysroot="$SYSROOT" \
+/usr/bin/clang -target aarch64-linux-gnu --sysroot="$SYSROOT" \
     -c -O2 "$REPO/_gssapi_stub.c" -o "$REPO/_gssapi_stub.o"
 ar rcs "$SYSROOT/usr/lib/aarch64-linux-gnu/libgssapi_krb5.a" "$REPO/_gssapi_stub.o"
 rm -f "$REPO/_gssapi_stub.c" "$REPO/_gssapi_stub.o"
@@ -260,7 +260,7 @@ void* p11_kit_uri_get_pin_value(P11KitUri* u) { return 0; }
 char* p11_kit_space_strdup(const char* s, size_t l) { return 0; }
 size_t p11_kit_space_strlen(const char* s, size_t l) { return 0; }
 P11KIT_EOF
-/usr/bin/clang-14 -target aarch64-linux-gnu --sysroot="$SYSROOT" \
+/usr/bin/clang -target aarch64-linux-gnu --sysroot="$SYSROOT" \
     -c -O2 "$REPO/_p11kit_stub.c" -o "$REPO/_p11kit_stub.o"
 ar rcs "$SYSROOT/usr/lib/aarch64-linux-gnu/libp11-kit.a" "$REPO/_p11kit_stub.o"
 rm -f "$REPO/_p11kit_stub.c" "$REPO/_p11kit_stub.o"
@@ -291,7 +291,7 @@ const char *sasl_errdetail(void *c) { return "sasl stub"; }
 void sasl_set_mutex(void *a, void *b, void *c, void *d) {}
 const char **sasl_global_listmech(void) { return 0; }
 SASL_EOF
-/usr/bin/clang-14 -target aarch64-linux-gnu --sysroot="$SYSROOT" \
+/usr/bin/clang -target aarch64-linux-gnu --sysroot="$SYSROOT" \
     -c -O2 "$REPO/_sasl_stub.c" -o "$REPO/_sasl_stub.o"
 ar rcs "$SYSROOT/usr/lib/aarch64-linux-gnu/libsasl2.a" "$REPO/_sasl_stub.o"
 rm -f "$REPO/_sasl_stub.c" "$REPO/_sasl_stub.o"
@@ -342,8 +342,20 @@ def _arm64_sysroot_impl(rctx):
               content = _CLANG_WRAPPER.format(suffix = "++"),
               executable = True)
 
-    # 4. Compute sysroot path for builtin include directories.
+    # 4. Compute sysroot path and clang resource dir for builtin include directories.
     sysroot = str(rctx.path("sysroot"))
+    result = rctx.execute(["clang", "--print-resource-dir"])
+    if result.return_code != 0:
+        fail("Could not determine clang resource dir: {}".format(result.stderr))
+    clang_resource_dir = result.stdout.strip()
+    # Bazel does string matching on include paths, not inode comparison, so we
+    # need both the real path (from --print-resource-dir) and the versioned
+    # symlink path (/usr/lib/clang/<major>/include) that clang may report.
+    result_ver = rctx.execute(["clang", "--version"])
+    if result_ver.return_code != 0:
+        fail("Could not determine clang version: {}".format(result_ver.stderr))
+    clang_major = result_ver.stdout.strip().split(" ")[3].split(".")[0]
+    clang_symlink_include = "/usr/lib/clang/{}/include".format(clang_major)
 
     # 5. Generate the Starlark toolchain config (needs a .bzl file because
     #    rule() is not allowed in BUILD files).
@@ -438,12 +450,12 @@ def _aarch64_toolchain_config_impl(ctx):
 
     return cc_common.create_cc_toolchain_config_info(
         ctx = ctx,
-        toolchain_identifier   = "aarch64-linux-gnu-clang14",
+        toolchain_identifier   = "aarch64-linux-gnu-clang",
         host_system_name       = "x86_64-unknown-linux-gnu",
         target_system_name     = "aarch64-unknown-linux-gnu",
         target_cpu             = "aarch64",
         target_libc            = "glibc_2.31",
-        compiler               = "clang14",
+        compiler               = "clang",
         abi_version            = "aarch64",
         abi_libc_version       = "glibc_2.31",
         tool_paths             = tool_paths,
@@ -460,12 +472,10 @@ def _aarch64_toolchain_config_impl(ctx):
             # libpq-fe.h is under a postgresql/ subdirectory
             sysroot + "/usr/include/postgresql",
             # clang's own internal headers (builtins, intrinsics, etc.)
-            # Ubuntu packages clang-14 as either 14.0.0 or 14.0.6 depending
-            # on the distro revision; list both so the build works either way.
-            "/usr/lib/llvm-14/lib/clang/14.0.0/include",
-            "/usr/lib/clang/14.0.0/include",
-            "/usr/lib/llvm-14/lib/clang/14.0.6/include",
-            "/usr/lib/clang/14.0.6/include",
+            # Both the real path and the versioned symlink are listed because
+            # Bazel does string matching, not inode comparison.
+            "{clang_resource_dir}/include",
+            "{clang_symlink_include}",
         ],
     )
 
@@ -474,7 +484,7 @@ aarch64_toolchain_config = rule(
     provides = [CcToolchainConfigInfo],
     attrs = {{}},
 )
-""".format(sysroot = sysroot))
+""".format(sysroot = sysroot, clang_resource_dir = clang_resource_dir, clang_symlink_include = clang_symlink_include))
 
     # 6. Generate BUILD.bazel.
     rctx.file("BUILD.bazel", content = """
