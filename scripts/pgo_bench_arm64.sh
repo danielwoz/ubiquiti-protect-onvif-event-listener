@@ -1,32 +1,64 @@
 #!/bin/bash
+# Benchmark ARM64 PGO + ThinLTO speedup via QEMU.
+# Collects a fresh native ARM64 profile each run and shows baseline vs optimised.
+# To persist the profile for --config=arm64_release builds, use pgo_collect_arm64.
+#
+# Prerequisites:
+#   sudo apt-get install qemu-user-static
+#
+# Usage:
+#   scripts/bz run --config=arm64 //:pgo_bench_arm64
+#   scripts/bz run --config=arm64 //:pgo_bench_arm64 -- 100000   # custom event count
 set -e
 cd "$BUILD_WORKSPACE_DIRECTORY"
 
-BAZEL=~/.local/bin/bazel
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+BZ="$SCRIPT_DIR/bz"
 PGO_EVENTS=${1:-50000}
 BENCH_JSONL=test/testdata/bench_onvif.jsonl
-PROFDATA=$(pwd)/pgo.profdata
-arm64_sysroot=$($BAZEL info output_base 2>/dev/null)/external/arm64_sysroot/sysroot/usr/aarch64-linux-gnu
+PROFRAW=$(mktemp /tmp/pgo_arm64_bench.XXXXXX.profraw)
+PROFDATA=$(mktemp /tmp/pgo_arm64_bench.XXXXXX.profdata)
+trap 'rm -f "$PROFRAW" "$PROFDATA"' EXIT
 
-test -f "$PROFDATA" || \
-    (echo "Run 'bazel run //:pgo_bench_x86' first to collect the profile." && exit 1)
-command -v qemu-aarch64-static >/dev/null || \
-    (echo "Install QEMU: sudo apt-get install qemu-user-static" && exit 1)
+command -v qemu-aarch64-static >/dev/null 2>&1 || {
+    echo "qemu-aarch64-static not found."
+    echo "Install with: sudo apt-get install qemu-user-static"
+    exit 1
+}
 
-echo "=== [1/4] Build baseline ARM64 binary ==="
-$BAZEL build --config=arm64 //test:bench_onvif_listener
-echo "=== [2/4] Baseline ARM64 benchmark under QEMU ==="
+arm64_sysroot=$("$BZ" --output_base="$HOME/.cache/bazel/arm64" info output_base 2>/dev/null)/external/arm64_sysroot/sysroot/usr/aarch64-linux-gnu
+
+echo "=== [1/6] Build baseline ARM64 binary ==="
+"$BZ" build --config=arm64 //test:bench_onvif_listener
+echo "=== [2/6] Baseline ARM64 benchmark under QEMU ==="
 qemu-aarch64-static -L "$arm64_sysroot" \
     bazel-bin/test/bench_onvif_listener \
     "$BENCH_JSONL" "$PGO_EVENTS" 2>/dev/null
 echo
-echo "=== [3/4] Build ARM64 with cross-PGO + LTO ==="
-echo "    (x86 profile applied to ARM64 build -- same LLVM IR structure)"
-$BAZEL build --config=arm64 --config=lto \
+
+echo "=== [3/6] Build instrumented ARM64 binary ==="
+"$BZ" build --config=arm64 --config=pgo_instrument \
+    //test:bench_onvif_listener
+
+echo "=== [4/6] Collect ARM64 profile ($PGO_EVENTS events) under QEMU ==="
+LLVM_PROFILE_FILE="$PROFRAW" \
+    qemu-aarch64-static -L "$arm64_sysroot" \
+    bazel-bin/test/bench_onvif_listener \
+    "$BENCH_JSONL" "$PGO_EVENTS" 2>/dev/null
+
+echo "=== [5/6] Merge ARM64 profile ==="
+LLVM_PROFDATA=$(command -v llvm-profdata-18 || command -v llvm-profdata-14 || echo llvm-profdata)
+"$LLVM_PROFDATA" merge -output="$PROFDATA" "$PROFRAW"
+
+echo "=== [6/6] Build ARM64 PGO + LTO binary ==="
+"$BZ" build --config=arm64 --config=lto \
     --copt=-fprofile-instr-use="$PROFDATA" \
     --linkopt=-fprofile-instr-use="$PROFDATA" \
     //test:bench_onvif_listener
-echo "=== [4/4] ARM64 PGO + LTO benchmark under QEMU ==="
+echo "=== ARM64 PGO + LTO benchmark under QEMU ==="
 qemu-aarch64-static -L "$arm64_sysroot" \
     bazel-bin/test/bench_onvif_listener \
     "$BENCH_JSONL" "$PGO_EVENTS" 2>/dev/null
+echo
+
+echo "(Profile discarded. To persist for arm64_release builds, run: scripts/bz run --config=arm64 //:pgo_collect_arm64)"
