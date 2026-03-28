@@ -55,3 +55,27 @@ build:msan --linkopt=-fsanitize=memory
 build:msan --copt=-fno-omit-frame-pointer
 build:msan --copt=-fsanitize-memory-track-origins
 build:msan --copt=-O1
+
+# ---------------------------------------------------------------------------
+# Composite configs: arch × mode
+# Each maps to its own --output_base via the bz wrapper (scripts/bz), which
+# prevents analysis-cache invalidation when switching between configs.
+#
+# Usage (via bz wrapper):
+#   bz build --config=x86 //:onvif_recorder
+#   bz test  --config=x86_asan //test:all
+#   bz test  --config=x86_tsan //test:all
+#   bz test  --config=x86_msan //test:all    # needs instrumented libc
+#   bz build --config=arm64 //:onvif_recorder
+#   bz build --config=arm64_release //:onvif_recorder
+# ---------------------------------------------------------------------------
+build:x86      --config=clang
+
+build:x86_asan --config=clang
+build:x86_asan --config=asan
+
+build:x86_tsan --config=clang
+build:x86_tsan --config=tsan
+
+build:x86_msan --config=clang
+build:x86_msan --config=msan

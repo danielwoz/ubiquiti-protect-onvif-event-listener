@@ -1,5 +1,5 @@
 #!/bin/bash
 set -e
 python3 -m cpplint *.cpp *.hpp test/*.cpp test/*.hpp
-~/.local/bin/bazel test //test:all
-~/.local/bin/bazel run //:pgo_bench_x86
+scripts/bz test  --config=x86 //test:all
+scripts/bz run   --config=x86 //:pgo_bench_x86

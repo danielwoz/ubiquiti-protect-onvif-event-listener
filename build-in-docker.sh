@@ -66,19 +66,27 @@ fi
 
 # ---------------------------------------------------------------------------
 # 2. Ensure the Bazel cache volume exists (persists across runs)
+#    Sub-directories inside the volume provide per-config isolation:
+#      /root/.cache/bazel/x86       — x86 build cache
+#      /root/.cache/bazel/arm64     — ARM64 cross-compile cache
+#      /root/.cache/bazel/arm64_release — ARM64 PGO+LTO release cache
 # ---------------------------------------------------------------------------
 docker volume create "$CACHE_VOL" > /dev/null
 
 mkdir -p "$SCRIPT_DIR/dist"
 
-# Run a single docker container for the build steps
+# Run a Docker container for a single build step.
+# $1 = Bazel config name (used as --output_base sub-directory)
+# $2 = shell command to run inside the container
 run() {
+    local config="$1"
+    local cmd="$2"
     docker run --rm \
         -v "$SCRIPT_DIR:/build" \
         -v "$CACHE_VOL:/root/.cache/bazel" \
         -w /build \
         "$IMAGE" \
-        bash -c "$1"
+        bash -c "bazel --output_base=/root/.cache/bazel/$config $cmd"
 }
 
 # ---------------------------------------------------------------------------
@@ -86,19 +94,19 @@ run() {
 # ---------------------------------------------------------------------------
 if $BUILD_X86; then
     echo "==> Building x86-64 binary ..."
-    run "bazel build //:onvif_recorder \
+    run "x86" "build --config=x86 //:onvif_recorder \
       && cp -f bazel-bin/onvif_recorder dist/onvif_recorder"
     echo "==> dist/onvif_recorder"
 fi
 
 if $RUN_TESTS; then
     echo "==> Running tests ..."
-    run "bazel test //test:all"
+    run "x86" "test --config=x86 //test:all"
 fi
 
 if $BUILD_ARM64; then
     echo "==> Building ARM64 binary ..."
-    run "bazel build --config=arm64 //:onvif_recorder \
+    run "arm64" "build --config=arm64 //:onvif_recorder \
       && cp -f bazel-bin/onvif_recorder dist/onvif_recorder.arm64"
     echo "==> dist/onvif_recorder.arm64"
 fi

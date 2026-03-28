@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# scripts/bz — thin Bazel wrapper that assigns a per-config --output_base so
+# that switching between build configurations (x86, x86_asan, arm64, …) does
+# not invalidate the analysis cache of other configurations.
+#
+# Usage: exactly like bazel, but use "bz" instead:
+#   bz build --config=x86 //:onvif_recorder
+#   bz test  --config=x86_asan //test:all
+#   bz build --config=arm64 //:onvif_recorder
+#   bz build --config=arm64_release //:onvif_recorder
+#
+# Cache layout:  $BAZEL_CACHE_ROOT/<config>/   (default: ~/.cache/bazel/<config>)
+# The "default" config name is used when no --config flag is present.
+
+set -euo pipefail
+
+BAZEL_BIN="${BAZEL_BIN:-bazel}"
+CACHE_ROOT="${BAZEL_CACHE_ROOT:-$HOME/.cache/bazel}"
+
+# Extract the last --config=<name> from the argument list (last wins, like Bazel).
+config="default"
+for arg in "$@"; do
+    case "$arg" in
+        --config=*) config="${arg#--config=}" ;;
+    esac
+done
+
+exec "$BAZEL_BIN" --output_base="$CACHE_ROOT/$config" "$@"

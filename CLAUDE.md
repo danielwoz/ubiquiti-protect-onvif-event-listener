@@ -2,52 +2,64 @@
 
 ## Build commands
 
+Use `scripts/bz` instead of `bazel` directly. The `bz` wrapper automatically assigns
+a separate `--output_base` per `--config`, so switching configs never invalidates the
+analysis cache of another config.
+
 ```bash
-# Host (x86_64) binary
-bazel build //:onvif_recorder
+# Host (x86_64) binary  [cache: ~/.cache/bazel/x86]
+scripts/bz build --config=x86 //:onvif_recorder
 
-# ARM64 cross-compiled binary (for Dream Machine)
-bazel build --config=arm64 //:onvif_recorder
+# ARM64 cross-compiled binary (for Dream Machine)  [cache: ~/.cache/bazel/arm64]
+scripts/bz build --config=arm64 //:onvif_recorder
 
-# All tests
-bazel test //test:all
+# All tests  [cache: ~/.cache/bazel/x86]
+scripts/bz test --config=x86 //test:all
 
 # Individual tests
-bazel run //test:test_detection_recorder
-bazel run //test:test_onvif_listener       # testdata JSONL passed automatically
-bazel run //test:test_ubv_thumbnail        # snapshot JPEGs passed automatically
+scripts/bz run --config=x86 //test:test_detection_recorder
+scripts/bz run --config=x86 //test:test_onvif_listener       # testdata JSONL passed automatically
+scripts/bz run --config=x86 //test:test_ubv_thumbnail        # snapshot JPEGs passed automatically
 
 # Manual inspection with a custom file
-bazel run //test:test_onvif_listener -- /path/to/other.jsonl
-bazel run //test:test_ubv_thumbnail  -- /path/to/file.ubv
+scripts/bz run --config=x86 //test:test_onvif_listener -- /path/to/other.jsonl
+scripts/bz run --config=x86 //test:test_ubv_thumbnail  -- /path/to/file.ubv
 
 # Throughput benchmark (single core, 50 000 events default)
-bazel run //test:bench_onvif_listener
-bazel run //test:bench_onvif_listener -- 100000   # custom event count
+scripts/bz run --config=x86 //test:bench_onvif_listener
+scripts/bz run --config=x86 //test:bench_onvif_listener -- 100000   # custom event count
 
 # JPEG crop benchmark (single core)
-bazel run //test:bench_jpeg_crop                  # uses security_cam_outdoor.jpg
+scripts/bz run --config=x86 //test:bench_jpeg_crop                  # uses security_cam_outdoor.jpg
 
 # Object detection benchmark (single core, 100 iterations)
 # Model files are downloaded automatically by Bazel via http_file rules.
-bazel run //test:bench_object_detect
+scripts/bz run --config=x86 //test:bench_object_detect
+
+# Sanitiser builds  [separate caches per sanitiser]
+scripts/bz test --config=x86_asan //test:all   # AddressSanitiser
+scripts/bz test --config=x86_tsan //test:all   # ThreadSanitiser
+scripts/bz test --config=x86_msan //test:all   # MemorySanitiser (needs instrumented libc)
 
 # PGO + ThinLTO optimised build (x86)
-bazel run //:pgo_bench_x86                   # baseline → instrument → profile → optimised
-bazel run //:pgo_bench_x86 -- 100000         # custom event count
+scripts/bz run --config=x86 //:pgo_bench_x86                   # baseline → instrument → profile → optimised
+scripts/bz run --config=x86 //:pgo_bench_x86 -- 100000         # custom event count
 
-# ARM64 release build (PGO + LTO, uses committed pgo_arm64.profdata)
-bazel build --config=arm64_release //:onvif_recorder
+# ARM64 release build (PGO + LTO, uses committed pgo_arm64.profdata)  [cache: ~/.cache/bazel/arm64_release]
+scripts/bz build --config=arm64_release //:onvif_recorder
 
 # Collect/refresh the ARM64 PGO profile (native profile via QEMU)
 # Prerequisite: sudo apt-get install qemu-user-static
 # Stages pgo_arm64.profdata automatically; commit it afterwards.
-bazel run //:pgo_collect_arm64
+scripts/bz run --config=arm64 //:pgo_collect_arm64
 
-# ARM64 benchmark under QEMU (cross-PGO reuses x86 profile)
-# Prerequisite: run pgo_bench_x86 first to generate pgo.profdata
-bazel run //:pgo_bench_arm64
+# ARM64 benchmark under QEMU
+scripts/bz run --config=arm64 //:pgo_bench_arm64
 ```
+
+`scripts/bz` is a thin wrapper: it reads `--config=<name>` from args and injects
+`--output_base=$HOME/.cache/bazel/<name>` as a Bazel startup option.  You can set
+`BAZEL_CACHE_ROOT` to change the root directory.
 
 Bazelisk is at `~/.local/bin/bazel` (auto-downloads Bazel 7.4.1 per `.bazelversion`).
 
@@ -145,10 +157,10 @@ Run these before every `git push` to keep the repo green:
 python3 -m cpplint *.cpp *.hpp test/*.cpp test/*.hpp
 
 # 2. All tests pass
-bazel test //test:all
+scripts/bz test --config=x86 //test:all
 
 # 3. Regenerate PGO profiles (keeps the optimised binary current)
-bazel run //:pgo_bench_x86
+scripts/bz run --config=x86 //:pgo_bench_x86
 ```
 
 > **Note:** these steps are a manual checklist for Claude to follow in conversation.
@@ -191,7 +203,7 @@ Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default 
 
 ```bash
 # 1. Cross-compile for ARM64
-bazel build --config=arm64 //:onvif_recorder
+scripts/bz build --config=arm64 //:onvif_recorder
 
 # 2. Copy binary to router (replace <router-ip> with your device's IP)
 scp bazel-bin/onvif_recorder root@<router-ip>:/root/onvif_recorder
