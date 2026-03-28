@@ -97,6 +97,11 @@ configure_make(
     postfix_script = """
 make -C src/common all
 make -C src/port all
+# Remove libpq-refs-stamp from the 'all' prerequisite list before building.
+# The stamp checks libpq.so for forbidden undefined symbols; it fires for any
+# build that injects its own symbols (sanitisers, PGO instrumentation, etc.).
+# We only need the static library, so the shared-lib symbol check is irrelevant.
+sed -i '/^all:/s/ *libpq-refs-stamp//' src/interfaces/libpq/Makefile
 make -C src/interfaces/libpq all
 make -C src/common install
 make -C src/port install

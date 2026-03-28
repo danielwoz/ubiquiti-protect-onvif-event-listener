@@ -170,6 +170,15 @@ Note: `"end"` must be double-quoted in SQL because `END` is a reserved word.
 
 ---
 
+## Git policy
+
+**Never use `git push --no-verify`.** The pre-push hook runs lint, tests, and the PGO
+benchmark to protect the repository from broken commits. If the hook fails, fix the
+underlying issue. If GitHub drops the SSH connection due to timeout while the hook
+runs, investigate and resolve the cause — bypassing the hook is not an option.
+
+---
+
 ## Build system
 
 Bazel is used exclusively.  See `README.md` for full build instructions.

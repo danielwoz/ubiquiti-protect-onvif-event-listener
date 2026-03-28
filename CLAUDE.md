@@ -175,6 +175,11 @@ scripts/bz run --config=x86 //:pgo_bench_x86
 > file that is checked into the repository. Anyone who clones the repo runs the same
 > one-time command to activate the hooks.
 
+> **IMPORTANT:** Never use `git push --no-verify`. The pre-push hook exists to prevent
+> broken commits reaching the repository. If the hook fails, fix the underlying issue
+> first. If GitHub's SSH connection times out while the hook is running, investigate
+> and resolve the root cause — do not bypass the hook.
+
 ## Command-line flags (runtime)
 
 All configuration is now via `absl::flags`. Pass `--help` for the full list.

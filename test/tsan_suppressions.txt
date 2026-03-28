@@ -1,0 +1,8 @@
+# TSan suppressions for test infrastructure only.
+# libmicrohttpd (used by OnvifCameraEmulator) has known benign races in its
+# internal select/daemon management that are unrelated to our code under test.
+race:MHD_stop_daemon
+race:MHD_select
+race:internal_run_from_select
+race:MHD_run
+race:MHD_run_from_select

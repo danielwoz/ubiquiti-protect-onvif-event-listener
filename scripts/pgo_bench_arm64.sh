@@ -6,7 +6,7 @@ BAZEL=~/.local/bin/bazel
 PGO_EVENTS=${1:-50000}
 BENCH_JSONL=test/testdata/bench_onvif.jsonl
 PROFDATA=$(pwd)/pgo.profdata
-arm64_sysroot=$($BAZEL info output_base 2>/dev/null)/external/arm64_sysroot/sysroot
+arm64_sysroot=$($BAZEL info output_base 2>/dev/null)/external/arm64_sysroot/sysroot/usr/aarch64-linux-gnu
 
 test -f "$PROFDATA" || \
     (echo "Run 'bazel run //:pgo_bench_x86' first to collect the profile." && exit 1)

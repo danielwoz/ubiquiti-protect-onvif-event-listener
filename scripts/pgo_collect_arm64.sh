@@ -11,12 +11,13 @@
 set -e
 cd "$BUILD_WORKSPACE_DIRECTORY"
 
-BAZEL=~/.local/bin/bazel
+SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+BZ="$SCRIPT_DIR/bz"
 PGO_EVENTS=${1:-50000}
 BENCH_JSONL=test/testdata/bench_onvif.jsonl
 PROFRAW=$(pwd)/pgo_arm64.profraw
 PROFDATA=$(pwd)/pgo_arm64.profdata
-arm64_sysroot=$($BAZEL info output_base 2>/dev/null)/external/arm64_sysroot/sysroot
+arm64_sysroot=$("$BZ" --output_base="$HOME/.cache/bazel/arm64" info output_base 2>/dev/null)/external/arm64_sysroot/sysroot/usr/aarch64-linux-gnu
 
 command -v qemu-aarch64-static >/dev/null 2>&1 || {
     echo "qemu-aarch64-static not found."
@@ -25,7 +26,7 @@ command -v qemu-aarch64-static >/dev/null 2>&1 || {
 }
 
 echo "=== [1/6] Build baseline ARM64 binary ==="
-$BAZEL build --config=arm64 //test:bench_onvif_listener
+"$BZ" build --config=arm64 //test:bench_onvif_listener
 echo "=== [2/6] Baseline ARM64 benchmark under QEMU ==="
 qemu-aarch64-static -L "$arm64_sysroot" \
     bazel-bin/test/bench_onvif_listener \
@@ -33,7 +34,7 @@ qemu-aarch64-static -L "$arm64_sysroot" \
 echo
 
 echo "=== [3/6] Build instrumented ARM64 binary ==="
-$BAZEL build --config=arm64 --config=pgo_instrument \
+"$BZ" build --config=arm64 --config=pgo_instrument \
     //test:bench_onvif_listener
 
 echo "=== [4/6] Collect ARM64 profile ($PGO_EVENTS events) under QEMU ==="
@@ -48,7 +49,7 @@ LLVM_PROFDATA=$(command -v llvm-profdata-18 || command -v llvm-profdata-14 || ec
 rm -f "$PROFRAW"
 
 echo "=== [6/6] Build ARM64 PGO + LTO binary and benchmark ==="
-$BAZEL build --config=arm64_release //test:bench_onvif_listener
+"$BZ" build --config=arm64_release //test:bench_onvif_listener
 qemu-aarch64-static -L "$arm64_sysroot" \
     bazel-bin/test/bench_onvif_listener \
     "$BENCH_JSONL" "$PGO_EVENTS" 2>/dev/null

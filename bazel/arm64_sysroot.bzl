@@ -297,6 +297,44 @@ ar rcs "$SYSROOT/usr/lib/aarch64-linux-gnu/libsasl2.a" "$REPO/_sasl_stub.o"
 rm -f "$REPO/_sasl_stub.c" "$REPO/_sasl_stub.o"
 echo "SASL stub built"
 
+# 10. Build LLVM profile runtime for aarch64.
+#     libclang_rt.profile-aarch64.a is needed for --config=pgo_instrument ARM64 builds.
+#     Ubuntu 22.04 ships clang-14 but omits the aarch64 cross-compilation runtime,
+#     so we build it from the LLVM 14.0.0 source.
+echo "Building ARM64 LLVM profile runtime..."
+mkdir -p "$REPO/resource_dir/include"
+mkdir -p "$REPO/resource_dir/lib/linux"
+
+# Copy clang builtin headers into our local resource directory so the wrapper
+# can use --resource-dir and keep everything self-contained.
+CLANG_RT_DIR=$(clang --print-resource-dir)
+cp -r "$CLANG_RT_DIR/include/." "$REPO/resource_dir/include/"
+
+# Profile source files were pre-downloaded by rctx.download() into profile_rt_src/.
+PROFILE_SRC="$REPO/profile_rt_src"
+
+# Cross-compile for aarch64. Only PlatformLinux.c is correct for Linux;
+# the Darwin/AIX/Fuchsia/Windows platform files are omitted to avoid
+# pulling in platform-specific headers that don't exist on Linux.
+CFLAGS="-target aarch64-linux-gnu --sysroot=$SYSROOT --gcc-toolchain=$SYSROOT/usr -O2 -fPIC -I$PROFILE_SRC -DCOMPILER_RT_HAS_UNAME"
+PROFILE_OBJS=()
+for f in GCDAProfiling.c InstrProfiling.c InstrProfilingBuffer.c \
+          InstrProfilingFile.c InstrProfilingInternal.c \
+          InstrProfilingMerge.c InstrProfilingMergeFile.c \
+          InstrProfilingNameVar.c InstrProfilingPlatformLinux.c \
+          InstrProfilingUtil.c InstrProfilingValue.c \
+          InstrProfilingVersionVar.c InstrProfilingWriter.c; do
+    /usr/bin/clang $CFLAGS -c "$PROFILE_SRC/$f" -o "$PROFILE_SRC/${f%.c}.o"
+    PROFILE_OBJS+=("$PROFILE_SRC/${f%.c}.o")
+done
+/usr/bin/clang++ $CFLAGS -std=c++11 \
+    -c "$PROFILE_SRC/InstrProfilingRuntime.cpp" \
+    -o "$PROFILE_SRC/InstrProfilingRuntime.o"
+PROFILE_OBJS+=("$PROFILE_SRC/InstrProfilingRuntime.o")
+ar rcs "$REPO/resource_dir/lib/linux/libclang_rt.profile-aarch64.a" "${PROFILE_OBJS[@]}"
+rm -rf "$PROFILE_SRC"
+echo "ARM64 profile runtime built"
+
 rm -rf "$TMP"
 echo "arm64 sysroot built at $SYSROOT"
 """
@@ -307,10 +345,12 @@ _CLANG_WRAPPER = """#!/bin/bash
 SCRIPT="$(readlink -f "${{BASH_SOURCE[0]}}")"
 DIR="$(dirname "$SCRIPT")"
 SYSROOT="$DIR/../sysroot"
+RESOURCE_DIR="$DIR/../resource_dir"
 exec /usr/bin/clang{suffix} \\
   -target aarch64-linux-gnu \\
   --sysroot="$SYSROOT" \\
   --gcc-toolchain="$SYSROOT/usr" \\
+  -resource-dir="$RESOURCE_DIR" \\
   -fuse-ld=lld \\
   -Wl,-Bstatic \\
   "$@" \\
@@ -327,14 +367,39 @@ def _arm64_sysroot_impl(rctx):
             sha256 = sha256,
         )
 
-    # 2. Build the sysroot.
+    # 2. Pre-download LLVM 14 compiler-rt profile runtime sources.
+    #    rctx.download() has network access; bash execute() does not.
+    _llvm_base = "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-14.0.0/compiler-rt/lib/profile/"
+    for f in [
+        "InstrProfiling.h",
+        "InstrProfilingInternal.h",
+        "InstrProfilingPort.h",
+        "InstrProfilingUtil.h",
+        "GCDAProfiling.c",
+        "InstrProfiling.c",
+        "InstrProfilingBuffer.c",
+        "InstrProfilingFile.c",
+        "InstrProfilingInternal.c",
+        "InstrProfilingMerge.c",
+        "InstrProfilingMergeFile.c",
+        "InstrProfilingNameVar.c",
+        "InstrProfilingPlatformLinux.c",
+        "InstrProfilingRuntime.cpp",
+        "InstrProfilingUtil.c",
+        "InstrProfilingValue.c",
+        "InstrProfilingVersionVar.c",
+        "InstrProfilingWriter.c",
+    ]:
+        rctx.download(url = _llvm_base + f, output = "profile_rt_src/" + f)
+
+    # 3. Build the sysroot.
     rctx.file("setup.sh", content = _SETUP_SH, executable = True)
     result = rctx.execute(["bash", "setup.sh"], timeout = 600)
     if result.return_code != 0:
         fail("arm64_sysroot setup.sh failed:\nstdout:\n{}\nstderr:\n{}".format(
             result.stdout, result.stderr))
 
-    # 3. Create compiler wrapper scripts.
+    # 4. Create compiler wrapper scripts.
     rctx.file("bin/clang_arm64",
               content = _CLANG_WRAPPER.format(suffix = ""),
               executable = True)
@@ -342,22 +407,15 @@ def _arm64_sysroot_impl(rctx):
               content = _CLANG_WRAPPER.format(suffix = "++"),
               executable = True)
 
-    # 4. Compute sysroot path and clang resource dir for builtin include directories.
+    # 5. Compute sysroot and resource_dir paths for toolchain config.
+    #    The resource_dir is built by _SETUP_SH and contains our local copy of
+    #    the clang builtin headers and the cross-compiled profile runtime.
+    #    Using --resource-dir in the wrapper keeps all clang-internal paths
+    #    self-contained and avoids fragile host-path matching.
     sysroot = str(rctx.path("sysroot"))
-    result = rctx.execute(["clang", "--print-resource-dir"])
-    if result.return_code != 0:
-        fail("Could not determine clang resource dir: {}".format(result.stderr))
-    clang_resource_dir = result.stdout.strip()
-    # Bazel does string matching on include paths, not inode comparison, so we
-    # need both the real path (from --print-resource-dir) and the versioned
-    # symlink path (/usr/lib/clang/<major>/include) that clang may report.
-    result_ver = rctx.execute(["clang", "--version"])
-    if result_ver.return_code != 0:
-        fail("Could not determine clang version: {}".format(result_ver.stderr))
-    clang_major = result_ver.stdout.strip().split(" ")[3].split(".")[0]
-    clang_symlink_include = "/usr/lib/clang/{}/include".format(clang_major)
+    resource_dir = str(rctx.path("resource_dir"))
 
-    # 5. Generate the Starlark toolchain config (needs a .bzl file because
+    # 6. Generate the Starlark toolchain config (needs a .bzl file because
     #    rule() is not allowed in BUILD files).
     rctx.file("toolchain_config.bzl", content = """
 \"\"\"Auto-generated aarch64-linux-gnu CC toolchain config.\"\"\"
@@ -471,11 +529,10 @@ def _aarch64_toolchain_config_impl(ctx):
             sysroot + "/usr/include/libxml2",
             # libpq-fe.h is under a postgresql/ subdirectory
             sysroot + "/usr/include/postgresql",
-            # clang's own internal headers (builtins, intrinsics, etc.)
-            # Both the real path and the versioned symlink are listed because
-            # Bazel does string matching, not inode comparison.
-            "{clang_resource_dir}/include",
-            "{clang_symlink_include}",
+            # clang builtin headers from our self-contained resource directory
+            # (built by _SETUP_SH alongside the profile runtime).  Using a
+            # local copy avoids fragile host-path matching across distros.
+            "{resource_dir}/include",
         ],
     )
 
@@ -484,9 +541,9 @@ aarch64_toolchain_config = rule(
     provides = [CcToolchainConfigInfo],
     attrs = {{}},
 )
-""".format(sysroot = sysroot, clang_resource_dir = clang_resource_dir, clang_symlink_include = clang_symlink_include))
+""".format(sysroot = sysroot, resource_dir = resource_dir))
 
-    # 6. Generate BUILD.bazel.
+    # 7. Generate BUILD.bazel.
     rctx.file("BUILD.bazel", content = """
 load(":toolchain_config.bzl", "aarch64_toolchain_config")
 
@@ -494,7 +551,7 @@ package(default_visibility = ["//visibility:public"])
 
 filegroup(
     name = "all_files",
-    srcs = glob(["bin/**", "sysroot/**"]),
+    srcs = glob(["bin/**", "sysroot/**", "resource_dir/**"]),
 )
 
 filegroup(name = "empty", srcs = [])

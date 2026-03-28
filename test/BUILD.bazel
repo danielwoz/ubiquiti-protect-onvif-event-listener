@@ -3,6 +3,12 @@ config_setting(
     constraint_values = ["@platforms//cpu:aarch64"],
 )
 
+filegroup(
+    name = "tsan_suppressions",
+    srcs = ["tsan_suppressions.txt"],
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "onvif_camera_emulator",
     srcs = ["onvif_camera_emulator.cpp"],
@@ -101,6 +107,7 @@ filegroup(
 cc_test(
     name = "test_onvif_listener",
     srcs = ["test_onvif_listener.cpp"],
+    env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},
     args = [
         "$(location //test:hikvision_raw_log)",
         "$(location //test:dahua_raw_log)",
@@ -118,6 +125,7 @@ cc_test(
         "$(location //test:unvr_1_47_raw_log)",
     ],
     data = [
+        "//test:tsan_suppressions",
         "//test:hikvision_raw_log",
         "//test:dahua_raw_log",
         "//test:cell_motion_raw_log",
@@ -145,7 +153,9 @@ cc_test(
 cc_test(
     name = "test_detection_recorder",
     srcs = ["test_detection_recorder.cpp"],
+    env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},
     data = [
+        "//test:tsan_suppressions",
         "testdata/snapshot_108.jpg",
         "testdata/snapshot_109.jpg",
     ],

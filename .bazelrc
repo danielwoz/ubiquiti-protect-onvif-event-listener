@@ -28,11 +28,10 @@ build:lto --linkopt=-flto=thin
 
 # ARM64 release build: native QEMU-collected PGO profile + ThinLTO.
 # Requires pgo_arm64.profdata to exist (committed to the repo).
-# Collect/refresh it with: bazel run //:pgo_collect_arm64
+# Collect/refresh it with: scripts/bz run --config=arm64 //:pgo_collect_arm64
 build:arm64_release --config=arm64
 build:arm64_release --config=lto
-build:arm64_release --copt=-fprofile-instr-use=%workspace%/pgo_arm64.profdata
-build:arm64_release --linkopt=-fprofile-instr-use=%workspace%/pgo_arm64.profdata
+build:arm64_release --fdo_profile=//:pgo_arm64
 
 # Sanitizer builds -- requires --config=clang; incompatible with each other
 # and with --config=arm64.
