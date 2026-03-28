@@ -204,8 +204,8 @@ Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default 
 ## Deploying to a Dream Router / NVR
 
 ```bash
-# 1. Cross-compile for ARM64
-scripts/bz build --config=arm64 //:onvif_recorder
+# 1. Cross-compile for ARM64 (PGO + ThinLTO optimised release)
+scripts/bz build --config=arm64_release //:onvif_recorder
 
 # 2. Copy binary to router (replace <router-ip> with your device's IP)
 scp bazel-bin/onvif_recorder root@<router-ip>:/root/onvif_recorder

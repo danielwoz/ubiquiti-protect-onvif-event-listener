@@ -192,8 +192,8 @@ sudo apt-get install -y \
 # x86_64 native binary
 ~/.local/bin/bazel build //:onvif_recorder
 
-# ARM64 cross-compiled binary (for Dream Router / Dream Machine)
-~/.local/bin/bazel build --config=arm64 //:onvif_recorder
+# ARM64 release binary — PGO + ThinLTO optimised (for Dream Router / Dream Machine)
+scripts/bz build --config=arm64_release //:onvif_recorder
 
 # Run all tests
 ~/.local/bin/bazel test //test:all
