@@ -156,11 +156,8 @@ Run these before every `git push` to keep the repo green:
 # 1. Lint all source files (must be zero errors)
 python3 -m cpplint *.cpp *.hpp test/*.cpp test/*.hpp
 
-# 2. All tests pass
+# 2. All tests pass (Bazel-cached; fast on repeat runs)
 scripts/bz test --config=x86 //test:all
-
-# 3. Regenerate PGO profiles (keeps the optimised binary current)
-scripts/bz run --config=x86 //:pgo_bench_x86
 ```
 
 > **Note:** these steps are a manual checklist for Claude to follow in conversation.
