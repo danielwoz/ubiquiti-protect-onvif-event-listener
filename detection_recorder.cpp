@@ -37,6 +37,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "alarm_notifier.hpp"
 #include "jpeg_crop.hpp"
 #include "object_detect.hpp"
 #include "ubv_thumbnail.hpp"
@@ -654,7 +655,13 @@ void DetectionRecorder::set_snapshot(const CameraConfig& cam) {
   std::lock_guard<std::mutex> lk(mu_);
   snapshot_info_[cam.ip] = {cam.snapshot_url, cam.user, cam.password};
   db_->register_camera(cam.ip, cam.id, cam.mac);
-  if (!cam.id.empty()) camera_ids_[cam.ip] = cam.id;
+  if (!cam.id.empty())  camera_ids_[cam.ip]  = cam.id;
+  if (!cam.mac.empty()) camera_macs_[cam.ip] = cam.mac;
+}
+
+void DetectionRecorder::set_alarm_notifier(AlarmNotifier* notifier) {
+  std::lock_guard<std::mutex> lk(mu_);
+  alarm_notifier_ = notifier;
 }
 
 void DetectionRecorder::set_detector(
@@ -717,10 +724,11 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
 
   if (det->started) {
     // 1. Look up snapshot + UBV config and buffer settings (brief lock, no I/O).
-    std::string snap_url, snap_user, snap_pass, ubv_dir, cam_uuid;
+    std::string snap_url, snap_user, snap_pass, ubv_dir, cam_uuid, cam_mac;
     uint64_t pre_ms;
     const object_detect::ObjectDetector* det_ptr;
     bool det_override;
+    AlarmNotifier* alarm_notif;
     {
       std::lock_guard<std::mutex> lk(mu_);
       auto it = snapshot_info_.find(ev.camera_ip);
@@ -731,10 +739,13 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       }
       auto cit = camera_ids_.find(ev.camera_ip);
       if (cit != camera_ids_.end()) cam_uuid = cit->second;
+      auto mit = camera_macs_.find(ev.camera_ip);
+      if (mit != camera_macs_.end()) cam_mac = mit->second;
       ubv_dir      = ubv_dir_;
       pre_ms       = pre_buffer_ms_;
       det_ptr      = detector_;
       det_override = detect_override_;
+      alarm_notif  = alarm_notifier_;
     }
 
     // 2. Compute timestamps and IDs (no lock -- needs ip_to_mac_ which is read-only).
@@ -781,43 +792,50 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     }
 
     // 4. INSERT into both tables, write thumbnail -- all under lock.
-    std::lock_guard<std::mutex> lk(mu_);
-
-    db_->insert_event(event_id, ts_ms, ev.camera_ip, sdt_json, thumb_id, now_str);
-    db_->insert_sdo(sdo_id, event_id, thumb_id, ev.camera_ip,
-                    obj_type, attributes, ts_ms, now_str);
-    db_->insert_smart_detect_raw(sdr_id, ev.camera_ip, ts_ms, obj_type, now_str);
-
-    // Insert detectionLabels rows so events appear in Protect's find-anything
-    // endpoint (which does INNER JOIN on detectionLabels WHERE objectId IS NULL).
     {
-      std::vector<std::string> label_names = {
-        "eventType:smartDetectZone",
-        "smartDetectType:" + obj_type,
-      };
-      if (!cam_uuid.empty())
-        label_names.push_back("camera:" + cam_uuid);
-      const std::vector<int> lids = db_->upsert_labels(label_names, now_str);
-      if (!lids.empty()) {
-        db_->insert_detection_label(event_id, "",      lids, now_str);
-        db_->insert_detection_label(event_id, sdo_id, lids, now_str);
-      }
-    }
+      std::lock_guard<std::mutex> lk(mu_);
 
-    open_[key] = event_id;
+      db_->insert_event(event_id, ts_ms, ev.camera_ip, sdt_json, thumb_id, now_str);
+      db_->insert_sdo(sdo_id, event_id, thumb_id, ev.camera_ip,
+                      obj_type, attributes, ts_ms, now_str);
+      db_->insert_smart_detect_raw(sdr_id, ev.camera_ip, ts_ms, obj_type, now_str);
 
-    // 4d. Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.
-    if (!snapshot.empty()) {
-      if (!ubv_dir.empty()) {
-        const std::string ubv_path =
-          ubv_dir + "/" + ev.camera_ip + "_thumbnails.ubv";
-        auto s = ubv::append(ubv_path, {ts_ms, snapshot});
-        if (!s.ok()) {
-          LOG(WARNING) << "[ubv] append failed (non-fatal): " << s.message();
+      // Insert detectionLabels rows so events appear in Protect's find-anything
+      // endpoint (which does INNER JOIN on detectionLabels WHERE objectId IS NULL).
+      {
+        std::vector<std::string> label_names = {
+          "eventType:smartDetectZone",
+          "smartDetectType:" + obj_type,
+        };
+        if (!cam_uuid.empty())
+          label_names.push_back("camera:" + cam_uuid);
+        const std::vector<int> lids = db_->upsert_labels(label_names, now_str);
+        if (!lids.empty()) {
+          db_->insert_detection_label(event_id, "",      lids, now_str);
+          db_->insert_detection_label(event_id, sdo_id, lids, now_str);
         }
       }
-      db_->write_thumbnail(thumb_id, event_id, ev.camera_ip,
-                           ts_ms, now_str, snapshot);
+
+      open_[key] = event_id;
+
+      // 4d. Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.
+      if (!snapshot.empty()) {
+        if (!ubv_dir.empty()) {
+          const std::string ubv_path =
+            ubv_dir + "/" + ev.camera_ip + "_thumbnails.ubv";
+          auto s = ubv::append(ubv_path, {ts_ms, snapshot});
+          if (!s.ok()) {
+            LOG(WARNING) << "[ubv] append failed (non-fatal): " << s.message();
+          }
+        }
+        db_->write_thumbnail(thumb_id, event_id, ev.camera_ip,
+                             ts_ms, now_str, snapshot);
+      }
+    }  // lock released
+
+    // 5. Notify UOS alarm manager (HTTP I/O, must be outside lock).
+    if (alarm_notif && !cam_mac.empty()) {
+      alarm_notif->notify(obj_type, cam_mac, event_id, ts_ms);
     }
 
   } else {

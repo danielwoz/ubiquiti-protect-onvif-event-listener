@@ -18,6 +18,7 @@
 #include <fstream>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -313,4 +314,38 @@ std::pair<int, std::string> DahuaSD4A425DBEmulator::handle(
 
   resp.second = rewrite_urls(resp.second);
   return resp;
+}
+
+// ============================================================
+// UosEmulator
+// ============================================================
+
+UosEmulator::UosEmulator() : OnvifCameraEmulator("uos-emulator") {}
+
+void UosEmulator::set_alarms_json(const std::string& json) {
+  std::lock_guard<std::mutex> lk(mu_);
+  alarms_json_ = json;
+}
+
+std::vector<std::string> UosEmulator::posted_events() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return posted_;
+}
+
+std::string UosEmulator::base_url() const {
+  return "http://127.0.0.1:" + std::to_string(port());
+}
+
+std::pair<int, std::string> UosEmulator::handle(
+    const std::string& path,
+    const std::string& /*soap_action*/,
+    const std::string& body) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (path == "/api/v1/alarms" && body.empty())
+    return {200, alarms_json_};
+  if (path == "/api/v1/alarms/events" && !body.empty()) {
+    posted_.push_back(body);
+    return {200, "{}"};
+  }
+  return {404, ""};
 }

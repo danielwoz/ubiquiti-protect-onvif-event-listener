@@ -2,6 +2,7 @@ load("@rules_foreign_cc//foreign_cc:defs.bzl", "cmake", "configure_make")
 
 # ---- GMP 6.3.0 (http_archive) ----
 # Arbitrary-precision arithmetic library; used by Nettle/hogweed.
+# Not required by any active build target; tagged manual to exclude from //...
 configure_make(
     name = "gmp",
     lib_source = "@gmp_src//:all",
@@ -12,11 +13,13 @@ configure_make(
         "--with-pic",
     ],
     out_static_libs = ["libgmp.a"],
+    tags = ["manual"],
     visibility = ["//visibility:public"],
 )
 
 # ---- libtasn1 4.19.0 (http_archive) ----
 # ASN.1 parsing library; used by GnuTLS.
+# Not required by any active build target; tagged manual to exclude from //...
 configure_make(
     name = "libtasn1",
     lib_source = "@libtasn1_src//:all",
@@ -26,11 +29,13 @@ configure_make(
         "--with-pic",
     ],
     out_static_libs = ["libtasn1.a"],
+    tags = ["manual"],
     visibility = ["//visibility:public"],
 )
 
 # ---- Nettle 3.9.1 (http_archive) ----
 # Cryptographic library; used by GnuTLS.  Requires GMP.
+# Not required by any active build target; tagged manual to exclude from //...
 configure_make(
     name = "nettle",
     lib_source = "@nettle_src//:all",
@@ -47,6 +52,7 @@ configure_make(
     },
     deps = [":gmp"],
     out_static_libs = ["libnettle.a", "libhogweed.a"],
+    tags = ["manual"],
     visibility = ["//visibility:public"],
 )
 

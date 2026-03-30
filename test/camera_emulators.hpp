@@ -146,3 +146,39 @@ class DahuaSD4A425DBEmulator : public OnvifCameraEmulator {
   std::size_t     pull_idx_{0};
   std::mutex      mu_;
 };
+
+// ============================================================
+// UosEmulator -- fake UOS external automation manager (port 11010 role)
+//
+// Accepts:
+//   GET  /api/v1/alarms         → returns the configured alarm list JSON
+//   POST /api/v1/alarms/events  → records the request body, returns "{}"
+//
+// Used by test_detection_recorder to verify that AlarmNotifier sends the
+// correct requests to UOS when a person or vehicle detection is recorded.
+// ============================================================
+class UosEmulator : public OnvifCameraEmulator {
+ public:
+  UosEmulator();
+
+  /// Replace the alarm list JSON returned by GET /api/v1/alarms.
+  /// Call before start() or while running; thread-safe.
+  void set_alarms_json(const std::string& json);
+
+  /// Returns every POST body received at /api/v1/alarms/events.
+  std::vector<std::string> posted_events() const;
+
+  /// Base URL of this server, e.g. "http://127.0.0.1:54321".
+  std::string base_url() const;
+
+ protected:
+  std::pair<int, std::string> handle(
+    const std::string& path,
+    const std::string& soap_action,
+    const std::string& body) override;
+
+ private:
+  mutable std::mutex       mu_;
+  std::string              alarms_json_{"[]"};
+  std::vector<std::string> posted_;
+};

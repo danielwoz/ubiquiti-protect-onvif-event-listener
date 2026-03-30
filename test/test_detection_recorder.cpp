@@ -68,9 +68,11 @@
 #include <utility>
 #include <vector>
 
+#include "../alarm_notifier.hpp"
 #include "../detection_recorder.hpp"
 #include "../onvif_listener.hpp"
 #include "../ubv_thumbnail.hpp"
+#include "camera_emulators.hpp"
 #include "onvif_camera_emulator.hpp"
 
 // ============================================================
@@ -522,6 +524,10 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
 
 struct TestContext {
   std::string                      ubv_dir;
+  // Optional: set before run_standard_script() to inject MACs into CameraConfigs
+  // so AlarmNotifier can include them in UOS POST scope fields.
+  std::string                      mac108;
+  std::string                      mac109;
   onvif::CameraConfig              cfg108;
   onvif::CameraConfig              cfg109;
   std::unique_ptr<SnapshotSyntheticEmulator> emu108;
@@ -561,12 +567,14 @@ static bool run_standard_script(TestContext& ctx,
   ctx.cfg108.password           = "test";
   ctx.cfg108.snapshot_url       = ctx.emu108->snapshot_url();
   ctx.cfg108.retry_interval_sec = 1;
+  if (!ctx.mac108.empty()) ctx.cfg108.mac = ctx.mac108;
 
   ctx.cfg109.ip                 = ctx.emu109->local_address();
   ctx.cfg109.user               = "user";
   ctx.cfg109.password           = "test";
   ctx.cfg109.snapshot_url       = ctx.emu109->snapshot_url();
   ctx.cfg109.retry_interval_sec = 1;
+  if (!ctx.mac109.empty()) ctx.cfg109.mac = ctx.mac109;
 
   recorder.set_ubv_dir(ctx.ubv_dir);
   recorder.set_snapshot(ctx.cfg108);
@@ -1321,6 +1329,205 @@ static void test_onvif_bbox_crop(const std::string& ubv_dir) {
 }
 
 // ============================================================
+// AlarmNotifier: single person alarm fires exactly once on person detection
+// ============================================================
+static void test_alarm_notify_person() {
+  static const char kAlarms[] =
+    "[{\"id\":\"3a4b5c6d-7e8f-9012-a3b4-c5d6e7f80912\","
+    "\"title\":\"Person Alert\","
+    "\"triggers_data\":[[{\"id\":\"smartDetectType:person\","
+    "\"is_matched_externally\":true}]]}]";
+
+  UosEmulator uos;
+  uos.set_alarms_json(kAlarms);
+  uos.start();
+
+  onvif::AlarmNotifier notifier(uos.base_url());
+  notifier.refresh_alarms();
+  notifier.notify("person", "AABBCCDDEEFF", "event-uuid-abc", 1234567890000ULL);
+
+  const auto posted = uos.posted_events();
+  CHECK(posted.size() == 1,
+        "alarm_notify_person: expected 1 POST, got "
+        + std::to_string(posted.size()));
+
+  if (!posted.empty()) {
+    const std::string& body = posted[0];
+    CHECK(body.find("smartDetectType:person") != std::string::npos,
+          "alarm_notify_person: POST body missing event key");
+    CHECK(body.find("3a4b5c6d-7e8f-9012-a3b4-c5d6e7f80912") != std::string::npos,
+          "alarm_notify_person: POST body missing alarm ID");
+    CHECK(body.find("AABBCCDDEEFF") != std::string::npos,
+          "alarm_notify_person: POST body missing camera MAC in scope");
+  }
+}
+
+// ============================================================
+// AlarmNotifier: type filtering — person alarm ignores vehicle events;
+// vehicle alarm ignores person events
+// ============================================================
+static void test_alarm_type_filtering() {
+  static const char kAlarms[] =
+    "[{\"id\":\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\","
+    "\"triggers_data\":[[{\"id\":\"smartDetectType:person\"}]]},"
+    "{\"id\":\"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\","
+    "\"triggers_data\":[[{\"id\":\"smartDetectType:vehicle\"}]]}]";
+
+  UosEmulator uos;
+  uos.set_alarms_json(kAlarms);
+  uos.start();
+
+  onvif::AlarmNotifier notifier(uos.base_url());
+  notifier.refresh_alarms();
+
+  // Person detection → only person alarm fires.
+  notifier.notify("person", "112233445566", "evt-p", 1000ULL);
+  {
+    const auto p = uos.posted_events();
+    CHECK(p.size() == 1,
+          "alarm_type_filtering: person: expected 1 POST, got "
+          + std::to_string(p.size()));
+    if (!p.empty()) {
+      CHECK(p[0].find("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") != std::string::npos,
+            "alarm_type_filtering: person POST must reference person alarm");
+      CHECK(p[0].find("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb") == std::string::npos,
+            "alarm_type_filtering: person POST must not reference vehicle alarm");
+    }
+  }
+
+  // Vehicle detection → only vehicle alarm fires.
+  notifier.notify("vehicle", "112233445566", "evt-v", 2000ULL);
+  {
+    const auto p = uos.posted_events();
+    CHECK(p.size() == 2,
+          "alarm_type_filtering: vehicle: expected 2 total POSTs, got "
+          + std::to_string(p.size()));
+    if (p.size() == 2) {
+      CHECK(p[1].find("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb") != std::string::npos,
+            "alarm_type_filtering: vehicle POST must reference vehicle alarm");
+      CHECK(p[1].find("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") == std::string::npos,
+            "alarm_type_filtering: vehicle POST must not reference person alarm");
+    }
+  }
+}
+
+// ============================================================
+// AlarmNotifier: empty alarm list → zero POSTs
+// ============================================================
+static void test_alarm_no_alarms() {
+  UosEmulator uos;
+  uos.set_alarms_json("[]");
+  uos.start();
+
+  onvif::AlarmNotifier notifier(uos.base_url());
+  notifier.refresh_alarms();
+  notifier.notify("person", "AABBCCDDEEFF", "evt-x", 999ULL);
+
+  const auto posted = uos.posted_events();
+  CHECK(posted.empty(),
+        "alarm_no_alarms: expected 0 POSTs, got " + std::to_string(posted.size()));
+}
+
+// ============================================================
+// AlarmNotifier: UOS unreachable → no crash, no POSTs
+// ============================================================
+static void test_alarm_uos_unreachable() {
+  // Port 1 is never open for regular users; curl returns ECONNREFUSED immediately.
+  onvif::AlarmNotifier notifier("http://127.0.0.1:1");
+  notifier.refresh_alarms();  // must not crash
+  notifier.notify("person", "AABBCCDDEEFF", "evt-y", 500ULL);  // must not crash
+  CHECK(true, "alarm_uos_unreachable: did not crash or hang");
+}
+
+// ============================================================
+// Alarm integration e2e:
+//   DetectionRecorder + AlarmNotifier + camera emulators + UosEmulator
+//
+// Standard 3-detection script (2 person + 1 vehicle) with two real cameras.
+// Verifies UOS receives exactly 3 POSTs matching the detection types and
+// that every POST includes the camera MAC in the scope.
+// ============================================================
+static void test_alarm_integration_e2e(const std::string& ubv_dir) {
+  static const char kAlarms[] =
+    "[{\"id\":\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\","
+    "\"triggers_data\":[[{\"id\":\"smartDetectType:person\"}]]},"
+    "{\"id\":\"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\","
+    "\"triggers_data\":[[{\"id\":\"smartDetectType:vehicle\"}]]}]";
+
+  UosEmulator uos;
+  uos.set_alarms_json(kAlarms);
+  uos.start();
+
+  onvif::AlarmNotifier notifier(uos.base_url());
+  notifier.refresh_alarms();
+
+  TestContext ctx;
+  ctx.ubv_dir = ubv_dir;
+  ctx.mac108  = "A1B2C3D4E5F6";
+  ctx.mac109  = "B2C3D4E5F6A7";
+
+  auto backend = std::make_unique<MockBackend>();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("alarm_integration_e2e: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_alarm_notifier(&notifier);
+
+  bool ok = run_standard_script(ctx, recorder);
+  CHECK(ok, "alarm_integration_e2e: timed out before all detection events arrived");
+  if (!ok) return;
+
+  // Standard script: cam108 emits Human+Vehicle (2 detections),
+  // cam109 emits Human (1 detection).
+  // With 1 person alarm + 1 vehicle alarm:
+  //   2 person detections × 1 alarm = 2 POSTs
+  //   1 vehicle detection × 1 alarm = 1 POST
+  //   Total: 3 POSTs
+  const auto posted = uos.posted_events();
+  CHECK(posted.size() == 3,
+        "alarm_integration_e2e: expected 3 UOS POSTs (2 person + 1 vehicle), got "
+        + std::to_string(posted.size()));
+
+  int person_posts = 0, vehicle_posts = 0;
+  for (const auto& body : posted) {
+    if (body.find("smartDetectType:person")  != std::string::npos) ++person_posts;
+    if (body.find("smartDetectType:vehicle") != std::string::npos) ++vehicle_posts;
+  }
+  CHECK(person_posts == 2,
+        "alarm_integration_e2e: expected 2 person POSTs, got "
+        + std::to_string(person_posts));
+  CHECK(vehicle_posts == 1,
+        "alarm_integration_e2e: expected 1 vehicle POST, got "
+        + std::to_string(vehicle_posts));
+
+  // Each POST must carry the triggering camera's MAC in the scope.
+  int with_mac = 0;
+  for (const auto& body : posted) {
+    if (body.find(ctx.mac108) != std::string::npos ||
+        body.find(ctx.mac109) != std::string::npos)
+      ++with_mac;
+  }
+  CHECK(with_mac == static_cast<int>(posted.size()),
+        "alarm_integration_e2e: expected all POSTs to include a camera MAC, only "
+        + std::to_string(with_mac) + " did");
+
+  // Alarm IDs must match their trigger types.
+  for (const auto& body : posted) {
+    if (body.find("smartDetectType:person") != std::string::npos) {
+      CHECK(body.find("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") != std::string::npos,
+            "alarm_integration_e2e: person POST missing person alarm ID");
+    }
+    if (body.find("smartDetectType:vehicle") != std::string::npos) {
+      CHECK(body.find("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb") != std::string::npos,
+            "alarm_integration_e2e: vehicle POST missing vehicle alarm ID");
+    }
+  }
+}
+
+// ============================================================
 // main
 // ============================================================
 int main() {
@@ -1342,6 +1549,12 @@ int main() {
            [&] { test_thumbnail_crop_dimensions(ubv_dir); });
   run_test("onvif_bbox_crop",
            [&] { test_onvif_bbox_crop(ubv_dir); });
+  run_test("alarm_notify_person",        [] { test_alarm_notify_person(); });
+  run_test("alarm_type_filtering",       [] { test_alarm_type_filtering(); });
+  run_test("alarm_no_alarms",            [] { test_alarm_no_alarms(); });
+  run_test("alarm_uos_unreachable",      [] { test_alarm_uos_unreachable(); });
+  run_test("alarm_integration_e2e",
+           [&] { test_alarm_integration_e2e(ubv_dir); });
 
   onvif::global_cleanup();
 

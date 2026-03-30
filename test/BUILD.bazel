@@ -161,8 +161,10 @@ cc_test(
     ],
     linkstatic = True,
     deps = [
+        "//:alarm_notifier",
         "//:detection_recorder",
         "//:ubv_thumbnail",
+        ":camera_emulators",
         ":onvif_camera_emulator",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",

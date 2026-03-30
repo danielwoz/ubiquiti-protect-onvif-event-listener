@@ -198,4 +198,61 @@ absl::Status enable_smart_detect(
   return absl::OkStatus();
 }
 
+// ---------------------------------------------------------------------------
+
+absl::Status ensure_smart_detect_zones(
+    const std::vector<onvif::CameraConfig>& cameras,
+    const DbConfig& db) {
+  if (cameras.empty()) return absl::OkStatus();
+
+  std::string connstr =
+    "host="    + db.host   +
+    " port="   + std::to_string(db.port) +
+    " dbname=" + db.dbname +
+    " user="   + db.user;
+  if (!db.password.empty())
+    connstr += " password=" + db.password;
+
+  PGconn* conn = PQconnectdb(connstr.c_str());
+  if (PQstatus(conn) != CONNECTION_OK) {
+    std::string err = PQerrorMessage(conn);
+    PQfinish(conn);
+    return absl::InternalError("unifi::ensure_smart_detect_zones: " + err);
+  }
+
+  // A single full-frame Default zone covering person + vehicle.  Matches the
+  // format written by Protect for native smart cameras so the UI treats it
+  // identically (scope_all_smart_cameras_with_zones filter requires length > 0).
+  static const char kDefaultZone[] =
+    "[{\"id\":1,\"name\":\"Default\",\"color\":\"#AB46BC\","
+    "\"points\":[[0,0],[1,0],[1,1],[0,1]],\"sensitivity\":50,"
+    "\"objectTypes\":[\"person\",\"vehicle\"],"
+    "\"isTriggerLightEnabled\":false,\"source\":\"unifi-protect\","
+    "\"triggerAccessTypes\":[],\"enableAccessLPOnlyMode\":false,"
+    "\"mergeId\":\"Default-1\"}]";
+
+  // Update all adopted ONVIF cameras that currently have an empty zone list.
+  const char* sql =
+    "UPDATE cameras "
+    "SET \"smartDetectZones\" = $1::json, "
+    "    \"updatedAt\" = NOW() "
+    "WHERE \"isThirdPartyCamera\" = true "
+    "  AND (\"smartDetectZones\" IS NULL "
+    "       OR \"smartDetectZones\"::jsonb = '[]'::jsonb)";
+
+  const char* params[1] = { kDefaultZone };
+  PGresult* res = PQexecParams(conn, sql, 1, nullptr, params,
+                               nullptr, nullptr, 0);
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    PQfinish(conn);
+    return absl::InternalError(
+        "unifi::ensure_smart_detect_zones update: " + err);
+  }
+  PQclear(res);
+  PQfinish(conn);
+  return absl::OkStatus();
+}
+
 }  // namespace unifi

@@ -54,4 +54,18 @@ absl::Status enable_smart_detect(
     const std::vector<onvif::CameraConfig>& cameras,
     const DbConfig& db = {});
 
+/// Ensure every third-party (ONVIF) camera has at least one smart-detect zone
+/// in the Protect database.  Cameras with an empty `smartDetectZones` array are
+/// updated with a single full-frame Default zone covering person and vehicle
+/// object types.
+///
+/// This makes ONVIF cameras appear in the `/protect/alarms/new` trigger
+/// dropdowns, which filter on `smartDetectZones.length > 0`.
+///
+/// Idempotent — cameras that already have zones are not modified.
+/// Returns error Status on connection or query failure.
+absl::Status ensure_smart_detect_zones(
+    const std::vector<onvif::CameraConfig>& cameras,
+    const DbConfig& db = {});
+
 }  // namespace unifi

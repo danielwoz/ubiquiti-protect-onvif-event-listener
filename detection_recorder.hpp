@@ -29,6 +29,8 @@
 
 namespace onvif {
 
+class AlarmNotifier;  // forward declaration; full definition in alarm_notifier.hpp
+
 /**
  * DetectionRecorder
  *
@@ -157,6 +159,12 @@ class DetectionRecorder {
   /// The detector must outlive the DetectionRecorder.
   void set_detector(const object_detect::ObjectDetector* detector);
 
+  /// Set the alarm notifier used to trigger UniFi Protect security alarms on
+  /// detection events.  If not called (or set to nullptr), alarms are not
+  /// notified.  The notifier must outlive the DetectionRecorder.
+  /// Must be called before run().
+  void set_alarm_notifier(AlarmNotifier* notifier);
+
   /// When override is true the detector is always run, ignoring any ONVIF
   /// bounding box provided by the camera. Has no effect if no detector is set.
   void set_detect_override(bool override);
@@ -259,6 +267,10 @@ class DetectionRecorder {
   // Written before run(); read-only after that.
   std::map<std::string, std::string> camera_ids_;
 
+  // Camera IP -> MAC address (uppercase, no colons).
+  // Written before run(); read-only after that.
+  std::map<std::string, std::string> camera_macs_;
+
   // Directory for per-camera UBV thumbnail files; empty = disabled.
   std::string ubv_dir_;
 
@@ -282,6 +294,9 @@ class DetectionRecorder {
 
   // When true the detector is preferred over ONVIF-provided bounding boxes.
   bool detect_override_{false};
+
+  // Optional alarm notifier. Set before run(); non-owning raw pointer.
+  AlarmNotifier* alarm_notifier_{nullptr};
 };
 
 }  // namespace onvif

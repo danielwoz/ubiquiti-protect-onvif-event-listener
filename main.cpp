@@ -42,6 +42,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "alarm_notifier.hpp"
 #include "detection_recorder.hpp"
 #include "object_detect.hpp"
 #include "onvif_listener.hpp"
@@ -82,6 +83,9 @@ ABSL_FLAG(std::string, raw_log, "",
     "Path for the raw SOAP exchange JSON Lines log file. "
     "Each line is one full HTTP request/response pair (large). "
     "Empty (default) disables this log.");
+ABSL_FLAG(std::string, uos_url, "http://localhost:11010",
+    "Base URL for the UOS external automation manager used to trigger "
+    "UniFi Protect security alarms on person/vehicle detections.");
 
 // ============================================================
 // JSON helpers (used only by EventRecorder)
@@ -299,6 +303,17 @@ int main(int argc, char* argv[]) {
     onvif::global_cleanup();
     return 1;
   }
+
+  if (auto s = unifi::ensure_smart_detect_zones(cameras, cam_db); !s.ok()) {
+    LOG(ERROR) << "Fatal: " << s.message();
+    onvif::global_cleanup();
+    return 1;
+  }
+
+  // AlarmNotifier: triggers UniFi Protect security alarms for ONVIF cameras.
+  onvif::AlarmNotifier alarm_notifier(absl::GetFlag(FLAGS_uos_url));
+  alarm_notifier.refresh_alarms();
+  det_rec.set_alarm_notifier(&alarm_notifier);
 
   for (auto cam : cameras) {
     cam.max_consecutive_failures = 3;
