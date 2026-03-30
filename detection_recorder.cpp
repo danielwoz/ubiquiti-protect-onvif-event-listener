@@ -55,7 +55,8 @@ struct Detection {
   std::string time;    // ISO-8601 UTC event_time from the OnvifEvent
 };
 
-std::optional<Detection> classify(const OnvifEvent& ev) {
+std::optional<Detection> classify(const OnvifEvent& ev,
+                                   const std::string& fallback_type) {
   // --- Camera 108 style: FieldDetector ObjectsInside ---
   if (ev.topic == "tns1:RuleEngine/FieldDetector/ObjectsInside") {
     auto rule_it   = ev.source.find("Rule");
@@ -100,11 +101,11 @@ std::optional<Detection> classify(const OnvifEvent& ev) {
   }
 
   // --- Generic CellMotionDetector/Motion (Amcrest, Lorex, Dahua, etc.) ---
-  // Basic pixel-change motion; no object class available so treated as person.
+  // Basic pixel-change motion; no object class available so use fallback_type.
   if (ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion") {
     auto it = ev.data.find("IsMotion");
     if (it == ev.data.end()) return {};
-    return Detection{"human", it->second == "true", ev.event_time};
+    return Detection{fallback_type, it->second == "true", ev.event_time};
   }
 
   // --- VideoSource/MotionAlarm fallback ---
@@ -114,7 +115,7 @@ std::optional<Detection> classify(const OnvifEvent& ev) {
   if (ev.topic == "tns1:VideoSource/MotionAlarm") {
     auto it = ev.data.find("State");
     if (it == ev.data.end()) return {};
-    return Detection{"human", it->second == "true", ev.event_time};
+    return Detection{fallback_type, it->second == "true", ev.event_time};
   }
 
   return {};
@@ -192,12 +193,16 @@ static std::string generate_24hex_id() {
 // Map our internal detection type to the Ubiquiti smartDetect object type.
 static const char* sdo_type(const std::string& det_type) {
   if (det_type == "vehicle") return "vehicle";
+  if (det_type == "animal")  return "animal";
+  if (det_type == "package") return "package";
   return "person";  // "human" -> "person"
 }
 
 // Build the smartDetectTypes JSON array from our detection type.
 static std::string smart_detect_types_json(const std::string& det_type) {
   if (det_type == "vehicle") return "[\"vehicle\"]";
+  if (det_type == "animal")  return "[\"animal\"]";
+  if (det_type == "package") return "[\"package\"]";
   return "[\"person\"]";
 }
 
@@ -697,6 +702,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
   // that emit CellMotionDetector/Motion during every pan.
   // MotionAlarm fires alongside CellMotionDetector on virtually all cameras;
   // it is only used as a fallback for cameras that have neither.
+  std::string default_obj_type, cam_override_type;
   {
     std::lock_guard<std::mutex> lk(mu_);
     if ((ev.topic == "tns1:RuleEngine/FieldDetector/ObjectsInside" ||
@@ -715,10 +721,16 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       if (ai_capable_cameras_.count(ev.camera_ip) ||
           cell_motion_cameras_.count(ev.camera_ip)) return;
     }
+    default_obj_type = default_object_type_;
+    auto it = camera_object_types_.find(ev.camera_ip);
+    if (it != camera_object_types_.end())
+      cam_override_type = it->second;
   }
 
-  auto det = classify(ev);
+  auto det = classify(ev, default_obj_type);
   if (!det) return;
+  if (!cam_override_type.empty())
+    det->type = cam_override_type;
 
   auto key = std::make_pair(ev.camera_ip, det->type);
 
@@ -850,6 +862,17 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     db_->update_event_end(it->second, end_ms, now_str);
     open_.erase(it);
   }
+}
+
+void DetectionRecorder::set_default_object_type(const std::string& type) {
+  std::lock_guard<std::mutex> lk(mu_);
+  default_object_type_ = type;
+}
+
+void DetectionRecorder::set_camera_object_type(const std::string& ip,
+                                                const std::string& type) {
+  std::lock_guard<std::mutex> lk(mu_);
+  camera_object_types_[ip] = type;
 }
 
 }  // namespace onvif

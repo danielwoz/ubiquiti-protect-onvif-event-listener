@@ -1,8 +1,10 @@
 # ONVIF Event Recorder
 
 Bridges **third-party ONVIF cameras** into UniFi Protect. It listens to ONVIF
-WS-PullPoint event streams and writes human/vehicle detection intervals to the
-UniFi Protect PostgreSQL database so they appear natively in the Protect UI.
+WS-PullPoint event streams and writes detection events (person, vehicle, animal,
+package) to the UniFi Protect PostgreSQL database so they appear natively in the
+Protect UI — including timeline clips, thumbnails, smart detection search, and
+security alarms.
 
 > **Note:** This software is only needed for third-party cameras adopted into
 > UniFi Protect via the ONVIF integration. Native UniFi cameras have built-in
@@ -58,6 +60,65 @@ ExecStart=/root/onvif_recorder --verbose --raw_log=/var/log/onvif-raw.jsonl
 ```bash
 systemctl daemon-reload && systemctl restart onvif-recorder
 ```
+
+### Detection object types
+
+The recorder maps ONVIF camera events to four UniFi Protect smart-detection types:
+
+| Type | How it is produced |
+|------|--------------------|
+| `person` | FieldDetector "Human", HumanShapeDetect, Reolink PeopleDetect, or any generic motion event when `--default_object_type=person` (the factory default) |
+| `vehicle` | FieldDetector "Vehicle", VehicleDetect, Reolink VehicleDetect, or generic motion when `--default_object_type=vehicle` |
+| `animal` | Generic motion when `--default_object_type=animal`, or any camera whose events are overridden via `--camera_object_types` |
+| `package` | Generic motion when `--default_object_type=package`, or any camera whose events are overridden via `--camera_object_types` |
+
+**Generic motion events** (CellMotionDetector, VideoSource/MotionAlarm) carry no object class — the recorder uses `--default_object_type` for these. AI-specific events (Human/Vehicle detections) are never affected by `--default_object_type`.
+
+**Per-camera overrides** (`--camera_object_types`) replace the detection type for every event from the named camera, including AI events. This is useful for wildlife cameras or entrance monitors where you always want a specific type regardless of what the camera reports.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--default_object_type` | `person` | Object type written for generic motion events (CellMotionDetector, VideoSource/MotionAlarm) that carry no object class. Valid values: `person`, `vehicle`, `animal`, `package`. |
+| `--camera_object_types` | _(disabled)_ | Comma-separated `ip=type` overrides applied to all events from each named camera, e.g. `192.168.1.108=animal,192.168.1.109=package`. Takes precedence over both the ONVIF-reported type and `--default_object_type`. |
+
+**Example — wildlife camera on `.108` and package camera on `.109`:**
+```bash
+ExecStart=/root/onvif_recorder \
+  --default_object_type=person \
+  --camera_object_types=192.168.1.108=animal,192.168.1.109=package
+```
+
+---
+
+### Security alarms
+
+The recorder integrates with the UniFi Protect alarm system so that ONVIF
+camera detections can trigger security alarms you configure in
+**Protect → Alarms → New alarm**.
+
+**How it works:**
+
+1. At startup the recorder ensures every third-party camera has a non-empty
+   `smartDetectZones` list so it appears in the alarm scope picker.
+2. The recorder refreshes the list of configured alarms from the UOS automation
+   manager every five minutes.
+3. When a detection event is recorded, the recorder posts it to the UOS
+   automation manager for every alarm whose trigger matches the detected type
+   (`person`, `vehicle`, `animal`, or `package`).
+
+**Setup:**
+
+1. In Protect, create a new alarm under **Protect → Alarms → New alarm**.
+2. Set the scope to **All smart cameras with detection zones** and choose the
+   trigger types you want (person, vehicle, animal, and/or package).
+3. Your ONVIF cameras will now appear in the scope list and fire the alarm on
+   matching detections.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--uos_url` | `http://localhost:11010` | Base URL for the UOS external automation manager. Only change this if you are running the recorder off-device (e.g. during development). |
+
+---
 
 ### Database
 

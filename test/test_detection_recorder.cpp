@@ -1528,6 +1528,337 @@ static void test_alarm_integration_e2e(const std::string& ubv_dir) {
 }
 
 // ============================================================
+// Default object type: CellMotion with animal override → animal SDO
+// ============================================================
+static void test_default_object_type_animal(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_ubv_dir(ubv_dir);
+  recorder.set_default_object_type("animal");
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+  SnapshotSyntheticEmulator emu("192.168.1.220",
+    {make_cell_motion_response(true,  "2026-03-30T10:00:00Z"),
+     make_cell_motion_response(false, "2026-03-30T10:00:05Z")},
+    jpeg);
+  emu.start();
+
+  bool ok = run_single_camera(emu, recorder, 2);
+  CHECK(ok, "default_object_type_animal: timed out");
+
+  int events = static_cast<int>(bptr->events.size());
+  CHECK(events == 1,
+        "default_object_type_animal: expected 1 event, got "
+        + std::to_string(events));
+
+  int animal_sdo = 0;
+  for (auto& s : bptr->sdos) if (s.obj_type == "animal") ++animal_sdo;
+  CHECK(animal_sdo == 1,
+        "default_object_type_animal: expected 1 animal SDO, got "
+        + std::to_string(animal_sdo));
+
+  if (!bptr->events.empty()) {
+    CHECK(bptr->events[0].sdt_json == "[\"animal\"]",
+          "default_object_type_animal: expected sdt_json=[\"animal\"], got "
+          + bptr->events[0].sdt_json);
+  }
+
+  bool has_animal_label = false;
+  for (const auto& kv : bptr->labels)
+    if (kv.first == "smartDetectType:animal") has_animal_label = true;
+  CHECK(has_animal_label, "default_object_type_animal: missing animal label");
+}
+
+// ============================================================
+// Per-camera override: FieldDetector/Human overridden to package
+// ============================================================
+static void test_camera_object_type_override(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_ubv_dir(ubv_dir);
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+  SnapshotSyntheticEmulator emu("192.168.1.221",
+    {make_field_detector_response("Human", true,  "2026-03-30T11:00:00Z"),
+     make_field_detector_response("Human", false, "2026-03-30T11:00:05Z")},
+    jpeg);
+  emu.start();
+
+  // Override BEFORE run_single_camera; IP is known from local_address().
+  recorder.set_camera_object_type(emu.local_address(), "package");
+
+  bool ok = run_single_camera(emu, recorder, 2);
+  CHECK(ok, "camera_object_type_override: timed out");
+
+  int events = static_cast<int>(bptr->events.size());
+  CHECK(events == 1,
+        "camera_object_type_override: expected 1 event, got "
+        + std::to_string(events));
+
+  int package_sdo = 0, person_sdo = 0;
+  for (auto& s : bptr->sdos) {
+    if (s.obj_type == "package") ++package_sdo;
+    if (s.obj_type == "person")  ++person_sdo;
+  }
+  CHECK(package_sdo == 1,
+        "camera_object_type_override: expected 1 package SDO, got "
+        + std::to_string(package_sdo));
+  CHECK(person_sdo == 0,
+        "camera_object_type_override: expected 0 person SDOs, got "
+        + std::to_string(person_sdo));
+
+  if (!bptr->events.empty()) {
+    CHECK(bptr->events[0].sdt_json == "[\"package\"]",
+          "camera_object_type_override: expected sdt_json=[\"package\"], got "
+          + bptr->events[0].sdt_json);
+  }
+}
+
+// ============================================================
+// AlarmNotifier: animal detection fires alarm with animal trigger
+// ============================================================
+static void test_alarm_notify_animal() {
+  static const char kAlarms[] =
+    "[{\"id\":\"cccccccc-cccc-cccc-cccc-cccccccccccc\","
+    "\"title\":\"Animal Alert\","
+    "\"triggers_data\":[[{\"id\":\"smartDetectType:animal\","
+    "\"is_matched_externally\":true}]]}"
+    ",{\"id\":\"dddddddd-dddd-dddd-dddd-dddddddddddd\","
+    "\"title\":\"Package Alert\","
+    "\"triggers_data\":[[{\"id\":\"smartDetectType:package\"}]]}]";
+
+  UosEmulator uos;
+  uos.set_alarms_json(kAlarms);
+  uos.start();
+
+  onvif::AlarmNotifier notifier(uos.base_url());
+  notifier.refresh_alarms();
+
+  // Animal detection → only animal alarm fires.
+  notifier.notify("animal", "AABBCCDDEEFF", "evt-animal", 1000ULL);
+  {
+    const auto p = uos.posted_events();
+    CHECK(p.size() == 1,
+          "alarm_notify_animal: expected 1 POST for animal, got "
+          + std::to_string(p.size()));
+    if (!p.empty()) {
+      CHECK(p[0].find("smartDetectType:animal") != std::string::npos,
+            "alarm_notify_animal: POST missing animal event key");
+      CHECK(p[0].find("cccccccc-cccc-cccc-cccc-cccccccccccc") != std::string::npos,
+            "alarm_notify_animal: POST missing animal alarm ID");
+      CHECK(p[0].find("dddddddd-dddd-dddd-dddd-dddddddddddd") == std::string::npos,
+            "alarm_notify_animal: POST must not reference package alarm");
+    }
+  }
+
+  // Package detection → only package alarm fires.
+  notifier.notify("package", "AABBCCDDEEFF", "evt-package", 2000ULL);
+  {
+    const auto p = uos.posted_events();
+    CHECK(p.size() == 2,
+          "alarm_notify_animal: expected 2 total POSTs after package, got "
+          + std::to_string(p.size()));
+    if (p.size() == 2) {
+      CHECK(p[1].find("smartDetectType:package") != std::string::npos,
+            "alarm_notify_animal: package POST missing event key");
+      CHECK(p[1].find("dddddddd-dddd-dddd-dddd-dddddddddddd") != std::string::npos,
+            "alarm_notify_animal: package POST missing package alarm ID");
+      CHECK(p[1].find("cccccccc-cccc-cccc-cccc-cccccccccccc") == std::string::npos,
+            "alarm_notify_animal: package POST must not reference animal alarm");
+    }
+  }
+}
+
+// ============================================================
+// default_object_type via VideoSource/MotionAlarm → vehicle
+// Confirms the fallback_type path in classify() for MotionAlarm
+// (different code path from the CellMotion test above).
+// ============================================================
+static void test_default_object_type_vehicle(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_ubv_dir(ubv_dir);
+  recorder.set_default_object_type("vehicle");
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+  SnapshotSyntheticEmulator emu("192.168.1.222",
+    {make_motion_alarm_response(true,  "2026-03-30T13:00:00Z"),
+     make_motion_alarm_response(false, "2026-03-30T13:00:05Z")},
+    jpeg);
+  emu.start();
+
+  bool ok = run_single_camera(emu, recorder, 2);
+  CHECK(ok, "default_object_type_vehicle: timed out");
+
+  CHECK(static_cast<int>(bptr->events.size()) == 1,
+        "default_object_type_vehicle: expected 1 event, got "
+        + std::to_string(bptr->events.size()));
+  if (!bptr->events.empty()) {
+    CHECK(bptr->events[0].sdt_json == "[\"vehicle\"]",
+          "default_object_type_vehicle: expected sdt_json=[\"vehicle\"], got "
+          + bptr->events[0].sdt_json);
+  }
+
+  int vehicle_sdo = 0;
+  for (auto& s : bptr->sdos) if (s.obj_type == "vehicle") ++vehicle_sdo;
+  CHECK(vehicle_sdo == 1,
+        "default_object_type_vehicle: expected 1 vehicle SDO, got "
+        + std::to_string(vehicle_sdo));
+
+  bool has_label = false;
+  for (const auto& kv : bptr->labels)
+    if (kv.first == "smartDetectType:vehicle") has_label = true;
+  CHECK(has_label, "default_object_type_vehicle: missing vehicle label");
+}
+
+// ============================================================
+// default_object_type does NOT override AI-reported types.
+// FieldDetector/Vehicle must still produce "vehicle" even when
+// default_object_type = "animal".
+// ============================================================
+static void test_default_object_type_no_effect_on_ai(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_ubv_dir(ubv_dir);
+  recorder.set_default_object_type("animal");  // must NOT affect AI events
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+  SnapshotSyntheticEmulator emu("192.168.1.223",
+    {make_field_detector_response("Vehicle", true,  "2026-03-30T14:00:00Z"),
+     make_field_detector_response("Vehicle", false, "2026-03-30T14:00:05Z")},
+    jpeg);
+  emu.start();
+
+  bool ok = run_single_camera(emu, recorder, 2);
+  CHECK(ok, "default_object_type_no_effect_on_ai: timed out");
+
+  CHECK(static_cast<int>(bptr->events.size()) == 1,
+        "default_object_type_no_effect_on_ai: expected 1 event, got "
+        + std::to_string(bptr->events.size()));
+  if (!bptr->events.empty()) {
+    CHECK(bptr->events[0].sdt_json == "[\"vehicle\"]",
+          "default_object_type_no_effect_on_ai: AI vehicle must remain vehicle, got "
+          + bptr->events[0].sdt_json);
+  }
+
+  int animal_sdo = 0, vehicle_sdo = 0;
+  for (auto& s : bptr->sdos) {
+    if (s.obj_type == "animal")  ++animal_sdo;
+    if (s.obj_type == "vehicle") ++vehicle_sdo;
+  }
+  CHECK(animal_sdo == 0,
+        "default_object_type_no_effect_on_ai: AI vehicle must not become animal");
+  CHECK(vehicle_sdo == 1,
+        "default_object_type_no_effect_on_ai: expected 1 vehicle SDO, got "
+        + std::to_string(vehicle_sdo));
+}
+
+// ============================================================
+// Multiple per-camera overrides: each camera gets its own type.
+// Exercises the comma-separated ip=type parsing behaviour of
+// --camera_object_types by wiring two cameras with different overrides
+// to the same recorder while default_object_type stays "person".
+// ============================================================
+static void test_camera_object_types_multi(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_ubv_dir(ubv_dir);
+  // default stays "person" — per-camera overrides must win
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+
+  // Camera A: CellMotion, overridden to "animal"
+  SnapshotSyntheticEmulator emu_a("192.168.1.230",
+    {make_cell_motion_response(true,  "2026-03-30T15:00:00Z"),
+     make_cell_motion_response(false, "2026-03-30T15:00:05Z")},
+    jpeg);
+  emu_a.start();
+  recorder.set_camera_object_type(emu_a.local_address(), "animal");
+
+  // Camera B: CellMotion, overridden to "package"
+  SnapshotSyntheticEmulator emu_b("192.168.1.231",
+    {make_cell_motion_response(true,  "2026-03-30T15:01:00Z"),
+     make_cell_motion_response(false, "2026-03-30T15:01:05Z")},
+    jpeg);
+  emu_b.start();
+  recorder.set_camera_object_type(emu_b.local_address(), "package");
+
+  bool ok_a = run_single_camera(emu_a, recorder, 2);
+  bool ok_b = run_single_camera(emu_b, recorder, 2);
+  CHECK(ok_a, "camera_object_types_multi: camera_a timed out");
+  CHECK(ok_b, "camera_object_types_multi: camera_b timed out");
+
+  int animal_sdo = 0, package_sdo = 0, person_sdo = 0;
+  for (auto& s : bptr->sdos) {
+    if (s.obj_type == "animal")  ++animal_sdo;
+    if (s.obj_type == "package") ++package_sdo;
+    if (s.obj_type == "person")  ++person_sdo;
+  }
+  CHECK(animal_sdo == 1,
+        "camera_object_types_multi: expected 1 animal SDO from camera_a, got "
+        + std::to_string(animal_sdo));
+  CHECK(package_sdo == 1,
+        "camera_object_types_multi: expected 1 package SDO from camera_b, got "
+        + std::to_string(package_sdo));
+  CHECK(person_sdo == 0,
+        "camera_object_types_multi: default_object_type must not override per-camera "
+        "setting; expected 0 person SDOs, got " + std::to_string(person_sdo));
+
+  // Verify events also carry the right sdt_json
+  int animal_ev = 0, package_ev = 0;
+  for (auto& e : bptr->events) {
+    if (e.sdt_json == "[\"animal\"]")  ++animal_ev;
+    if (e.sdt_json == "[\"package\"]") ++package_ev;
+  }
+  CHECK(animal_ev == 1,
+        "camera_object_types_multi: expected 1 animal event, got "
+        + std::to_string(animal_ev));
+  CHECK(package_ev == 1,
+        "camera_object_types_multi: expected 1 package event, got "
+        + std::to_string(package_ev));
+}
+
+// ============================================================
 // main
 // ============================================================
 int main() {
@@ -1555,6 +1886,17 @@ int main() {
   run_test("alarm_uos_unreachable",      [] { test_alarm_uos_unreachable(); });
   run_test("alarm_integration_e2e",
            [&] { test_alarm_integration_e2e(ubv_dir); });
+  run_test("default_object_type_animal",
+           [&] { test_default_object_type_animal(ubv_dir); });
+  run_test("default_object_type_vehicle",
+           [&] { test_default_object_type_vehicle(ubv_dir); });
+  run_test("default_object_type_no_effect_on_ai",
+           [&] { test_default_object_type_no_effect_on_ai(ubv_dir); });
+  run_test("camera_object_type_override",
+           [&] { test_camera_object_type_override(ubv_dir); });
+  run_test("camera_object_types_multi",
+           [&] { test_camera_object_types_multi(ubv_dir); });
+  run_test("alarm_notify_animal",        [] { test_alarm_notify_animal(); });
 
   onvif::global_cleanup();
 

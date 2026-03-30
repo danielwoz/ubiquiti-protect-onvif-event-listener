@@ -95,8 +95,10 @@ std::vector<AlarmNotifier::AlarmEntry> AlarmNotifier::parse_alarms(
         AlarmEntry entry;
         entry.id = extract_uuid_id(alarm);
         if (entry.id.size() == 36) {
-          entry.has_person  = alarm.find("smartDetectType:person")  != std::string::npos;
-          entry.has_vehicle = alarm.find("smartDetectType:vehicle") != std::string::npos;
+          for (const char* t : {"person", "vehicle", "animal", "package"}) {
+            if (alarm.find(std::string("smartDetectType:") + t) != std::string::npos)
+              entry.trigger_types.insert(t);
+          }
           result.push_back(std::move(entry));
         }
         start = std::string::npos;
@@ -228,9 +230,7 @@ void AlarmNotifier::notify(const std::string& obj_type,
   }
 
   for (const auto& alarm : alarms_copy) {
-    const bool matches = (obj_type == "person"  && alarm.has_person) ||
-                         (obj_type == "vehicle" && alarm.has_vehicle);
-    if (!matches) continue;
+    if (!alarm.trigger_types.count(obj_type)) continue;
 
     char ts_buf[24];
     std::snprintf(ts_buf, sizeof(ts_buf), "%" PRIu64, ts_ms);

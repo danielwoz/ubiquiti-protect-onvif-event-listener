@@ -85,7 +85,16 @@ ABSL_FLAG(std::string, raw_log, "",
     "Empty (default) disables this log.");
 ABSL_FLAG(std::string, uos_url, "http://localhost:11010",
     "Base URL for the UOS external automation manager used to trigger "
-    "UniFi Protect security alarms on person/vehicle detections.");
+    "UniFi Protect security alarms on detections.");
+ABSL_FLAG(std::string, default_object_type, "person",
+    "Object type reported for generic motion events (CellMotionDetector, "
+    "VideoSource/MotionAlarm) when the camera does not identify a type. "
+    "Valid values: person, vehicle, animal, package.");
+ABSL_FLAG(std::string, camera_object_types, "",
+    "Per-camera object type overrides as comma-separated ip=type pairs, "
+    "e.g. '192.168.1.108=animal,192.168.1.109=package'. "
+    "Overrides the detection type for all events from that camera. "
+    "Valid types: person, vehicle, animal, package.");
 
 // ============================================================
 // JSON helpers (used only by EventRecorder)
@@ -252,6 +261,22 @@ int main(int argc, char* argv[]) {
   }
   onvif::DetectionRecorder& det_rec = **dr_or;
   det_rec.set_buffer(pre_buf_sec, post_buf_sec);
+
+  // Object type configuration.
+  det_rec.set_default_object_type(absl::GetFlag(FLAGS_default_object_type));
+  {
+    const std::string cam_types = absl::GetFlag(FLAGS_camera_object_types);
+    size_t pos = 0;
+    while (pos < cam_types.size()) {
+      size_t comma = cam_types.find(',', pos);
+      if (comma == std::string::npos) comma = cam_types.size();
+      const std::string pair = cam_types.substr(pos, comma - pos);
+      const size_t eq = pair.find('=');
+      if (eq != std::string::npos)
+        det_rec.set_camera_object_type(pair.substr(0, eq), pair.substr(eq + 1));
+      pos = comma + 1;
+    }
+  }
 
   // Optional: load NanoDet-M for thumbnail subject cropping.
   std::unique_ptr<object_detect::ObjectDetector> detector;

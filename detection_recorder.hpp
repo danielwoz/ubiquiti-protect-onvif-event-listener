@@ -68,8 +68,13 @@ class AlarmNotifier;  // forward declaration; full definition in alarm_notifier.
  *
  * Detection type mapping
  * ----------------------
- *   ONVIF "human"   -> smartDetectTypes ["person"], smartDetectObjects.type "person"
+ *   ONVIF "human"   -> smartDetectTypes ["person"],  smartDetectObjects.type "person"
  *   ONVIF "vehicle" -> smartDetectTypes ["vehicle"], smartDetectObjects.type "vehicle"
+ *
+ *   Generic motion events (CellMotionDetector, VideoSource/MotionAlarm) use the
+ *   configured default_object_type (default "person").  Per-camera overrides
+ *   (set_camera_object_type) replace the type for all events from that camera.
+ *   Valid object types: person, vehicle, animal, package.
  *
  * Backend selection
  * -----------------
@@ -164,6 +169,17 @@ class DetectionRecorder {
   /// notified.  The notifier must outlive the DetectionRecorder.
   /// Must be called before run().
   void set_alarm_notifier(AlarmNotifier* notifier);
+
+  /// Set the object type reported for generic motion events (CellMotionDetector,
+  /// VideoSource/MotionAlarm) where the camera does not specify a type.
+  /// Valid values: "person" (default), "vehicle", "animal", "package".
+  void set_default_object_type(const std::string& type);
+
+  /// Override the detection type for all events from a specific camera IP.
+  /// The per-camera type takes precedence over the ONVIF-reported type and
+  /// over the default_object_type.
+  /// Valid values: "person", "vehicle", "animal", "package".
+  void set_camera_object_type(const std::string& ip, const std::string& type);
 
   /// When override is true the detector is always run, ignoring any ONVIF
   /// bounding box provided by the camera. Has no effect if no detector is set.
@@ -297,6 +313,12 @@ class DetectionRecorder {
 
   // Optional alarm notifier. Set before run(); non-owning raw pointer.
   AlarmNotifier* alarm_notifier_{nullptr};
+
+  // Object type for generic motion events (CellMotionDetector, MotionAlarm).
+  std::string default_object_type_{"person"};
+
+  // Per-camera type overrides: all events from the keyed IP use this type.
+  std::map<std::string, std::string> camera_object_types_;
 };
 
 }  // namespace onvif

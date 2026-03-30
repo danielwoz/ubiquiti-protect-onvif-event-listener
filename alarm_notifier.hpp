@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -55,7 +56,7 @@ class AlarmNotifier {
   void refresh_alarms();
 
   /// Post a detection event to UOS for every alarm that has a matching trigger.
-  ///   obj_type   -- "person" or "vehicle"
+  ///   obj_type   -- "person", "vehicle", "animal", or "package"
   ///   camera_mac -- uppercase no-colon MAC, e.g. "FC5F49CA68D4"
   ///   event_id   -- UUID of the inserted events row
   ///   ts_ms      -- event start timestamp (ms since Unix epoch)
@@ -67,8 +68,7 @@ class AlarmNotifier {
  private:
   struct AlarmEntry {
     std::string id;
-    bool has_person{false};
-    bool has_vehicle{false};
+    std::set<std::string> trigger_types;  // "person", "vehicle", "animal", "package"
   };
 
   std::string uos_base_url_;

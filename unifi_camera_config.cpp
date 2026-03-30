@@ -165,12 +165,12 @@ absl::Status enable_smart_detect(
     "SET \"featureFlags\" = jsonb_set("
     "      \"featureFlags\"::jsonb,"
     "      '{smartDetectTypes}',"
-    "      '[\"person\",\"vehicle\"]'::jsonb"
+    "      '[\"person\",\"vehicle\",\"animal\",\"package\"]'::jsonb"
     "    )::json,"
     "    \"smartDetectSettings\" = jsonb_set("
     "      \"smartDetectSettings\"::jsonb,"
     "      '{objectTypes}',"
-    "      '[\"person\",\"vehicle\"]'::jsonb"
+    "      '[\"person\",\"vehicle\",\"animal\",\"package\"]'::jsonb"
     "    )::json,"
     "    \"updatedAt\" = NOW() "
     "WHERE id = $1 "
@@ -220,13 +220,13 @@ absl::Status ensure_smart_detect_zones(
     return absl::InternalError("unifi::ensure_smart_detect_zones: " + err);
   }
 
-  // A single full-frame Default zone covering person + vehicle.  Matches the
-  // format written by Protect for native smart cameras so the UI treats it
+  // A single full-frame Default zone covering all smart-detect types.  Matches
+  // the format written by Protect for native smart cameras so the UI treats it
   // identically (scope_all_smart_cameras_with_zones filter requires length > 0).
   static const char kDefaultZone[] =
     "[{\"id\":1,\"name\":\"Default\",\"color\":\"#AB46BC\","
     "\"points\":[[0,0],[1,0],[1,1],[0,1]],\"sensitivity\":50,"
-    "\"objectTypes\":[\"person\",\"vehicle\"],"
+    "\"objectTypes\":[\"person\",\"vehicle\",\"animal\",\"package\"],"
     "\"isTriggerLightEnabled\":false,\"source\":\"unifi-protect\","
     "\"triggerAccessTypes\":[],\"enableAccessLPOnlyMode\":false,"
     "\"mergeId\":\"Default-1\"}]";
