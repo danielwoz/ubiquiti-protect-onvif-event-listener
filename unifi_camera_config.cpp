@@ -122,12 +122,20 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     std::string username     = json_get(info, "username");
     std::string password     = json_get(info, "password");
     std::string snapshot_url = json_get(info, "snapshotUrl");
+    std::string port         = json_get(info, "port");
     if (username.empty() || password.empty()) continue;
+
+    // Build ip as "host" or "host:port" depending on whether the camera uses
+    // a non-standard ONVIF port.  Port 80 is the HTTP default and omitted so
+    // that camera_ip values in the events table stay backwards-compatible with
+    // existing rows written before port support was added.
+    std::string ip = host_c;
+    if (!port.empty() && port != "80" && port != "0")
+      ip += ":" + port;
 
     cameras.push_back({std::string(id_c),
                        mac_c ? std::string(mac_c) : std::string(),
-                       std::string(host_c),
-                       username, password, snapshot_url});
+                       ip, username, password, snapshot_url});
   }
 
   PQclear(res);

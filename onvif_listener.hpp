@@ -48,7 +48,7 @@ struct OnvifEvent {
 struct CameraConfig {
     std::string id;           ///< UUID from the cameras table (empty = not registered)
     std::string mac;          ///< MAC address, uppercase no colons e.g. "FC5F49CA68D4"
-    std::string ip;
+    std::string ip;           ///< Host or host:port, e.g. "192.168.1.108" or "192.168.1.108:8080"
     std::string user;
     std::string password;
     std::string snapshot_url;  ///< Optional HTTP URL used to capture a snapshot image

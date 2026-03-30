@@ -1859,6 +1859,58 @@ static void test_camera_object_types_multi(const std::string& ubv_dir) {
 }
 
 // ============================================================
+// Alternate ONVIF port: camera whose HTTP API is not on port 80.
+//
+// CameraConfig::ip is set to "127.0.0.1:<port>" (host:port format),
+// mirroring what load_cameras() now produces for cameras whose
+// thirdPartyCameraInfo.port is not "80".  Verifies that OnvifListener
+// correctly builds the event_service URL with the non-standard port and
+// that events flow through to DetectionRecorder as normal.
+// ============================================================
+static void test_alt_port_camera(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_ubv_dir(ubv_dir);
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+
+  // The emulator binds to a random ephemeral port (never port 80).
+  // local_address() returns "127.0.0.1:<port>", which is the host:port
+  // format used by OnvifListener for non-standard-port cameras.
+  SnapshotSyntheticEmulator emu("192.168.1.250",
+    {make_field_detector_response("Human", true,  "2026-03-30T16:00:00Z"),
+     make_field_detector_response("Human", false, "2026-03-30T16:00:05Z")},
+    jpeg);
+  emu.start();
+
+  // Confirm the emulator is not on port 80 (it never is — OS always assigns
+  // an ephemeral port well above 1024).
+  CHECK(emu.port() != 80,
+        "alt_port_camera: emulator must not bind to port 80");
+
+  bool ok = run_single_camera(emu, recorder, 2);
+  CHECK(ok, "alt_port_camera: timed out waiting for events");
+
+  CHECK(static_cast<int>(bptr->events.size()) == 1,
+        "alt_port_camera: expected 1 event, got "
+        + std::to_string(bptr->events.size()));
+
+  int person_sdo = 0;
+  for (auto& s : bptr->sdos) if (s.obj_type == "person") ++person_sdo;
+  CHECK(person_sdo == 1,
+        "alt_port_camera: expected 1 person SDO, got "
+        + std::to_string(person_sdo));
+}
+
+// ============================================================
 // main
 // ============================================================
 int main() {
@@ -1897,6 +1949,7 @@ int main() {
   run_test("camera_object_types_multi",
            [&] { test_camera_object_types_multi(ubv_dir); });
   run_test("alarm_notify_animal",        [] { test_alarm_notify_animal(); });
+  run_test("alt_port_camera",            [&] { test_alt_port_camera(ubv_dir); });
 
   onvif::global_cleanup();
 
