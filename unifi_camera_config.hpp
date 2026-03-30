@@ -68,4 +68,15 @@ absl::Status ensure_smart_detect_zones(
     const std::vector<onvif::CameraConfig>& cameras,
     const DbConfig& db = {});
 
+/// Set `thirdPartyCameraInfo.enableRtspAudio` for every adopted third-party
+/// camera that has `hasAudio = true`.
+///
+/// @p enable  true  → set enableRtspAudio to true
+///            false → set enableRtspAudio to false
+///
+/// Idempotent — cameras already at the requested value are still updated
+/// (no read-modify-check; the write is cheap).
+/// Returns error Status on connection or query failure.
+absl::Status set_rtsp_audio(bool enable, const DbConfig& db = {});
+
 }  // namespace unifi

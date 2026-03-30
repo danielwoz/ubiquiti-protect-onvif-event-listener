@@ -95,6 +95,11 @@ ABSL_FLAG(std::string, camera_object_types, "",
     "e.g. '192.168.1.108=animal,192.168.1.109=package'. "
     "Overrides the detection type for all events from that camera. "
     "Valid types: person, vehicle, animal, package.");
+ABSL_FLAG(std::string, rtsp_audio, "",
+    "Set enableRtspAudio in the Protect database for all adopted third-party "
+    "cameras that have audio capability (hasAudio=true). "
+    "Values: 'enable' sets enableRtspAudio=true, 'disable' sets it to false. "
+    "Empty (default) leaves the database unchanged.");
 
 // ============================================================
 // JSON helpers (used only by EventRecorder)
@@ -333,6 +338,20 @@ int main(int argc, char* argv[]) {
     LOG(ERROR) << "Fatal: " << s.message();
     onvif::global_cleanup();
     return 1;
+  }
+
+  {
+    const std::string rtsp_audio = absl::GetFlag(FLAGS_rtsp_audio);
+    if (rtsp_audio == "enable" || rtsp_audio == "disable") {
+      const bool enable = (rtsp_audio == "enable");
+      if (auto s = unifi::set_rtsp_audio(enable, cam_db); !s.ok()) {
+        LOG(ERROR) << "Fatal: " << s.message();
+        onvif::global_cleanup();
+        return 1;
+      }
+      LOG(INFO) << "[rtsp_audio] " << (enable ? "enabled" : "disabled")
+                << " RTSP audio for all cameras with audio capability";
+    }
   }
 
   // AlarmNotifier: triggers UniFi Protect security alarms for ONVIF cameras.

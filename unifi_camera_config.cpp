@@ -263,4 +263,50 @@ absl::Status ensure_smart_detect_zones(
   return absl::OkStatus();
 }
 
+// ---------------------------------------------------------------------------
+
+absl::Status set_rtsp_audio(bool enable, const DbConfig& db) {
+  std::string connstr =
+    "host="    + db.host   +
+    " port="   + std::to_string(db.port) +
+    " dbname=" + db.dbname +
+    " user="   + db.user;
+  if (!db.password.empty())
+    connstr += " password=" + db.password;
+
+  PGconn* conn = PQconnectdb(connstr.c_str());
+  if (PQstatus(conn) != CONNECTION_OK) {
+    std::string err = PQerrorMessage(conn);
+    PQfinish(conn);
+    return absl::InternalError("unifi::set_rtsp_audio: " + err);
+  }
+
+  // Only update cameras that report hasAudio = true.
+  const char* val = enable ? "true" : "false";
+  const char* sql =
+    "UPDATE cameras "
+    "SET \"thirdPartyCameraInfo\" = jsonb_set("
+    "      \"thirdPartyCameraInfo\"::jsonb,"
+    "      '{enableRtspAudio}',"
+    "      $1::jsonb"
+    "    )::json,"
+    "    \"updatedAt\" = NOW() "
+    "WHERE \"isThirdPartyCamera\" = true "
+    "  AND \"isAdopted\" = true "
+    "  AND (\"thirdPartyCameraInfo\"::jsonb->>'hasAudio') = 'true'";
+
+  const char* params[1] = { val };
+  PGresult* res = PQexecParams(conn, sql, 1, nullptr, params,
+                               nullptr, nullptr, 0);
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    PQfinish(conn);
+    return absl::InternalError("unifi::set_rtsp_audio update: " + err);
+  }
+  PQclear(res);
+  PQfinish(conn);
+  return absl::OkStatus();
+}
+
 }  // namespace unifi

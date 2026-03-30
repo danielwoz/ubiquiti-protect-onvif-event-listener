@@ -127,6 +127,24 @@ camera detections can trigger security alarms you configure in
 | `--db_conn` | `host=/run/postgresql port=5433 dbname=unifi-protect user=postgres` | libpq connection string for the UniFi Protect database. You only need to change this if your database is on a different host or port. |
 | `--db_host` | _(empty = Unix socket)_ | Override only the PostgreSQL host used when loading camera credentials from the database. Useful when running the recorder on a different machine than the Dream Router. |
 
+### RTSP audio
+
+UniFi Protect stores an `enableRtspAudio` flag per third-party camera in its database.
+The recorder can set this flag at startup for all cameras that report audio capability
+(`hasAudio = true`).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rtsp_audio` | _(disabled)_ | Set RTSP audio in the Protect database. `enable` turns on audio for all audio-capable cameras; `disable` turns it off. Empty (default) leaves the database unchanged. |
+
+**Example — enable RTSP audio at every startup:**
+```bash
+ExecStart=/root/onvif_recorder --rtsp_audio=enable
+```
+
+Note: this updates the database on every startup. If you only need a one-time change,
+set the flag once, restart the service, then remove the flag and restart again.
+
 ### Detection buffers
 
 | Flag | Default | Description |
