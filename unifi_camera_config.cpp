@@ -165,15 +165,25 @@ absl::Status enable_smart_detect(
     return absl::InternalError("unifi::enable_smart_detect: " + err);
   }
 
-  // For each camera: if either smartDetectTypes (featureFlags) or objectTypes
-  // (smartDetectSettings) is missing or empty, fill both with person+vehicle.
+  // Ensure smartDetectTypes (featureFlags) includes all four detection types
+  // plus "licensePlate".  Including "licensePlate" in featureFlags is required
+  // to unlock the smart-detections panel in the Protect timelapse/playback UI:
+  // the frontend checks featureFlags.smartDetectTypes.includes("licensePlate")
+  // to decide whether to show that panel for third-party cameras.  We do NOT
+  // add "licensePlate" to smartDetectSettings.objectTypes so that no license-
+  // plate recording slots are consumed.
+  //
+  // The condition also fires when a camera already has some types but is
+  // missing "licensePlate" (e.g. cameras seeded by an older recorder build
+  // that only wrote ["person","vehicle"]).
+  //
   // Cast via ::jsonb so jsonb_set works even though the columns are json type.
   const char* sql =
     "UPDATE cameras "
     "SET \"featureFlags\" = jsonb_set("
     "      \"featureFlags\"::jsonb,"
     "      '{smartDetectTypes}',"
-    "      '[\"person\",\"vehicle\",\"animal\",\"package\"]'::jsonb"
+    "      '[\"person\",\"vehicle\",\"animal\",\"package\",\"licensePlate\"]'::jsonb"
     "    )::json,"
     "    \"smartDetectSettings\" = jsonb_set("
     "      \"smartDetectSettings\"::jsonb,"
@@ -185,6 +195,8 @@ absl::Status enable_smart_detect(
     "  AND ("
     "    (\"featureFlags\"::jsonb -> 'smartDetectTypes') IS NULL"
     "    OR (\"featureFlags\"::jsonb -> 'smartDetectTypes') = '[]'::jsonb"
+    "    OR NOT (\"featureFlags\"::jsonb -> 'smartDetectTypes')"
+    "           @> '\"licensePlate\"'::jsonb"
     "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') IS NULL"
     "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') = '[]'::jsonb"
     "  )";
