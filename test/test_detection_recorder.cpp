@@ -333,6 +333,10 @@ class SnapshotSyntheticEmulator : public OnvifCameraEmulator {
     auto   p    = soap_action.rfind('/');
     auto   tail = (p != std::string::npos) ? soap_action.substr(p + 1) : soap_action;
 
+    if (tail == "GetServicesRequest")
+      return {200, rewrite_urls(
+                     make_get_services_response(real_ip_, alarm_service_url_))};
+
     if (tail == "CreatePullPointSubscriptionRequest")
       return {200, rewrite_urls(create_resp_)};
 
@@ -528,6 +532,9 @@ struct TestContext {
   // so AlarmNotifier can include them in UOS POST scope fields.
   std::string                      mac108;
   std::string                      mac109;
+  // Optional: UOS base URL to advertise in GetServices alarm service entries.
+  // When set, OnvifListener discovers it and DetectionRecorder activates alarms.
+  std::string                      alarm_service_url;
   onvif::CameraConfig              cfg108;
   onvif::CameraConfig              cfg109;
   std::unique_ptr<SnapshotSyntheticEmulator> emu108;
@@ -559,6 +566,10 @@ static bool run_standard_script(TestContext& ctx,
     "192.168.1.108", std::move(pulls_108), jpeg108);
   ctx.emu109 = std::make_unique<SnapshotSyntheticEmulator>(
     "192.168.1.109", std::move(pulls_109), jpeg109);
+  if (!ctx.alarm_service_url.empty()) {
+    ctx.emu108->set_alarm_service_url(ctx.alarm_service_url);
+    ctx.emu109->set_alarm_service_url(ctx.alarm_service_url);
+  }
   ctx.emu108->start();
   ctx.emu109->start();
 
@@ -1462,9 +1473,12 @@ static void test_alarm_integration_e2e(const std::string& ubv_dir) {
   notifier.refresh_alarms();
 
   TestContext ctx;
-  ctx.ubv_dir = ubv_dir;
-  ctx.mac108  = "A1B2C3D4E5F6";
-  ctx.mac109  = "B2C3D4E5F6A7";
+  ctx.ubv_dir           = ubv_dir;
+  ctx.mac108            = "A1B2C3D4E5F6";
+  ctx.mac109            = "B2C3D4E5F6A7";
+  // Advertise the UOS alarm service in GetServices so the listener discovers it
+  // and DetectionRecorder activates alarm notification for these cameras.
+  ctx.alarm_service_url = uos.base_url();
 
   auto backend = std::make_unique<MockBackend>();
   auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));

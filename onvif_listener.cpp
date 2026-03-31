@@ -385,6 +385,8 @@ struct XmlDoc {
       BAD_CAST "http://schemas.xmlsoap.org/ws/2004/08/addressing");
     xmlXPathRegisterNs(c, BAD_CAST "tt",
       BAD_CAST "http://www.onvif.org/ver10/schema");
+    xmlXPathRegisterNs(c, BAD_CAST "tds",
+      BAD_CAST "http://www.onvif.org/ver10/device/wsdl");
   }
 
   using XPathObj = std::unique_ptr<xmlXPathObject, decltype(&xmlXPathFreeObject)>;
@@ -427,6 +429,14 @@ struct XmlDoc {
 };
 
 // -------------------------------------------------------
+// Pair of URLs discovered via GetServices
+// -------------------------------------------------------
+struct DiscoveredServices {
+  std::string event_url;   // events service XAddr (fallback: /onvif/event_service)
+  std::string alarm_url;   // alarm service XAddr; empty = no alarm service found
+};
+
+// -------------------------------------------------------
 // Internal notification struct (parsed from XML)
 // -------------------------------------------------------
 struct Notification {
@@ -457,7 +467,11 @@ class CameraWorker {
     std::chrono::steady_clock::time_point streak_start;
 
     while (running_) {
-      auto sub_or = create_subscription();
+      // Discover event and alarm service URLs via GetServices (IncludeCapability=true).
+      // Re-runs on every outer loop iteration so a camera restart is handled cleanly.
+      const DiscoveredServices sv = discover_services();
+
+      auto sub_or = create_subscription(sv.event_url);
       if (!sub_or.ok()) {
         if (consecutive_failures == 0)
           streak_start = std::chrono::steady_clock::now();
@@ -495,12 +509,14 @@ class CameraWorker {
               " consecutive attempts -- pausing before retry");
           continue;
         }
-        LOG(ERROR) << '[' << cfg_.ip << "] failed to get subscription URL"
-                   << ", retrying in " << cfg_.retry_interval_sec << "s"
-                   << (max_failures > 0
-                         ? " (" + std::to_string(consecutive_failures) +
-                           "/" + std::to_string(max_failures) + ")"
-                         : "");
+        LOG_FIRST_N(ERROR, 1) << '[' << cfg_.ip
+                             << "] failed to get subscription URL"
+                             << ", retrying in " << cfg_.retry_interval_sec
+                             << "s"
+                             << (max_failures > 0
+                                   ? " (" + std::to_string(consecutive_failures) +
+                                     "/" + std::to_string(max_failures) + ")"
+                                   : "");
         sleep_interruptible(cfg_.retry_interval_sec);
         continue;
       }
@@ -521,7 +537,7 @@ class CameraWorker {
           renew_at = std::chrono::steady_clock::now()
                      + std::chrono::seconds(90);
         }
-        absl::Status ps = pull(sub_url);
+        absl::Status ps = pull(sub_url, sv.alarm_url);
         if (!ps.ok()) {
           if (consecutive_failures == 0)
             streak_start = std::chrono::steady_clock::now();
@@ -534,12 +550,16 @@ class CameraWorker {
                 " consecutive failures -- pausing before retry"
                 " (last error: " + std::string(ps.message()) + ")");
           } else {
-            LOG(ERROR) << '[' << cfg_.ip << "] error: " << ps.message()
-                       << ", reconnecting in " << cfg_.retry_interval_sec << "s"
-                       << (max_failures > 0
-                             ? " (" + std::to_string(consecutive_failures) +
-                               "/" + std::to_string(max_failures) + ")"
-                             : "");
+            LOG_FIRST_N(ERROR, 1) << '[' << cfg_.ip << "] error: "
+                                  << ps.message()
+                                  << ", reconnecting in "
+                                  << cfg_.retry_interval_sec << "s"
+                                  << (max_failures > 0
+                                        ? " (" +
+                                          std::to_string(consecutive_failures) +
+                                          "/" + std::to_string(max_failures) +
+                                          ")"
+                                        : "");
             sleep_interruptible(cfg_.retry_interval_sec);
           }
           inner_ok = false;
@@ -575,6 +595,79 @@ class CameraWorker {
     return "http://" + cfg_.ip + "/onvif/event_service";
   }
 
+  std::string device_url() const {
+    return "http://" + cfg_.ip + "/onvif/device_service";
+  }
+
+  // Calls GetServices (with capabilities) on the device management endpoint to
+  // discover the canonical event service XAddr and, if advertised, an alarm
+  // service base URL.
+  //
+  // event_url: falls back to /onvif/event_service on any error.
+  // alarm_url: empty when no service with "alarm" in its namespace is found
+  //            (camera not managed by UniFi Protect or does not support alarms).
+  DiscoveredServices discover_services() {
+    static const char* ACTION =
+      "http://www.onvif.org/ver10/device/wsdl/DeviceManagement/GetServicesRequest";
+
+    const std::string body =
+      "    <tds:GetServices>\n"
+      "      <tds:IncludeCapability>true</tds:IncludeCapability>\n"
+      "    </tds:GetServices>\n";
+
+    DiscoveredServices result;
+    result.event_url = event_url();  // default fallback
+
+    auto soap = build_soap(cfg_.user, cfg_.password, body, device_url(), ACTION);
+    auto resp_or = soap_post_r(device_url(), soap, ACTION, 10);
+    if (!resp_or.ok()) {
+      LOG(INFO) << '[' << cfg_.ip << "] GetServices: "
+                << resp_or.status().message() << " -- using defaults";
+      return result;
+    }
+    if (resp_or->status_code != 200) {
+      LOG_FIRST_N(INFO, 1) << '[' << cfg_.ip << "] GetServices HTTP "
+                           << resp_or->status_code << " -- using defaults";
+      return result;
+    }
+
+    auto doc_or = XmlDoc::Create(resp_or->body);
+    if (!doc_or.ok()) {
+      LOG(INFO) << '[' << cfg_.ip << "] GetServices parse error -- using defaults";
+      return result;
+    }
+
+    // Walk every tds:Service and extract event/alarm XAddrs by namespace.
+    auto services = doc_or->xpath("//tds:Service");
+    if (services && services->nodesetval) {
+      for (int i = 0; i < services->nodesetval->nodeNr; ++i) {
+        xmlNodePtr node = services->nodesetval->nodeTab[i];
+        const std::string ns =
+            XmlDoc::trim(doc_or->text("tds:Namespace", node));
+        const std::string xaddr =
+            XmlDoc::trim(doc_or->text("tds:XAddr", node));
+        if (xaddr.empty()) continue;
+
+        if (ns.find("events") != std::string::npos && result.event_url == event_url()) {
+          LOG(INFO) << '[' << cfg_.ip << "] event service URL: " << xaddr;
+          result.event_url = xaddr;
+        } else if (ns.find("alarm") != std::string::npos) {
+          LOG(INFO) << '[' << cfg_.ip << "] alarm service URL: " << xaddr;
+          result.alarm_url = xaddr;
+        }
+      }
+    }
+
+    if (result.event_url == event_url())
+      LOG(INFO) << '[' << cfg_.ip
+                << "] events service not in GetServices -- using default";
+    if (result.alarm_url.empty())
+      LOG(INFO) << '[' << cfg_.ip
+                << "] alarm service not in GetServices -- skipping alarms";
+
+    return result;
+  }
+
   // soap_post wrapper: records the exchange if raw recording is enabled.
   absl::StatusOr<HttpResponse> soap_post_r(const std::string& url,
                                             const std::string& body,
@@ -589,7 +682,7 @@ class CameraWorker {
   }
 
   // CreatePullPointSubscription -> subscription URL (empty string on HTTP error)
-  absl::StatusOr<std::string> create_subscription() {
+  absl::StatusOr<std::string> create_subscription(const std::string& ev_url) {
     static const char* ACTION =
       "http://www.onvif.org/ver10/events/wsdl/EventPortType/"
       "CreatePullPointSubscriptionRequest";
@@ -599,14 +692,16 @@ class CameraWorker {
       "      <tev:InitialTerminationTime>PT120S</tev:InitialTerminationTime>\n"
       "    </tev:CreatePullPointSubscription>\n";
 
-    auto soap = build_soap(cfg_.user, cfg_.password, body, event_url(), ACTION);
-    auto resp_or = soap_post_r(event_url(), soap, ACTION, 20);
+    auto soap = build_soap(cfg_.user, cfg_.password, body, ev_url, ACTION);
+    auto resp_or = soap_post_r(ev_url, soap, ACTION, 20);
     if (!resp_or.ok()) return resp_or.status();
 
     const HttpResponse& resp = *resp_or;
     if (resp.status_code != 200) {
-      LOG(INFO) << '[' << cfg_.ip << "] CreatePullPointSubscription HTTP "
-                << resp.status_code << ": " << resp.body.substr(0, 300);
+      LOG_FIRST_N(INFO, 1) << '[' << cfg_.ip
+                           << "] CreatePullPointSubscription HTTP "
+                           << resp.status_code << ": "
+                           << resp.body.substr(0, 300);
       return std::string{};
     }
 
@@ -636,11 +731,12 @@ class CameraWorker {
     if (resp_or->status_code == 200)
       LOG(INFO) << '[' << cfg_.ip << "] subscription renewed";
     else
-      LOG(WARNING) << '[' << cfg_.ip << "] renew HTTP " << resp_or->status_code;
+      LOG_FIRST_N(WARNING, 1) << '[' << cfg_.ip << "] renew HTTP "
+                              << resp_or->status_code;
     return absl::OkStatus();
   }
 
-  absl::Status pull(const std::string& sub_url) {
+  absl::Status pull(const std::string& sub_url, const std::string& alarm_url) {
     static const char* ACTION =
       "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/"
       "PullMessagesRequest";
@@ -672,7 +768,7 @@ class CameraWorker {
       cb_(OnvifEvent{
         cfg_.ip, cfg_.user,
         n.topic, n.event_time, n.property_op,
-        n.source, n.data, n.bbox});
+        n.source, n.data, n.bbox, alarm_url});
     }
     return absl::OkStatus();
   }

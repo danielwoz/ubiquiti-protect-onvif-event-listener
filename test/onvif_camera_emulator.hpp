@@ -60,6 +60,11 @@ class OnvifCameraEmulator {
     /// Returns "127.0.0.1:<port>" — use as CameraConfig::ip in tests.
     std::string local_address() const;
 
+    /// Set the alarm service base URL to advertise in GetServices responses
+    /// (e.g. the UosEmulator's base_url() in tests).  Empty by default,
+    /// which means no alarm service entry is included in GetServices.
+    void set_alarm_service_url(const std::string& url) { alarm_service_url_ = url; }
+
  protected:
     /// Called for each complete SOAP request. Return {http_status, soap_xml}.
     /// @param path        Request URL path  (e.g. "/onvif/event_service")
@@ -75,6 +80,7 @@ class OnvifCameraEmulator {
     std::string rewrite_urls(const std::string& response) const;
 
     const std::string real_ip_;
+    std::string       alarm_service_url_;
 
  private:
     // Per-connection accumulation buffer (stored in MHD con_cls)

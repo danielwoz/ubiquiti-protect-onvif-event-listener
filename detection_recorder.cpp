@@ -846,7 +846,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     }  // lock released
 
     // 5. Notify UOS alarm manager (HTTP I/O, must be outside lock).
-    if (alarm_notif && !cam_mac.empty()) {
+    // alarm_url is populated from GetServices; empty means the camera did not
+    // advertise an alarm service (not Protect-managed) -- skip in that case.
+    if (alarm_notif && !cam_mac.empty() && !ev.alarm_url.empty()) {
+      alarm_notif->set_base_url(ev.alarm_url);
       alarm_notif->notify(obj_type, cam_mac, event_id, ts_ms);
     }
 

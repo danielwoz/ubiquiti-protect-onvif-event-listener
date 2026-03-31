@@ -22,6 +22,18 @@
 #include "onvif_camera_emulator.hpp"
 
 // ============================================================
+// GetServices response builder
+//
+// Builds a minimal GetServices response advertising the events service.
+// If alarm_url is non-empty, also advertises an alarm service entry so
+// that the ONVIF listener's discover_services() can extract it.
+// Pass the result through rewrite_urls() to replace real_ip with the
+// local emulator address (the alarm_url is already the correct address).
+// ============================================================
+std::string make_get_services_response(const std::string& real_ip,
+                                        const std::string& alarm_url = "");
+
+// ============================================================
 // RecordedSession -- responses loaded from a raw JSONL log file
 // ============================================================
 

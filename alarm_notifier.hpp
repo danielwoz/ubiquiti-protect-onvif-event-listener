@@ -51,6 +51,11 @@ class AlarmNotifier {
  public:
   explicit AlarmNotifier(std::string uos_base_url = "http://localhost:11010");
 
+  /// Update the UOS base URL (e.g. after discovering it from ONVIF GetServices).
+  /// Clears the cached alarm list so the next notify() fetches from the new URL.
+  /// Thread-safe; safe to call concurrently with notify().
+  void set_base_url(const std::string& url);
+
   /// Fetch the current alarm list from UOS and cache it.
   /// Safe to call before the listener starts. Silently ignores errors.
   void refresh_alarms();

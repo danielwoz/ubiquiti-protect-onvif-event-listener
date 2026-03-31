@@ -194,9 +194,21 @@ void AlarmNotifier::http_post(const std::string& url, const std::string& body) {
 AlarmNotifier::AlarmNotifier(std::string uos_base_url)
     : uos_base_url_(std::move(uos_base_url)) {}
 
+void AlarmNotifier::set_base_url(const std::string& url) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (uos_base_url_ == url) return;
+  uos_base_url_ = url;
+  alarms_.clear();
+  last_refresh_ = {};
+}
+
 void AlarmNotifier::refresh_alarms() {
-  const std::string response =
-      http_get(uos_base_url_ + "/api/v1/alarms");
+  std::string url;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    url = uos_base_url_;
+  }
+  const std::string response = http_get(url + "/api/v1/alarms");
   if (response.empty()) return;
 
   auto parsed = parse_alarms(response);
@@ -213,11 +225,13 @@ void AlarmNotifier::notify(const std::string& obj_type,
                            uint64_t ts_ms) {
   // Refresh alarm list if empty or older than 5 minutes.
   bool need_refresh;
+  std::string url;
   {
     std::lock_guard<std::mutex> lk(mu_);
     auto now = std::chrono::steady_clock::now();
     need_refresh = alarms_.empty() ||
         (now - last_refresh_) > std::chrono::minutes(5);
+    url = uos_base_url_;
   }
   if (need_refresh) refresh_alarms();
 
@@ -227,6 +241,7 @@ void AlarmNotifier::notify(const std::string& obj_type,
   {
     std::lock_guard<std::mutex> lk(mu_);
     alarms_copy = alarms_;
+    url = uos_base_url_;  // re-snapshot after potential refresh
   }
 
   for (const auto& alarm : alarms_copy) {
@@ -267,7 +282,7 @@ void AlarmNotifier::notify(const std::string& obj_type,
     body += ts_buf;
     body += "},\"allEvents\":[]}}]";
 
-    http_post(uos_base_url_ + "/api/v1/alarms/events", body);
+    http_post(url + "/api/v1/alarms/events", body);
   }
 }
 

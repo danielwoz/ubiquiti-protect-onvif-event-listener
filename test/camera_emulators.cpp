@@ -138,6 +138,49 @@ std::string action_tail(const std::string& soap_action) {
   return (p != std::string::npos) ? soap_action.substr(p + 1) : soap_action;
 }
 
+}  // namespace
+
+// ============================================================
+// make_get_services_response -- declared in camera_emulators.hpp
+// ============================================================
+std::string make_get_services_response(const std::string& real_ip,
+                                        const std::string& alarm_url) {
+  std::string resp =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+    "<SOAP-ENV:Envelope"
+    "  xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+    "  xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\""
+    "  xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+    "<SOAP-ENV:Body>"
+    "<tds:GetServicesResponse>"
+    "<tds:Service>"
+    "<tds:Namespace>http://www.onvif.org/ver10/events/wsdl</tds:Namespace>"
+    "<tds:XAddr>http://" + real_ip + "/onvif/event_service</tds:XAddr>"
+    "<tds:Version>"
+    "<tt:Major>2</tt:Major><tt:Minor>60</tt:Minor>"
+    "</tds:Version>"
+    "</tds:Service>";
+
+  if (!alarm_url.empty()) {
+    resp +=
+      "<tds:Service>"
+      "<tds:Namespace>http://www.ubnt.com/ver10/alarm/wsdl</tds:Namespace>"
+      "<tds:XAddr>" + alarm_url + "</tds:XAddr>"
+      "<tds:Version>"
+      "<tt:Major>1</tt:Major><tt:Minor>0</tt:Minor>"
+      "</tds:Version>"
+      "</tds:Service>";
+  }
+
+  resp +=
+    "</tds:GetServicesResponse>"
+    "</SOAP-ENV:Body>"
+    "</SOAP-ENV:Envelope>";
+  return resp;
+}
+
+namespace {  // re-open anonymous namespace for emulator implementations
+
 // Advance through a response sequence:
 //   - clamp:  clamps at last entry (used for CreatePullPointSubscription / Renew
 //             so the last successful 200 keeps being returned)
@@ -212,7 +255,9 @@ std::pair<int, std::string> HikvisionCompatibleEmulator::handle(
   const auto tail = action_tail(soap_action);
 
   std::pair<int, std::string> resp;
-  if      (tail == "CreatePullPointSubscriptionRequest")
+  if      (tail == "GetServicesRequest")
+    resp = {200, make_get_services_response(real_ip_, alarm_service_url_)};
+  else if (tail == "CreatePullPointSubscriptionRequest")
     resp = next_clamp(session_.create_sub, create_idx_);
   else if (tail == "PullMessagesRequest")
     resp = next_cycle(session_.pull, pull_idx_);
@@ -241,7 +286,9 @@ std::pair<int, std::string> CellMotionCameraEmulator::handle(
   const auto tail = action_tail(soap_action);
 
   std::pair<int, std::string> resp;
-  if      (tail == "CreatePullPointSubscriptionRequest")
+  if      (tail == "GetServicesRequest")
+    resp = {200, make_get_services_response(real_ip_, alarm_service_url_)};
+  else if (tail == "CreatePullPointSubscriptionRequest")
     resp = next_clamp(session_.create_sub, create_idx_);
   else if (tail == "PullMessagesRequest")
     resp = next_cycle(session_.pull, pull_idx_);
@@ -264,9 +311,13 @@ ThinginoCameraEmulator::ThinginoCameraEmulator(const std::string& jsonl_path)
 
 std::pair<int, std::string> ThinginoCameraEmulator::handle(
   const std::string& /*path*/,
-  const std::string& /*soap_action*/,
+  const std::string& soap_action,
   const std::string& /*body*/) {
   std::lock_guard<std::mutex> lk(mu_);
+  // GetServices: this camera returns 404 for everything; return without
+  // consuming the create_sub replay sequence.
+  if (action_tail(soap_action) == "GetServicesRequest")
+    return {404, ""};
   return next_clamp(session_.create_sub, create_idx_);
 }
 
@@ -280,9 +331,15 @@ Html404CameraEmulator::Html404CameraEmulator(const std::string& jsonl_path)
 
 std::pair<int, std::string> Html404CameraEmulator::handle(
   const std::string& /*path*/,
-  const std::string& /*soap_action*/,
+  const std::string& soap_action,
   const std::string& /*body*/) {
   std::lock_guard<std::mutex> lk(mu_);
+  // GetServices: this camera returns HTML 404 for everything; return without
+  // consuming the create_sub replay sequence.
+  if (action_tail(soap_action) == "GetServicesRequest") {
+    const auto& ex = session_.create_sub.front();
+    return {ex.status, ex.response};
+  }
   return next_clamp(session_.create_sub, create_idx_);
 }
 
@@ -305,7 +362,9 @@ std::pair<int, std::string> DahuaSD4A425DBEmulator::handle(
   // stays on the final 200, so the retry-then-succeed path is exercised.
   // PullMessages: cycle -- events repeat indefinitely.
   std::pair<int, std::string> resp;
-  if      (tail == "CreatePullPointSubscriptionRequest")
+  if      (tail == "GetServicesRequest")
+    resp = {200, make_get_services_response(real_ip_, alarm_service_url_)};
+  else if (tail == "CreatePullPointSubscriptionRequest")
     resp = next_clamp(session_.create_sub, create_idx_);
   else if (tail == "PullMessagesRequest")
     resp = next_cycle(session_.pull, pull_idx_);

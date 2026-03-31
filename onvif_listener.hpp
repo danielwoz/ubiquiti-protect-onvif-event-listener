@@ -40,6 +40,11 @@ struct OnvifEvent {
     // Set only for cameras that include <tt:BoundingBox> in their ONVIF analytics
     // events (e.g. tns1:VideoAnalytics/ObjectDetector).  Most cameras do not.
     std::optional<jpeg_crop::BoundingBox> bbox;
+    // Alarm service base URL discovered via GetServices for this camera.
+    // Empty when the camera did not advertise an alarm service in GetServices
+    // (e.g. not managed by UniFi Protect).  DetectionRecorder skips alarm
+    // notification when this is empty.
+    std::string alarm_url;
 };
 
 // ---------------------------------------------------------------
