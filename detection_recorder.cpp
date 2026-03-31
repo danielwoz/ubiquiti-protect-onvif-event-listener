@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <jpeglib.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <cstdint>
@@ -583,6 +584,61 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
       6, params);
   }
 
+  std::vector<IDbBackend::EventSummary> query_recent_events(int days) override {
+    maybe_reconnect();
+    const uint64_t since_ms =
+        now_ms() - static_cast<uint64_t>(days) * 86400000ULL;
+    const std::string since_str = std::to_string(since_ms);
+    const char* params[] = { since_str.c_str() };
+    PGresult* res = PQexecParams(conn_,
+      "SELECT id, \"cameraId\", \"smartDetectTypes\"::text, start, \"end\""
+      " FROM events"
+      " WHERE type = 'smartDetectZone'"
+      "   AND \"end\" IS NOT NULL"
+      "   AND start >= $1::bigint"
+      " ORDER BY \"cameraId\", \"smartDetectTypes\"::text, start",
+      1, nullptr, params, nullptr, nullptr, 0);
+    std::vector<IDbBackend::EventSummary> result;
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+      LOG(ERROR) << "[pg] query_recent_events failed: " << pg_errmsg(res);
+      PQclear(res);
+      return result;
+    }
+    const int n = PQntuples(res);
+    result.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      IDbBackend::EventSummary e;
+      e.id        = PQgetvalue(res, i, 0);
+      e.camera_id = PQgetvalue(res, i, 1);
+      e.sdt_json  = PQgetvalue(res, i, 2);
+      e.start_ms  =
+          static_cast<uint64_t>(std::stoull(PQgetvalue(res, i, 3)));
+      e.end_ms    =
+          static_cast<uint64_t>(std::stoull(PQgetvalue(res, i, 4)));
+      result.push_back(std::move(e));
+    }
+    PQclear(res);
+    return result;
+  }
+
+  void coalesce_events(const std::string& into_id,
+                        uint64_t           new_end_ms,
+                        const std::string& from_id,
+                        const std::string& now_str) override {
+    // Extend the surviving event's end time.
+    update_event_end(into_id, new_end_ms, now_str);
+    // Delete dependent rows and the merged event itself.
+    const char* p[] = { from_id.c_str() };
+    exec_params(
+        "DELETE FROM thumbnails WHERE \"eventId\" = $1", 1, p);
+    exec_params(
+        "DELETE FROM \"smartDetectObjects\" WHERE \"eventId\" = $1", 1, p);
+    exec_params(
+        "DELETE FROM \"detectionLabels\" WHERE \"eventId\" = $1", 1, p);
+    exec_params(
+        "DELETE FROM events WHERE id = $1", 1, p);
+  }
+
   void write_thumbnail(const std::string&              thumb_id,
                        const std::string&              event_id,
                        const std::string&              camera_ip,
@@ -686,6 +742,16 @@ void DetectionRecorder::set_buffer(uint32_t pre_sec, uint32_t post_sec) {
   post_buffer_ms_ = static_cast<uint64_t>(post_sec) * 1000;
 }
 
+void DetectionRecorder::set_coalesce_window(uint32_t sec) {
+  std::lock_guard<std::mutex> lk(mu_);
+  coalesce_window_ms_ = static_cast<uint64_t>(sec) * 1000;
+}
+
+void DetectionRecorder::set_max_events_per_hour(uint32_t n) {
+  std::lock_guard<std::mutex> lk(mu_);
+  max_events_per_hour_ = n;
+}
+
 void DetectionRecorder::set_ubv_dir(const std::string& dir) {
   std::lock_guard<std::mutex> lk(mu_);
   ubv_dir_ = dir;
@@ -735,7 +801,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
   auto key = std::make_pair(ev.camera_ip, det->type);
 
   if (det->started) {
-    // 1. Look up snapshot + UBV config and buffer settings (brief lock, no I/O).
+    // 1. Coalesce / rate-limit checks then snapshot + config read (brief lock, no I/O).
     std::string snap_url, snap_user, snap_pass, ubv_dir, cam_uuid, cam_mac;
     uint64_t pre_ms;
     const object_detect::ObjectDetector* det_ptr;
@@ -743,6 +809,34 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     AlarmNotifier* alarm_notif;
     {
       std::lock_guard<std::mutex> lk(mu_);
+
+      // Coalescing: if the previous detection for this key ended recently,
+      // re-open the existing event row instead of creating a new one.
+      if (coalesce_window_ms_ > 0) {
+        auto lei = last_event_.find(key);
+        if (lei != last_event_.end() && lei->second.real_end_ms > 0) {
+          const uint64_t cur = now_ms();
+          if (cur >= lei->second.real_end_ms &&
+              cur - lei->second.real_end_ms <= coalesce_window_ms_) {
+            open_[key] = lei->second.event_id;
+            lei->second.real_end_ms = 0;  // mark as re-opened
+            return;
+          }
+        }
+      }
+
+      // Rate limiting: drop the event if this camera has hit its hourly budget.
+      if (max_events_per_hour_ > 0) {
+        auto& times = recent_event_times_[ev.camera_ip];
+        const uint64_t cutoff = now_ms() - 3600000;
+        while (!times.empty() && times.front() < cutoff) times.pop_front();
+        if (times.size() >= static_cast<std::size_t>(max_events_per_hour_)) {
+          LOG(WARNING) << '[' << ev.camera_ip << "] rate limit ("
+                       << max_events_per_hour_ << "/h): dropping detection";
+          return;
+        }
+      }
+
       auto it = snapshot_info_.find(ev.camera_ip);
       if (it != snapshot_info_.end()) {
         snap_url  = it->second.url;
@@ -830,6 +924,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
 
       open_[key] = event_id;
 
+      // Rate limiting: record this event's wall-clock creation time.
+      if (max_events_per_hour_ > 0)
+        recent_event_times_[ev.camera_ip].push_back(now_ms());
+
       // 4d. Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.
       if (!snapshot.empty()) {
         if (!ubv_dir.empty()) {
@@ -846,10 +944,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     }  // lock released
 
     // 5. Notify UOS alarm manager (HTTP I/O, must be outside lock).
-    // alarm_url is populated from GetServices; empty means the camera did not
-    // advertise an alarm service (not Protect-managed) -- skip in that case.
+    // alarm_url is non-empty when the camera advertised an alarm service via
+    // GetServices; empty means it is not Protect-managed -- skip in that case.
+    // The AlarmNotifier always uses its configured --uos_url (host:port).
     if (alarm_notif && !cam_mac.empty() && !ev.alarm_url.empty()) {
-      alarm_notif->set_base_url(ev.alarm_url);
       alarm_notif->notify(obj_type, cam_mac, event_id, ts_ms);
     }
 
@@ -859,12 +957,70 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     auto it = open_.find(key);
     if (it == open_.end()) return;
 
-    const uint64_t    end_ms  = now_ms() + post_buffer_ms_;  // padded end
-    const std::string now_str = utc_now_iso8601();
+    const uint64_t    wall_now = now_ms();
+    const uint64_t    end_ms   = wall_now + post_buffer_ms_;  // padded end
+    const std::string now_str  = utc_now_iso8601();
+    const std::string ended_id = it->second;
 
-    db_->update_event_end(it->second, end_ms, now_str);
+    db_->update_event_end(ended_id, end_ms, now_str);
     open_.erase(it);
+
+    // Coalescing: remember when this detection ended (wall-clock, unpadded)
+    // so the next detection within coalesce_window_ms_ can extend this event.
+    last_event_[key] = {ended_id, wall_now};
   }
+}
+
+int DetectionRecorder::coalesce_history(int days) {
+  uint64_t coalesce_ms;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    coalesce_ms = coalesce_window_ms_;
+  }
+  if (coalesce_ms == 0) return 0;
+
+  // Events are sorted by (camera_id, sdt_json, start_ms) by the backend query.
+  auto events = db_->query_recent_events(days);
+  if (events.empty()) return 0;
+
+  int merged = 0;
+  std::size_t i = 0;
+  while (i < events.size()) {
+    // Find the end of this (camera_id, sdt_json) group.
+    std::size_t j = i + 1;
+    while (j < events.size() &&
+           events[j].camera_id == events[i].camera_id &&
+           events[j].sdt_json  == events[i].sdt_json) {
+      ++j;
+    }
+    // Walk events[i..j): merge adjacent events within the coalesce window.
+    std::size_t base = i;
+    for (std::size_t k = i + 1; k < j; ++k) {
+      const auto& b = events[base];
+      const auto& c = events[k];
+      // within_window: overlapping OR gap <= coalesce_ms.
+      // Short-circuit prevents underflow on the subtraction.
+      const bool within =
+          (c.start_ms <= b.end_ms) ||
+          (c.start_ms - b.end_ms <= coalesce_ms);
+      if (within) {
+        const uint64_t    new_end  = std::max(b.end_ms, c.end_ms);
+        const std::string now_str  = utc_now_iso8601();
+        db_->coalesce_events(b.id, new_end, c.id, now_str);
+        events[base].end_ms = new_end;
+        ++merged;
+        // Keep base at the same index so it can absorb further events.
+      } else {
+        base = k;
+      }
+    }
+    i = j;
+  }
+
+  if (merged > 0)
+    LOG(INFO) << "[coalesce_history] merged " << merged
+              << " event(s) over the last " << days << " day(s)";
+  return merged;
 }
 
 void DetectionRecorder::set_default_object_type(const std::string& type) {

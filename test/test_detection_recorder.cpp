@@ -52,6 +52,7 @@
 #include <stdio.h>    // for FILE (needed before jpeglib.h)
 #include <jpeglib.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -519,6 +520,42 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
                               const std::vector<int>& lids,
                               const std::string& /*now_str*/) override {
     det_labels.push_back({event_id, object_id, lids});
+  }
+
+  std::vector<onvif::DetectionRecorder::IDbBackend::EventSummary>
+  query_recent_events(int /*days*/) override {
+    std::vector<onvif::DetectionRecorder::IDbBackend::EventSummary> result;
+    for (const auto& e : events) {
+      if (!e.ended) continue;
+      onvif::DetectionRecorder::IDbBackend::EventSummary s;
+      s.id        = e.id;
+      s.camera_id = e.camera_ip;
+      s.sdt_json  = e.sdt_json;
+      s.start_ms  = e.start_ms;
+      s.end_ms    = e.end_ms;
+      result.push_back(std::move(s));
+    }
+    std::sort(result.begin(), result.end(),
+      [](const onvif::DetectionRecorder::IDbBackend::EventSummary& a,
+         const onvif::DetectionRecorder::IDbBackend::EventSummary& b) {
+        if (a.camera_id != b.camera_id) return a.camera_id < b.camera_id;
+        if (a.sdt_json  != b.sdt_json)  return a.sdt_json  < b.sdt_json;
+        return a.start_ms < b.start_ms;
+      });
+    return result;
+  }
+
+  void coalesce_events(const std::string& into_id,
+                        uint64_t           new_end_ms,
+                        const std::string& from_id,
+                        const std::string& now_str) override {
+    update_event_end(into_id, new_end_ms, now_str);
+    for (auto it = events.begin(); it != events.end(); ++it) {
+      if (it->id == from_id) {
+        events.erase(it);
+        break;
+      }
+    }
   }
 };
 
@@ -1925,6 +1962,151 @@ static void test_alt_port_camera(const std::string& ubv_dir) {
 }
 
 // ============================================================
+// Coalescing: two detections in quick succession → one event row.
+// Uses a 1-hour coalesce window so the test always coalesces regardless
+// of how fast (or slow) the host runs.
+// ============================================================
+static void test_coalesce_window() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("test_coalesce_window: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(3600);  // 1-hour window → always coalesces in tests
+
+  auto make_ev = [](bool started) {
+    onvif::OnvifEvent ev;
+    ev.camera_ip   = "192.168.1.200";
+    ev.topic       = "tns1:RuleEngine/FieldDetector/ObjectsInside";
+    ev.event_time  = "2026-03-31T10:00:00Z";
+    ev.property_op = "Changed";
+    ev.source["Rule"]      = "Human";
+    ev.data["IsInside"]    = started ? "true" : "false";
+    return ev;
+  };
+
+  // First detection: start then end.
+  recorder.on_event(make_ev(true));
+  CHECK(bptr->events.size() == 1,
+        "coalesce: expected 1 event after first start, got "
+        + std::to_string(bptr->events.size()));
+  recorder.on_event(make_ev(false));
+  CHECK(bptr->events[0].ended,
+        "coalesce: event should be ended after first end");
+
+  // Second detection immediately after: must coalesce into the first event row.
+  recorder.on_event(make_ev(true));
+  CHECK(bptr->events.size() == 1,
+        "coalesce: expected still 1 event after second start (coalesced), got "
+        + std::to_string(bptr->events.size()));
+
+  recorder.on_event(make_ev(false));
+  CHECK(bptr->events.size() == 1,
+        "coalesce: still 1 event after coalesced end, got "
+        + std::to_string(bptr->events.size()));
+  CHECK(bptr->events[0].ended,
+        "coalesce: event should still be ended after coalesced end");
+}
+
+// ============================================================
+// coalesce_history: pre-existing events in the DB merged on startup.
+//
+// Pre-loads 3 ended events for the same camera+type with sub-window gaps,
+// then calls coalesce_history() and verifies 2 are merged away into 1.
+// ============================================================
+static void test_coalesce_history() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("test_coalesce_history: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(3600);  // 1-hour window; all gaps in this test are <10s
+
+  // Three events, each 10 s long, 5 s apart — all within a 1-h window.
+  //   A: [100, 110)   B: [115, 125)   C: [130, 140)
+  // All gaps (5 s) are well within 3600 s → should merge to one event [100, 140).
+  const uint64_t T = 100000ULL;   // base time in ms
+  bptr->events.push_back({"hist-A", "192.168.1.200", "[\"person\"]",
+                           "", T,        true, T + 10000});
+  bptr->events.push_back({"hist-B", "192.168.1.200", "[\"person\"]",
+                           "", T + 15000, true, T + 25000});
+  bptr->events.push_back({"hist-C", "192.168.1.200", "[\"person\"]",
+                           "", T + 30000, true, T + 40000});
+
+  const int merged = recorder.coalesce_history(30);
+  CHECK(merged == 2,
+        "coalesce_history: expected 2 merged, got " + std::to_string(merged));
+  CHECK(bptr->events.size() == 1,
+        "coalesce_history: expected 1 event remaining, got "
+        + std::to_string(bptr->events.size()));
+  if (!bptr->events.empty()) {
+    CHECK(bptr->events[0].id.find("hist-A") != std::string::npos,
+          "coalesce_history: surviving event should be hist-A");
+    const uint64_t expected_end = T + 40000;
+    CHECK(bptr->events[0].end_ms == expected_end,
+          "coalesce_history: surviving event end should be T+40000, got "
+          + std::to_string(bptr->events[0].end_ms));
+  }
+
+  // A second camera should be unaffected.
+  bptr->events.push_back({"other-X", "192.168.1.201", "[\"person\"]",
+                           "", T, true, T + 10000});
+  const int merged2 = recorder.coalesce_history(30);
+  CHECK(merged2 == 0,
+        "coalesce_history: second run (no pairs within window) should merge 0, got "
+        + std::to_string(merged2));
+}
+
+// ============================================================
+// Rate limiting: camera is capped at N events/hour; excess dropped.
+// ============================================================
+static void test_rate_limit() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("test_rate_limit: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_max_events_per_hour(2);
+  recorder.set_coalesce_window(0);  // disable coalescing so each start is independent
+
+  auto make_ev = [](bool started) {
+    onvif::OnvifEvent ev;
+    ev.camera_ip   = "192.168.1.200";
+    ev.topic       = "tns1:RuleEngine/FieldDetector/ObjectsInside";
+    ev.event_time  = "2026-03-31T10:00:00Z";
+    ev.property_op = "Changed";
+    ev.source["Rule"]   = "Human";
+    ev.data["IsInside"] = started ? "true" : "false";
+    return ev;
+  };
+
+  // Send 4 start+end pairs; only the first 2 should produce event rows.
+  for (int i = 0; i < 4; ++i) {
+    recorder.on_event(make_ev(true));
+    recorder.on_event(make_ev(false));
+  }
+
+  CHECK(bptr->events.size() == 2,
+        "rate_limit: expected 2 events (limit=2/h), got "
+        + std::to_string(bptr->events.size()));
+}
+
+// ============================================================
 // main
 // ============================================================
 int main() {
@@ -1964,6 +2146,9 @@ int main() {
            [&] { test_camera_object_types_multi(ubv_dir); });
   run_test("alarm_notify_animal",        [] { test_alarm_notify_animal(); });
   run_test("alt_port_camera",            [&] { test_alt_port_camera(ubv_dir); });
+  run_test("coalesce_window",            [] { test_coalesce_window(); });
+  run_test("coalesce_history",           [] { test_coalesce_history(); });
+  run_test("rate_limit",                 [] { test_rate_limit(); });
 
   onvif::global_cleanup();
 

@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -155,9 +156,27 @@ class DetectionRecorder {
   /// Defaults: 2 s pre, 2 s post. Must be called before run().
   void set_buffer(uint32_t pre_sec, uint32_t post_sec);
 
+  /// Merge consecutive detections from the same camera into one event if the
+  /// new detection starts within @p sec seconds of the previous one ending.
+  /// Coalescing re-uses the existing event row instead of creating a new one.
+  /// Pass 0 to disable. Default: 30 s.
+  void set_coalesce_window(uint32_t sec);
+
+  /// Drop new detection events from a camera once it has produced more than
+  /// @p n events in the last rolling hour.  Pass 0 for unlimited. Default: 10.
+  void set_max_events_per_hour(uint32_t n);
+
   /// Process one ONVIF event. Ignores events that are not human/vehicle
   /// detections. Thread-safe.
   void on_event(const OnvifEvent& ev);
+
+  /// Scan the last @p days of ended events in the database and merge
+  /// consecutive detections from the same camera with the same type if the
+  /// gap between them is within the configured coalesce window.
+  /// Returns the number of event rows deleted (merged away).
+  /// Intended to be called once at startup, before run(). No-op if
+  /// coalesce_window_sec is 0.
+  int coalesce_history(int days = 30);
 
   /// Set the object detector used to locate subjects for thumbnail cropping.
   /// If not called (or set to nullptr), falls back to the smart-crop heuristic.
@@ -255,6 +274,29 @@ class DetectionRecorder {
                                         const std::string&      /*object_id*/,
                                         const std::vector<int>& /*lids*/,
                                         const std::string&      /*now_str*/) {}
+
+    /// One row returned by query_recent_events().
+    struct EventSummary {
+      std::string id;
+      std::string camera_id;
+      std::string sdt_json;   // smartDetectTypes text, e.g. '["person"]'
+      uint64_t    start_ms{0};
+      uint64_t    end_ms{0};
+    };
+
+    /// Fetch ended (non-NULL end) smartDetectZone events from the last @p days,
+    /// sorted by (camera_id, sdt_json, start_ms). Used by coalesce_history().
+    virtual std::vector<EventSummary> query_recent_events(int /*days*/) {
+      return {};
+    }
+
+    /// Extend the surviving event's end to new_end_ms, then delete the merged
+    /// event (from_id) and its dependent rows (smartDetectObjects, thumbnails,
+    /// detectionLabels).
+    virtual void coalesce_events(const std::string& /*into_id*/,
+                                  uint64_t           /*new_end_ms*/,
+                                  const std::string& /*from_id*/,
+                                  const std::string& /*now_str*/) {}
   };
 
   /// Factory for testing: injects a custom backend (skips PostgreSQL connect).
@@ -319,6 +361,22 @@ class DetectionRecorder {
 
   // Per-camera type overrides: all events from the keyed IP use this type.
   std::map<std::string, std::string> camera_object_types_;
+
+  // Coalescing: last completed event per (camera_ip, detection_type).
+  // real_end_ms is the wall-clock time (ms) when the detection ended, without
+  // the post-buffer offset.  0 means the event has been re-opened for coalescing.
+  struct LastEventInfo {
+    std::string event_id;
+    uint64_t    real_end_ms{0};
+  };
+  std::map<std::pair<std::string, std::string>, LastEventInfo> last_event_;
+
+  // Rate limiting: wall-clock creation timestamps (ms) of recent events per
+  // camera IP.  Entries older than one hour are purged before each check.
+  std::map<std::string, std::deque<uint64_t>> recent_event_times_;
+
+  uint64_t coalesce_window_ms_{30000};  // --coalesce_window_sec * 1000
+  uint32_t max_events_per_hour_{10};    // 0 = unlimited
 };
 
 }  // namespace onvif

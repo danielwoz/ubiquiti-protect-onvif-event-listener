@@ -100,6 +100,19 @@ ABSL_FLAG(std::string, rtsp_audio, "",
     "cameras that have audio capability (hasAudio=true). "
     "Values: 'enable' sets enableRtspAudio=true, 'disable' sets it to false. "
     "Empty (default) leaves the database unchanged.");
+ABSL_FLAG(int32_t, coalesce_window_sec, 30,
+    "Merge consecutive detections from the same camera into one event if the "
+    "new detection starts within this many seconds of the previous one ending. "
+    "Set to 0 to disable merging.");
+ABSL_FLAG(int32_t, max_events_per_hour, 10,
+    "Maximum new detection events created per camera per hour. Events beyond "
+    "this limit are dropped to prevent runaway recordings. Set to 0 for unlimited.");
+ABSL_FLAG(bool, coalesce_history, false,
+    "On startup, scan the last --coalesce_history_days days of events in the "
+    "database and merge consecutive detections from the same camera that are "
+    "within --coalesce_window_sec of each other. Applies to all cameras.");
+ABSL_FLAG(int32_t, coalesce_history_days, 30,
+    "Number of days to look back when --coalesce_history is set.");
 
 // ============================================================
 // JSON helpers (used only by EventRecorder)
@@ -236,6 +249,8 @@ int main(int argc, char* argv[]) {
   LOG(INFO) << "DB host     : " << (db_host.empty() ? "(default)" : db_host);
   LOG(INFO) << "Pre-buffer  : " << pre_buf_sec << " s";
   LOG(INFO) << "Post-buffer : " << post_buf_sec << " s";
+  LOG(INFO) << "Coalesce    : " << absl::GetFlag(FLAGS_coalesce_window_sec) << " s";
+  LOG(INFO) << "Max/hr      : " << absl::GetFlag(FLAGS_max_events_per_hour);
   LOG(INFO) << "Event log   : " << (event_log.empty() ? "(disabled)" : event_log);
   LOG(INFO) << "Raw log     : " << (raw_log.empty() ? "(disabled)" : raw_log);
   if (!thumbs_dir.empty())
@@ -266,6 +281,10 @@ int main(int argc, char* argv[]) {
   }
   onvif::DetectionRecorder& det_rec = **dr_or;
   det_rec.set_buffer(pre_buf_sec, post_buf_sec);
+  det_rec.set_coalesce_window(
+      static_cast<uint32_t>(absl::GetFlag(FLAGS_coalesce_window_sec)));
+  det_rec.set_max_events_per_hour(
+      static_cast<uint32_t>(absl::GetFlag(FLAGS_max_events_per_hour)));
 
   // Object type configuration.
   det_rec.set_default_object_type(absl::GetFlag(FLAGS_default_object_type));
@@ -358,6 +377,14 @@ int main(int argc, char* argv[]) {
   onvif::AlarmNotifier alarm_notifier(absl::GetFlag(FLAGS_uos_url));
   alarm_notifier.refresh_alarms();
   det_rec.set_alarm_notifier(&alarm_notifier);
+
+  // Optional startup coalescing: merge nearby events already in the database.
+  if (absl::GetFlag(FLAGS_coalesce_history)) {
+    const int days = absl::GetFlag(FLAGS_coalesce_history_days);
+    LOG(INFO) << "[coalesce_history] scanning last " << days << " day(s)...";
+    const int n = det_rec.coalesce_history(days);
+    LOG(INFO) << "[coalesce_history] done (" << n << " event(s) merged)";
+  }
 
   for (auto cam : cameras) {
     cam.max_consecutive_failures = 3;

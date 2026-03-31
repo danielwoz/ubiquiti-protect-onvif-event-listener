@@ -194,6 +194,10 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--model_dir` | _(empty)_ | Directory containing `nanodet_m.param` and `nanodet_m.bin` |
 | `--detect` | `false` | Enable NanoDet-M as fallback when the camera provides no ONVIF bbox (requires `--model_dir`) |
 | `--detect_override` | `false` | Always run NanoDet-M, ignoring the ONVIF bbox entirely (implies `--detect`) |
+| `--coalesce_window_sec` | `30` | Merge consecutive detections from the same camera into one event if the new detection starts within this many seconds of the previous one ending. Set to 0 to disable. |
+| `--max_events_per_hour` | `10` | Maximum new detection events per camera per hour. Events beyond this limit are dropped. Set to 0 for unlimited. |
+| `--coalesce_history` | `false` | On startup, scan the last `--coalesce_history_days` days of events and merge consecutive detections within `--coalesce_window_sec`. Applies to all cameras. |
+| `--coalesce_history_days` | `30` | Number of days to look back when `--coalesce_history` is set. |
 
 Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default is `kError`.
 `enable_verbose_logging()` has been removed from `OnvifListener`; set log level via absl before calling `run()`.

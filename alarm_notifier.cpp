@@ -194,14 +194,6 @@ void AlarmNotifier::http_post(const std::string& url, const std::string& body) {
 AlarmNotifier::AlarmNotifier(std::string uos_base_url)
     : uos_base_url_(std::move(uos_base_url)) {}
 
-void AlarmNotifier::set_base_url(const std::string& url) {
-  std::lock_guard<std::mutex> lk(mu_);
-  if (uos_base_url_ == url) return;
-  uos_base_url_ = url;
-  alarms_.clear();
-  last_refresh_ = {};
-}
-
 void AlarmNotifier::refresh_alarms() {
   std::string url;
   {
