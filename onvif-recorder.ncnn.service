@@ -1,0 +1,17 @@
+[Unit]
+Description=ONVIF Detection Recorder (NanoDet-M object detection)
+After=network.target postgresql@14-protect.service unifi-protect.service
+Wants=postgresql@14-protect.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root
+ExecStart=/root/onvif_recorder --detect_override --model_dir=/root/models
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/onvif-recorder.log
+StandardError=append:/var/log/onvif-recorder.log
+
+[Install]
+WantedBy=multi-user.target

@@ -168,19 +168,20 @@ int main(int argc, char* argv[]) {
     }
 
     // --- detect crop (or smart_crop fallback) ---
-    std::optional<jpeg_crop::BoundingBox> det_bbox;
-    if (detector) det_bbox = detector->detect(input);
+    std::optional<object_detect::Detection> det_result;
+    if (detector) det_result = detector->detect(input);
+    const jpeg_crop::BoundingBox* det_bbox_ptr =
+        det_result ? &det_result->bbox : nullptr;
 
     jpeg_crop::BoundingBox box =
-        jpeg_crop::select_crop_box(w, h, nullptr,
-                                   det_bbox ? &*det_bbox : nullptr);
+        jpeg_crop::select_crop_box(w, h, nullptr, det_bbox_ptr);
     auto detect = jpeg_crop::crop(input, box);
     if (detect.empty()) {
       std::cerr << "  skip " << in_path << ": detect_crop failed\n";
       ++fail;
       continue;
     }
-    const char* kind = det_bbox ? "detect" : "smart";
+    const char* kind = det_result ? "detect" : "smart";
     std::string detect_out =
         out_dir + "/" + stem(in_path) + "_" + kind + "_crop.jpg";
     if (!write_file(detect_out, detect)) {
@@ -193,9 +194,10 @@ int main(int argc, char* argv[]) {
               << "  " << w << "×" << h
               << "  →  smart_crop: " << smart.size() / 1024 << " KB"
               << "  |  " << kind << "_crop: " << detect.size() / 1024 << " KB";
-    if (det_bbox)
+    if (det_bbox_ptr)
       std::printf("  bbox=(%.3f,%.3f,%.3f,%.3f)",
-                  det_bbox->x, det_bbox->y, det_bbox->w, det_bbox->h);
+                  det_bbox_ptr->x, det_bbox_ptr->y,
+                  det_bbox_ptr->w, det_bbox_ptr->h);
     std::cout << "\n";
     ++ok;
   }

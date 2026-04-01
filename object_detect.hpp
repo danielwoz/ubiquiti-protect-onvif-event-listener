@@ -60,6 +60,35 @@ inline bool is_security_relevant(int class_id) {
   }
 }
 
+/// Result of a successful detection: bounding box + COCO class ID.
+struct Detection {
+  jpeg_crop::BoundingBox bbox;
+  int class_id;  // COCO class ID (see is_security_relevant())
+};
+
+/// Map a COCO class ID to a UniFi Protect detection type string.
+/// Covers the security-relevant subset detected by NanoDet-M.
+/// Returns "person" for class 0 and any unrecognised ID.
+inline std::string detection_type(int class_id) {
+  switch (class_id) {
+    case 1:   // bicycle
+    case 2:   // car
+    case 3:   // motorcycle
+    case 5:   // bus
+    case 7:   // truck
+      return "vehicle";
+    case 14:  // bird
+    case 15:  // cat
+    case 16:  // dog
+    case 17:  // horse
+    case 18:  // sheep
+    case 19:  // cow
+      return "animal";
+    default:
+      return "person";  // 0 = person; also fallback for anything else
+  }
+}
+
 class ObjectDetector {
  public:
   /// Load model from .param and .bin files.
@@ -74,10 +103,10 @@ class ObjectDetector {
   ObjectDetector& operator=(const ObjectDetector&) = delete;
 
   /// Detect objects in a JPEG image.
-  /// Returns the bounding box (in normalised [0,1] coordinates) of the
-  /// highest-confidence security-relevant object, or nullopt if none found
-  /// above the threshold.
-  std::optional<jpeg_crop::BoundingBox> detect(
+  /// Returns the highest-confidence security-relevant detection (bounding box
+  /// in normalised [0,1] coordinates + COCO class ID), or nullopt if none
+  /// found above the confidence threshold.
+  std::optional<Detection> detect(
       const std::vector<uint8_t>& jpeg_bytes) const;
 
  private:

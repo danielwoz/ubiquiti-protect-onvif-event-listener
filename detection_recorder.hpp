@@ -73,8 +73,10 @@ class AlarmNotifier;  // forward declaration; full definition in alarm_notifier.
  *   ONVIF "vehicle" -> smartDetectTypes ["vehicle"], smartDetectObjects.type "vehicle"
  *
  *   Generic motion events (CellMotionDetector, VideoSource/MotionAlarm) use the
- *   configured default_object_type (default "person").  Per-camera overrides
- *   (set_camera_object_type) replace the type for all events from that camera.
+ *   configured default_object_type (default "person") unless NanoDet-M is
+ *   enabled (--detect / --detect_override), in which case the COCO class
+ *   returned by the detector overrides the type (person / vehicle / animal).
+ *   Per-camera overrides (set_camera_object_type) take priority over NCNN.
  *   Valid object types: person, vehicle, animal, package.
  *
  * Backend selection

@@ -30,6 +30,49 @@ scp onvif_recorder_arm64 root@<router-ip>:/root/onvif_recorder
 scp onvif-recorder.service root@<router-ip>:/etc/systemd/system/
 ```
 
+### Step 2b — (Optional) Enable NanoDet-M object detection
+
+By default the recorder writes every detection as type **person**.  If your
+cameras use generic motion events (CellMotionDetector / VideoSource/MotionAlarm)
+rather than AI-specific events, you can enable NanoDet-M so the recorder
+automatically classifies each snapshot as **person**, **vehicle**, or **animal**.
+
+> **Performance guidance (Dream Router — 4 × Cortex-A55 cores):**
+> NanoDet-M takes ~158 ms per inference on one core (ARM64 NEON build).
+> At **1 detection/minute** this is 0.26% of 1 core ≈ **0.065% of total CPU**.
+> Even at 5 detections/minute across multiple cameras you are well under 0.5%
+> of total device CPU — safe to run alongside all normal Protect workloads.
+
+**Download the model files** (once, from your local machine):
+
+```bash
+# Download from ncnn-assets
+curl -LO https://github.com/nihui/ncnn-assets/raw/master/models/nanodet_m.param
+curl -LO https://github.com/nihui/ncnn-assets/raw/master/models/nanodet_m.bin
+
+# Copy to router
+ssh root@<router-ip> "mkdir -p /root/models"
+scp nanodet_m.param nanodet_m.bin root@<router-ip>:/root/models/
+```
+
+**Install the NanoDet-M service file instead of the standard one:**
+
+```bash
+scp onvif-recorder.ncnn.service root@<router-ip>:/etc/systemd/system/
+```
+
+Then in [Step 3](#step-3--enable-and-start-the-service), substitute
+`onvif-recorder.ncnn` for `onvif-recorder`:
+
+```bash
+systemctl enable onvif-recorder.ncnn
+systemctl start onvif-recorder.ncnn
+systemctl status onvif-recorder.ncnn
+```
+
+> The `.ncnn.service` file pre-configures `--detect_override --model_dir=/root/models`.
+> It is a drop-in replacement — do **not** enable both service files at the same time.
+
 ### Step 3 — Enable and start the service
 
 ```bash
@@ -72,7 +115,9 @@ The recorder maps ONVIF camera events to four UniFi Protect smart-detection type
 | `animal` | Generic motion when `--default_object_type=animal`, or any camera whose events are overridden via `--camera_object_types` |
 | `package` | Generic motion when `--default_object_type=package`, or any camera whose events are overridden via `--camera_object_types` |
 
-**Generic motion events** (CellMotionDetector, VideoSource/MotionAlarm) carry no object class — the recorder uses `--default_object_type` for these. AI-specific events (Human/Vehicle detections) are never affected by `--default_object_type`.
+**Generic motion events** (CellMotionDetector, VideoSource/MotionAlarm) carry no object class. By default the recorder uses `--default_object_type` for these. When NanoDet-M is enabled (`--detect` or `--detect_override`), the detected COCO class overrides the default type — so a snapshot containing a car is stored as `vehicle` even though the camera reported only "motion". Per-camera `--camera_object_types` overrides always take priority over NanoDet-M.
+
+AI-specific events (Human/Vehicle detections from FieldDetector, HumanShapeDetect, etc.) are never affected by `--default_object_type` or NanoDet-M class inference.
 
 **Per-camera overrides** (`--camera_object_types`) replace the detection type for every event from the named camera, including AI events. This is useful for wildlife cameras or entrance monitors where you always want a specific type regardless of what the camera reports.
 
@@ -185,10 +230,27 @@ set the flag once, restart the service, then remove the flag and restart again.
 
 The recorder uses negligible CPU at normal camera workloads:
 
+### ONVIF event processing
+
 | Load | CPU (single core) | Share of total CPU (4 cores) |
 |------|-------------------|------------------------------|
 | 60 ev/min (typical) | 0.036% of 1 core | **< 0.01%** |
 | 2,714 ev/s (benchmark max) | 97.5% of 1 core | 24.4% |
+
+### NanoDet-M object detection (optional)
+
+NanoDet-M runs on one core using ARM64 NEON SIMD (compiled from source, no GPU):
+
+| Metric | Value |
+|--------|-------|
+| Inference latency | ~158 ms / detection |
+| Throughput | ~6 inferences / second |
+| 1 detection/minute | 0.26% of 1 core ≈ **0.065% of total CPU** |
+| 5 detections/minute | 1.3% of 1 core ≈ **0.33% of total CPU** |
+
+NanoDet-M is safe to run on a Dream Router at typical home-camera workloads.
+Only detections that reach the recorder trigger an inference — idle cameras
+and cameras that send AI events (which already include a bounding box) add zero cost.
 
 ---
 

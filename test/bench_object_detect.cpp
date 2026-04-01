@@ -91,8 +91,9 @@ int main(int argc, char* argv[]) {
     auto result = det->detect(input);
     if (result) {
       std::fprintf(stderr,
-                   "Warmup detection: bbox=(%.3f, %.3f, %.3f, %.3f)\n",
-                   result->x, result->y, result->w, result->h);
+                   "Warmup detection: bbox=(%.3f, %.3f, %.3f, %.3f) class=%d\n",
+                   result->bbox.x, result->bbox.y,
+                   result->bbox.w, result->bbox.h, result->class_id);
     } else {
       std::fprintf(stderr, "Warmup: no security-relevant detection\n");
     }

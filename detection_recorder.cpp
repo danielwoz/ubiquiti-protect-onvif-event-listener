@@ -51,9 +51,10 @@ namespace onvif {
 namespace {
 
 struct Detection {
-  std::string type;    // "human" or "vehicle"
-  bool        started;  // true = detection began, false = detection ended
-  std::string time;    // ISO-8601 UTC event_time from the OnvifEvent
+  std::string type;          // "human", "vehicle", or fallback type
+  bool        started;       // true = detection began, false = detection ended
+  std::string time;          // ISO-8601 UTC event_time from the OnvifEvent
+  bool        from_fallback{false};  // true for generic motion (no ONVIF class)
 };
 
 std::optional<Detection> classify(const OnvifEvent& ev,
@@ -102,21 +103,24 @@ std::optional<Detection> classify(const OnvifEvent& ev,
   }
 
   // --- Generic CellMotionDetector/Motion (Amcrest, Lorex, Dahua, etc.) ---
-  // Basic pixel-change motion; no object class available so use fallback_type.
+  // Basic pixel-change motion; no object class from ONVIF.  Uses fallback_type
+  // unless NanoDet-M (--detect / --detect_override) infers a class from the
+  // snapshot — marked from_fallback=true so on_event() can apply that override.
   if (ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion") {
     auto it = ev.data.find("IsMotion");
     if (it == ev.data.end()) return {};
-    return Detection{fallback_type, it->second == "true", ev.event_time};
+    return Detection{fallback_type, it->second == "true", ev.event_time, true};
   }
 
   // --- VideoSource/MotionAlarm fallback ---
   // Fires on most cameras alongside CellMotionDetector.  Used only for
   // cameras that have neither CellMotionDetector nor AI events (suppression
-  // is handled in on_event()).
+  // is handled in on_event()).  Also marked from_fallback=true for NCNN
+  // type inference.
   if (ev.topic == "tns1:VideoSource/MotionAlarm") {
     auto it = ev.data.find("State");
     if (it == ev.data.end()) return {};
-    return Detection{fallback_type, it->second == "true", ev.event_time};
+    return Detection{fallback_type, it->second == "true", ev.event_time, true};
   }
 
   return {};
@@ -943,8 +947,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     const std::string sdo_id     = generate_uuid();
     const std::string sdr_id     = generate_uuid();
     const std::string thumb_id   = db_->make_thumbnail_id(ev.camera_ip, ts_ms);
-    const std::string sdt_json   = smart_detect_types_json(det->type);
-    const std::string obj_type   = sdo_type(det->type);
+    std::string sdt_json   = smart_detect_types_json(det->type);
+    std::string obj_type   = sdo_type(det->type);
     const std::string attributes = "{\"confidence\":0}";
 
     // 3. Fetch snapshot if the backend needs it.
@@ -960,11 +964,21 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         if (jpeg_read_dimensions(snapshot, &img_w, &img_h)) {
           const jpeg_crop::BoundingBox* onvif_bbox =
               (ev.bbox && !det_override) ? &*ev.bbox : nullptr;
-          std::optional<jpeg_crop::BoundingBox> det_result;
+          std::optional<object_detect::Detection> det_result;
           if (det_ptr && (!onvif_bbox || det_override))
             det_result = det_ptr->detect(snapshot);
           const jpeg_crop::BoundingBox* det_bbox =
-              det_result ? &*det_result : nullptr;
+              det_result ? &det_result->bbox : nullptr;
+          // If this was a generic motion event (no ONVIF class) and NCNN
+          // identified a security-relevant object, use its class to set the
+          // detection type (person / vehicle / animal) in all tables.
+          // Per-camera type overrides (cam_override_type) take priority.
+          if (det->from_fallback && cam_override_type.empty() && det_result) {
+            const std::string inferred =
+                object_detect::detection_type(det_result->class_id);
+            obj_type = inferred;
+            sdt_json = smart_detect_types_json(inferred);
+          }
           // Only crop when we have a basis: an ONVIF bbox, or a loaded
           // detector (which may yield a result or fall back to smart-crop).
           // Without either, store the full uncropped image.

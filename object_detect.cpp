@@ -219,7 +219,7 @@ ObjectDetector::~ObjectDetector() = default;
 // detect
 // ---------------------------------------------------------------------------
 
-std::optional<jpeg_crop::BoundingBox> ObjectDetector::detect(
+std::optional<Detection> ObjectDetector::detect(
     const std::vector<uint8_t>& jpeg_bytes) const {
 #ifndef WITH_NCNN
   (void)jpeg_bytes;
@@ -358,7 +358,7 @@ std::optional<jpeg_crop::BoundingBox> ObjectDetector::detect(
                            h_orig / static_cast<float>(orig_h)));
 
   if (bb.w <= 0.0f || bb.h <= 0.0f) return std::nullopt;
-  return bb;
+  return Detection{bb, best->cls};
 #endif  // WITH_NCNN
 }
 
