@@ -7,7 +7,7 @@ Wants=postgresql@14-protect.service
 Type=simple
 User=root
 WorkingDirectory=/root
-ExecStart=/root/onvif_recorder --detect_override --model_dir=/root/models
+ExecStart=/root/onvif_recorder
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:/var/log/onvif-recorder.log
