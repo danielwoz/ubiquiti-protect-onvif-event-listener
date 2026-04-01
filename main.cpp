@@ -379,6 +379,15 @@ int main(int argc, char* argv[]) {
   det_rec.set_alarm_notifier(&alarm_notifier);
 
   // Optional startup coalescing: merge nearby events already in the database.
+  // Purge stuck-open events (end IS NULL older than 5 minutes) left behind
+  // by a previous crash or rapid-fire "started" bursts from cameras.
+  // Must run before coalesce_history so the NULL-end rows don't interfere.
+  {
+    const int n = det_rec.purge_stale_open_events(300000);
+    if (n > 0)
+      LOG(INFO) << "[startup] purged " << n << " stuck-open event(s)";
+  }
+
   if (absl::GetFlag(FLAGS_coalesce_history)) {
     const int days = absl::GetFlag(FLAGS_coalesce_history_days);
     LOG(INFO) << "[coalesce_history] scanning last " << days << " day(s)...";

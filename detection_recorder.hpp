@@ -190,6 +190,14 @@ class DetectionRecorder {
   /// Returns the total number of rows deleted across all tables.
   int purge_orphaned_rows();
 
+  /// Delete stuck-open events (end IS NULL) from third-party cameras whose
+  /// start timestamp is older than @p older_than_ms milliseconds.  These are
+  /// left behind when the service is restarted mid-detection or when a camera
+  /// fires rapid "started" events without matching "ended" events.  Dependent
+  /// rows (smartDetectRaws, thumbnails, smartDetectObjects, detectionLabels)
+  /// are removed first.  Returns the number of event rows deleted.
+  int purge_stale_open_events(uint64_t older_than_ms = 300000);
+
   /// Set the object detector used to locate subjects for thumbnail cropping.
   /// If not called (or set to nullptr), falls back to the smart-crop heuristic.
   /// The detector must outlive the DetectionRecorder.
@@ -326,6 +334,11 @@ class DetectionRecorder {
     /// Delete detectionLabels rows whose eventId no longer references an
     /// existing event. Returns the number of rows deleted.
     virtual int purge_orphaned_detection_labels() { return 0; }
+
+    /// Delete stuck-open events (end IS NULL) for third-party cameras whose
+    /// start is older than older_than_ms, plus their dependent rows.
+    /// Returns the number of event rows deleted.
+    virtual int purge_stale_open_events(uint64_t /*older_than_ms*/) { return 0; }
   };
 
   /// Factory for testing: injects a custom backend (skips PostgreSQL connect).

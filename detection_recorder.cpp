@@ -719,6 +719,95 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         "purge_orphaned_detection_labels");
   }
 
+  int purge_stale_open_events(uint64_t older_than_ms) override {
+    maybe_reconnect();
+    const std::string cutoff = std::to_string(
+        static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count())
+        - older_than_ms);
+    const char* p[] = { cutoff.c_str() };
+
+    // Delete dependent rows first (smartDetectRaws by timestamp window).
+    PGresult* r = PQexecParams(conn_,
+        "DELETE FROM \"smartDetectRaws\" sdr"
+        " USING events e"
+        " JOIN cameras c ON c.id = e.\"cameraId\""
+        "   AND c.\"isThirdPartyCamera\" = true"
+        " WHERE e.type = 'smartDetectZone'"
+        "   AND e.\"end\" IS NULL"
+        "   AND e.start < $1::bigint"
+        "   AND sdr.\"cameraId\" = e.\"cameraId\""
+        "   AND sdr.timestamp >= e.start"
+        "   AND sdr.timestamp <= e.start + 60000",
+        1, nullptr, p, nullptr, nullptr, 0);
+    if (PQresultStatus(r) != PGRES_COMMAND_OK)
+      LOG(ERROR) << "[pg] purge_stale_open_events (raws): " << pg_errmsg(r);
+    PQclear(r);
+
+    r = PQexecParams(conn_,
+        "DELETE FROM thumbnails t"
+        " USING events e"
+        " JOIN cameras c ON c.id = e.\"cameraId\""
+        "   AND c.\"isThirdPartyCamera\" = true"
+        " WHERE e.type = 'smartDetectZone'"
+        "   AND e.\"end\" IS NULL"
+        "   AND e.start < $1::bigint"
+        "   AND t.\"eventId\" = e.id",
+        1, nullptr, p, nullptr, nullptr, 0);
+    if (PQresultStatus(r) != PGRES_COMMAND_OK)
+      LOG(ERROR) << "[pg] purge_stale_open_events (thumbnails): " << pg_errmsg(r);
+    PQclear(r);
+
+    r = PQexecParams(conn_,
+        "DELETE FROM \"smartDetectObjects\" o"
+        " USING events e"
+        " JOIN cameras c ON c.id = e.\"cameraId\""
+        "   AND c.\"isThirdPartyCamera\" = true"
+        " WHERE e.type = 'smartDetectZone'"
+        "   AND e.\"end\" IS NULL"
+        "   AND e.start < $1::bigint"
+        "   AND o.\"eventId\" = e.id",
+        1, nullptr, p, nullptr, nullptr, 0);
+    if (PQresultStatus(r) != PGRES_COMMAND_OK)
+      LOG(ERROR) << "[pg] purge_stale_open_events (sdo): " << pg_errmsg(r);
+    PQclear(r);
+
+    r = PQexecParams(conn_,
+        "DELETE FROM \"detectionLabels\" dl"
+        " USING events e"
+        " JOIN cameras c ON c.id = e.\"cameraId\""
+        "   AND c.\"isThirdPartyCamera\" = true"
+        " WHERE e.type = 'smartDetectZone'"
+        "   AND e.\"end\" IS NULL"
+        "   AND e.start < $1::bigint"
+        "   AND dl.\"eventId\" = e.id",
+        1, nullptr, p, nullptr, nullptr, 0);
+    if (PQresultStatus(r) != PGRES_COMMAND_OK)
+      LOG(ERROR) << "[pg] purge_stale_open_events (labels): " << pg_errmsg(r);
+    PQclear(r);
+
+    // Delete the stale event rows and return count.
+    r = PQexecParams(conn_,
+        "DELETE FROM events e"
+        " USING cameras c"
+        " WHERE c.id = e.\"cameraId\""
+        "   AND c.\"isThirdPartyCamera\" = true"
+        "   AND e.type = 'smartDetectZone'"
+        "   AND e.\"end\" IS NULL"
+        "   AND e.start < $1::bigint",
+        1, nullptr, p, nullptr, nullptr, 0);
+    int deleted = 0;
+    if (PQresultStatus(r) == PGRES_COMMAND_OK) {
+      const char* tag = PQcmdTuples(r);
+      if (tag && *tag) deleted = std::atoi(tag);
+    } else {
+      LOG(ERROR) << "[pg] purge_stale_open_events (events): " << pg_errmsg(r);
+    }
+    PQclear(r);
+    return deleted;
+  }
+
   void write_thumbnail(const std::string&              thumb_id,
                        const std::string&              event_id,
                        const std::string&              camera_ip,
@@ -1145,6 +1234,10 @@ int DetectionRecorder::purge_orphaned_rows() {
   total += db_->purge_orphaned_smart_detect_objects();
   total += db_->purge_orphaned_detection_labels();
   return total;
+}
+
+int DetectionRecorder::purge_stale_open_events(uint64_t older_than_ms) {
+  return db_->purge_stale_open_events(older_than_ms);
 }
 
 void DetectionRecorder::set_default_object_type(const std::string& type) {
