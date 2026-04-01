@@ -57,6 +57,11 @@ struct CameraConfig {
     std::string user;
     std::string password;
     std::string snapshot_url;  ///< Optional HTTP URL used to capture a snapshot image
+
+    /// Returns "http://host" or "http://host:port".
+    /// All HTTP URL construction must go through this method so that port
+    /// handling is centralised here rather than scattered at each call site.
+    std::string http_base() const { return "http://" + ip; }
     int retry_interval_sec{10};      ///< Seconds to wait before retrying a failed subscription
     ///< Pause and reset after this many consecutive failures (0 = unlimited)
     int max_consecutive_failures{0};

@@ -133,6 +133,15 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     if (!port.empty() && port != "80" && port != "0")
       ip += ":" + port;
 
+    // Build the config first so we can use http_base() for URL construction,
+    // keeping "http://" + ip in exactly one place.
+    onvif::CameraConfig cam;
+    cam.id       = std::string(id_c);
+    cam.mac      = mac_c ? std::string(mac_c) : std::string();
+    cam.ip       = ip;
+    cam.user     = username;
+    cam.password = password;
+
     // Rebase snapshot URL onto the configured host:port so that cameras on
     // non-standard ports use the correct address regardless of what Protect
     // stored in snapshotUrl.
@@ -140,13 +149,11 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
       const auto scheme_end = snapshot_url.find("://");
       const auto path_start = (scheme_end == std::string::npos) ? 0 : scheme_end + 3;
       const auto slash      = snapshot_url.find('/', path_start);
-      const std::string path = (slash == std::string::npos) ? "/" : snapshot_url.substr(slash);
-      snapshot_url = "http://" + ip + path;
+      cam.snapshot_url = cam.http_base()
+          + ((slash == std::string::npos) ? "/" : snapshot_url.substr(slash));
     }
 
-    cameras.push_back({std::string(id_c),
-                       mac_c ? std::string(mac_c) : std::string(),
-                       ip, username, password, snapshot_url});
+    cameras.push_back(cam);
   }
 
   PQclear(res);

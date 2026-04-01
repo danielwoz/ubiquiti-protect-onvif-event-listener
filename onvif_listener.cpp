@@ -602,11 +602,11 @@ class CameraWorker {
   }
 
   std::string event_url() const {
-    return "http://" + cfg_.ip + "/onvif/event_service";
+    return cfg_.http_base() + "/onvif/event_service";
   }
 
   std::string device_url() const {
-    return "http://" + cfg_.ip + "/onvif/device_service";
+    return cfg_.http_base() + "/onvif/device_service";
   }
 
   // Calls GetServices (with capabilities) on the device management endpoint to
@@ -659,7 +659,7 @@ class CameraWorker {
         if (xaddr.empty()) continue;
 
         if (ns.find("events") != std::string::npos && result.event_url == event_url()) {
-          result.event_url = "http://" + cfg_.ip + url_path(xaddr);
+          result.event_url = cfg_.http_base() + url_path(xaddr);
           LOG(INFO) << '[' << cfg_.ip << "] event service URL: " << result.event_url;
         } else if (ns.find("alarm") != std::string::npos) {
           LOG(INFO) << '[' << cfg_.ip << "] alarm service URL: " << xaddr;
