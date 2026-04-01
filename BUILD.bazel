@@ -22,16 +22,14 @@ _PQ     = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libpq"],
 _JPEG   = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libjpeg"],
                   "//conditions:default":    ["//third_party:libjpeg_turbo"]})
 
-# NCNN dependency: host builds use rules_foreign_cc CMake; ARM64 has no NCNN yet.
+# NCNN dependency: built from source for both x86 and ARM64.
+# ARM64 uses a separate cmake target that sets cross-compilation flags.
 _NCNN_DEPS = select({
-    "@platforms//cpu:aarch64": [],
+    "@platforms//cpu:aarch64": ["//third_party:ncnn_arm64"],
     "//conditions:default":    ["//third_party:ncnn"],
 })
 
-_NCNN_DEFS = select({
-    "@platforms//cpu:aarch64": [],
-    "//conditions:default":    ["WITH_NCNN"],
-})
+_NCNN_DEFS = ["WITH_NCNN"]
 
 cc_library(
     name = "onvif_listener",

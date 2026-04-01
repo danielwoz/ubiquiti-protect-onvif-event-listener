@@ -128,6 +128,7 @@ done
 )
 
 # ---- NCNN (downloaded via http_archive) ----
+# x86 host build -- native, no cross-compilation flags needed.
 cmake(
     name = "ncnn",
     lib_source = "@ncnn//:all",
@@ -140,6 +141,32 @@ cmake(
         "NCNN_BUILD_BENCHMARK": "OFF",
         "NCNN_OPENMP": "OFF",
         "NCNN_SHARED_LIB": "OFF",
+    },
+    visibility = ["//visibility:public"],
+)
+
+# ARM64 cross-compiled build.
+# CMAKE_SYSTEM_NAME + CMAKE_SYSTEM_PROCESSOR tell CMake we are cross-compiling:
+#   - try_run() checks are skipped (ARM64 binaries can't execute on the x86 host)
+#   - NCNN detects aarch64 and enables NEON SIMD intrinsics automatically
+# The Bazel ARM64 toolchain wrapper already passes --sysroot and
+# -target aarch64-linux-gnu to clang via the rules_foreign_cc toolchain file,
+# so no additional sysroot or compiler flags are needed here.
+cmake(
+    name = "ncnn_arm64",
+    lib_source = "@ncnn//:all",
+    out_static_libs = ["libncnn.a"],
+    cache_entries = {
+        "NCNN_BUILD_TOOLS": "OFF",
+        "NCNN_BUILD_EXAMPLES": "OFF",
+        "NCNN_VULKAN": "OFF",
+        "NCNN_BUILD_TESTS": "OFF",
+        "NCNN_BUILD_BENCHMARK": "OFF",
+        "NCNN_OPENMP": "OFF",
+        "NCNN_SHARED_LIB": "OFF",
+        "CMAKE_SYSTEM_NAME": "Linux",
+        "CMAKE_SYSTEM_PROCESSOR": "aarch64",
+        "CMAKE_CROSSCOMPILING": "TRUE",
     },
     visibility = ["//visibility:public"],
 )

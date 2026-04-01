@@ -88,7 +88,7 @@ detection_recorder.hpp/.cpp   — Detection → SQLite/PostgreSQL recorder
 ubv_thumbnail.hpp/.cpp        — UBV container encode/decode (thumbnail storage)
 jpeg_crop.hpp/.cpp            — JPEG decode/crop/re-encode via libjpeg
 object_detect.hpp/.cpp        — NanoDet-M on-device object detection via NCNN
-                                  Guarded by WITH_NCNN; stub returns nullopt without NCNN
+                                  Built with WITH_NCNN on both x86 and ARM64 (NEON SIMD)
 unifi_camera_config.hpp/.cpp  — Load camera credentials from UniFi Protect DB
 main.cpp                      — Binary entry point
 
@@ -138,9 +138,13 @@ Optionally, per-camera UBV thumbnail files are also written to `ONVIF_UBV_DIR` i
 - `"end"` must be double-quoted in SQL (reserved word).
 - Thumbnail crop priority: ONVIF `tt:BoundingBox` (if w>0 && h>0) → ML detector
   (`ObjectDetector::detect()`) → smart_crop heuristic (square at 60% vertical centre).
-- `ObjectDetector` uses NanoDet-M (NCNN) on host; ARM64 builds compile without
-  `WITH_NCNN` and always return `nullopt` (smart_crop fallback).  Pass `--model_dir`
-  with `--detect` (or `--detect_override`) to enable on-device detection.
+- `ObjectDetector` uses NanoDet-M (NCNN) on both x86 and ARM64.  NCNN is built
+  from source via `rules_foreign_cc` cmake() for both architectures; the ARM64
+  target (`//third_party:ncnn_arm64`) sets `CMAKE_SYSTEM_NAME=Linux`,
+  `CMAKE_SYSTEM_PROCESSOR=aarch64`, and `CMAKE_CROSSCOMPILING=TRUE` so CMake
+  enters cross-compilation mode and enables NEON SIMD automatically.  Pass
+  `--model_dir` with `--detect` (or `--detect_override`) to enable on-device
+  detection.
 - Thumbnail crop modes (default → ONVIF bbox only; no bbox → full image stored uncropped):
   - default: ONVIF bbox → crop; no bbox → full image
   - `--detect`: ONVIF bbox → crop; no bbox → NanoDet-M → full image
@@ -196,7 +200,7 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--detect_override` | `false` | Always run NanoDet-M, ignoring the ONVIF bbox entirely (implies `--detect`) |
 | `--coalesce_window_sec` | `30` | Merge consecutive detections from the same camera into one event if the new detection starts within this many seconds of the previous one ending. Set to 0 to disable. |
 | `--max_events_per_hour` | `10` | Maximum new detection events per camera per hour. Events beyond this limit are dropped. Set to 0 for unlimited. |
-| `--coalesce_history` | `false` | On startup, scan the last `--coalesce_history_days` days of events and merge consecutive detections within `--coalesce_window_sec`. Applies to all cameras. |
+| `--coalesce_history` | `true` | On startup, scan the last `--coalesce_history_days` days of events and merge consecutive detections from the same third-party camera within `--coalesce_window_sec`. Only third-party (ONVIF) cameras are affected. |
 | `--coalesce_history_days` | `30` | Number of days to look back when `--coalesce_history` is set. |
 
 Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default is `kError`.
@@ -204,6 +208,68 @@ Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default 
 
 `ubv_extract` accepts `--db_host` (default `127.0.0.1`) to override the Protect DB host.
 `gen_examples` accepts `--model_dir` for the NanoDet-M model path.
+
+## NanoDet-M object detection model
+
+NanoDet-M is used for thumbnail subject cropping when the camera does not provide
+an ONVIF bounding box.  It is enabled with `--detect` (fallback) or
+`--detect_override` (always run), both of which require `--model_dir`.
+
+### Downloading the model files
+
+The model files are hosted in the
+[nihui/ncnn-assets](https://github.com/nihui/ncnn-assets) repository.
+Bazel downloads them automatically when running `bench_object_detect` or any
+target that depends on `object_detect`.  To fetch them manually:
+
+```bash
+# These are the exact URLs used by the Bazel http_file rules in WORKSPACE.
+curl -L -o nanodet_m.param \
+  https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.param
+curl -L -o nanodet_m.bin \
+  https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.bin
+```
+
+Both files must live in the same directory, which is passed to `--model_dir`.
+
+### Running on an x86 host
+
+```bash
+# Place model files in a local directory, e.g. ~/models/
+mkdir -p ~/models
+cp nanodet_m.param nanodet_m.bin ~/models/
+
+# Run with NanoDet-M as a fallback (fires when the camera has no bbox)
+./bazel-bin/onvif_recorder --detect --model_dir=$HOME/models
+
+# Run with NanoDet-M always overriding the camera bbox
+./bazel-bin/onvif_recorder --detect_override --model_dir=$HOME/models
+```
+
+### Deploying the model to a Dream Router / NVR
+
+NCNN is now built from source for ARM64 (with NEON SIMD).  After copying the
+binary to the router, copy the model files too:
+
+```bash
+# Copy model files to the router
+ssh root@<router-ip> "mkdir -p /root/models"
+scp nanodet_m.param nanodet_m.bin root@<router-ip>:/root/models/
+```
+
+Then update the service file to pass `--model_dir` (and `--detect` or
+`--detect_override`) to the recorder:
+
+```ini
+[Service]
+ExecStart=/root/onvif_recorder --detect --model_dir=/root/models
+```
+
+Reload and restart after editing the service file:
+
+```bash
+ssh root@<router-ip> "systemctl daemon-reload && systemctl restart onvif-recorder"
+```
 
 ## Deploying to a Dream Router / NVR
 
