@@ -892,19 +892,30 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     {
       std::lock_guard<std::mutex> lk(mu_);
 
-      // Coalescing: if the previous detection for this key ended recently,
-      // re-open the existing event row instead of creating a new one.
+      // Coalescing: merge into an existing event rather than creating a new one.
+      // Two cases:
+      //   1. Key is already open: camera re-fired "started" before "ended".
+      //      Reuse the open event so the burst stays as a single event in the DB.
+      //   2. Previous detection ended recently (within coalesce_window_ms_):
+      //      re-open the last event so back-to-back detections merge naturally.
       // We don't return early: an SDO + detection labels are still inserted so
       // each detection occurrence is recorded within the coalesced event.
       if (coalesce_window_ms_ > 0) {
-        auto lei = last_event_.find(key);
-        if (lei != last_event_.end() && lei->second.real_end_ms > 0) {
-          const uint64_t cur = now_ms();
-          if (cur >= lei->second.real_end_ms &&
-              cur - lei->second.real_end_ms <= coalesce_window_ms_) {
-            coalesced_event_id = lei->second.event_id;
-            open_[key] = coalesced_event_id;
-            lei->second.real_end_ms = 0;  // mark as re-opened
+        auto oit = open_.find(key);
+        if (oit != open_.end()) {
+          // Case 1: event is still open — reuse it without touching last_event_.
+          coalesced_event_id = oit->second;
+        } else {
+          // Case 2: event ended recently — re-open it.
+          auto lei = last_event_.find(key);
+          if (lei != last_event_.end() && lei->second.real_end_ms > 0) {
+            const uint64_t cur = now_ms();
+            if (cur >= lei->second.real_end_ms &&
+                cur - lei->second.real_end_ms <= coalesce_window_ms_) {
+              coalesced_event_id = lei->second.event_id;
+              open_[key] = coalesced_event_id;
+              lei->second.real_end_ms = 0;  // mark as re-opened
+            }
           }
         }
       }
