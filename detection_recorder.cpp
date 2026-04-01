@@ -629,7 +629,17 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     // Extend the surviving event's end time.
     update_event_end(into_id, new_end_ms, now_str);
     // Delete dependent rows and the merged event itself.
+    // smartDetectRaws has no eventId column; delete by matching cameraId and
+    // timestamp range against the event row before it is removed.
     const char* p[] = { from_id.c_str() };
+    exec_params(
+        "DELETE FROM \"smartDetectRaws\" sdr"
+        " USING events e"
+        " WHERE e.id = $1"
+        "   AND sdr.\"cameraId\" = e.\"cameraId\""
+        "   AND sdr.timestamp >= e.start"
+        "   AND sdr.timestamp <= e.\"end\"",
+        1, p);
     exec_params(
         "DELETE FROM thumbnails WHERE \"eventId\" = $1", 1, p);
     exec_params(
@@ -638,6 +648,36 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         "DELETE FROM \"detectionLabels\" WHERE \"eventId\" = $1", 1, p);
     exec_params(
         "DELETE FROM events WHERE id = $1", 1, p);
+  }
+
+  int purge_orphaned_smart_detect_raws() override {
+    maybe_reconnect();
+    // Delete smartDetectRaws rows for third-party cameras whose timestamp does
+    // not fall within any existing smartDetectZone event for that camera.
+    // This catches rows left behind by historical coalesce operations that ran
+    // before the smartDetectRaws cleanup was added.
+    PGresult* res = PQexec(conn_,
+        "DELETE FROM \"smartDetectRaws\" sdr"
+        " USING cameras c"
+        " WHERE c.id = sdr.\"cameraId\""
+        "   AND c.\"isThirdPartyCamera\" = true"
+        "   AND NOT EXISTS ("
+        "       SELECT 1 FROM events e"
+        "       WHERE e.\"cameraId\" = sdr.\"cameraId\""
+        "         AND e.type = 'smartDetectZone'"
+        "         AND e.start <= sdr.timestamp"
+        "         AND (e.\"end\" IS NULL OR e.\"end\" >= sdr.timestamp)"
+        "   )");
+    int deleted = 0;
+    if (PQresultStatus(res) == PGRES_COMMAND_OK) {
+      const char* tag = PQcmdTuples(res);
+      if (tag && *tag) deleted = std::atoi(tag);
+    } else {
+      LOG(ERROR) << "[pg] purge_orphaned_smart_detect_raws failed: "
+                 << pg_errmsg(res);
+    }
+    PQclear(res);
+    return deleted;
   }
 
   void write_thumbnail(const std::string&              thumb_id,
@@ -1036,6 +1076,10 @@ int DetectionRecorder::coalesce_history(int days) {
     LOG(INFO) << "[coalesce_history] merged " << merged
               << " event(s) over the last " << days << " day(s)";
   return merged;
+}
+
+int DetectionRecorder::purge_orphaned_smart_detect_raws() {
+  return db_->purge_orphaned_smart_detect_raws();
 }
 
 void DetectionRecorder::set_default_object_type(const std::string& type) {

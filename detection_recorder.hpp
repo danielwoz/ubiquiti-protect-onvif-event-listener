@@ -178,6 +178,13 @@ class DetectionRecorder {
   /// coalesce_window_sec is 0.
   int coalesce_history(int days = 30);
 
+  /// Delete smartDetectRaws rows for third-party cameras whose timestamp does
+  /// not fall within any existing smartDetectZone event for that camera.
+  /// Intended to be called once at startup to clean up rows orphaned by
+  /// coalesce operations that pre-date the smartDetectRaws cleanup fix.
+  /// Returns the number of rows deleted.
+  int purge_orphaned_smart_detect_raws();
+
   /// Set the object detector used to locate subjects for thumbnail cropping.
   /// If not called (or set to nullptr), falls back to the smart-crop heuristic.
   /// The detector must outlive the DetectionRecorder.
@@ -292,11 +299,16 @@ class DetectionRecorder {
 
     /// Extend the surviving event's end to new_end_ms, then delete the merged
     /// event (from_id) and its dependent rows (smartDetectObjects, thumbnails,
-    /// detectionLabels).
+    /// detectionLabels, smartDetectRaws).
     virtual void coalesce_events(const std::string& /*into_id*/,
                                   uint64_t           /*new_end_ms*/,
                                   const std::string& /*from_id*/,
                                   const std::string& /*now_str*/) {}
+
+    /// Delete smartDetectRaws rows for third-party cameras whose timestamp
+    /// does not fall within any existing smartDetectZone event for that camera.
+    /// Returns the number of rows deleted.
+    virtual int purge_orphaned_smart_detect_raws() { return 0; }
   };
 
   /// Factory for testing: injects a custom backend (skips PostgreSQL connect).
