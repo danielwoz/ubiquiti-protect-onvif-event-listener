@@ -591,12 +591,13 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     const std::string since_str = std::to_string(since_ms);
     const char* params[] = { since_str.c_str() };
     PGresult* res = PQexecParams(conn_,
-      "SELECT id, \"cameraId\", \"smartDetectTypes\"::text, start, \"end\""
-      " FROM events"
-      " WHERE type = 'smartDetectZone'"
-      "   AND \"end\" IS NOT NULL"
-      "   AND start >= $1::bigint"
-      " ORDER BY \"cameraId\", \"smartDetectTypes\"::text, start",
+      "SELECT e.id, e.\"cameraId\", e.\"smartDetectTypes\"::text, e.start, e.\"end\""
+      " FROM events e"
+      " JOIN cameras c ON c.id = e.\"cameraId\" AND c.\"isThirdPartyCamera\" = true"
+      " WHERE e.type = 'smartDetectZone'"
+      "   AND e.\"end\" IS NOT NULL"
+      "   AND e.start >= $1::bigint"
+      " ORDER BY e.\"cameraId\", e.\"smartDetectTypes\"::text, e.start",
       1, nullptr, params, nullptr, nullptr, 0);
     std::vector<IDbBackend::EventSummary> result;
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {

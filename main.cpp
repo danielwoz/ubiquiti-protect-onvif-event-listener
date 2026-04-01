@@ -107,10 +107,10 @@ ABSL_FLAG(int32_t, coalesce_window_sec, 30,
 ABSL_FLAG(int32_t, max_events_per_hour, 10,
     "Maximum new detection events created per camera per hour. Events beyond "
     "this limit are dropped to prevent runaway recordings. Set to 0 for unlimited.");
-ABSL_FLAG(bool, coalesce_history, false,
+ABSL_FLAG(bool, coalesce_history, true,
     "On startup, scan the last --coalesce_history_days days of events in the "
-    "database and merge consecutive detections from the same camera that are "
-    "within --coalesce_window_sec of each other. Applies to all cameras.");
+    "database and merge consecutive detections from the same third-party camera "
+    "that are within --coalesce_window_sec of each other.");
 ABSL_FLAG(int32_t, coalesce_history_days, 30,
     "Number of days to look back when --coalesce_history is set.");
 
