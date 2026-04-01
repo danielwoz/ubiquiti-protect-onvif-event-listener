@@ -807,26 +807,30 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     const object_detect::ObjectDetector* det_ptr;
     bool det_override;
     AlarmNotifier* alarm_notif;
+    // Non-empty when merging this detection into an existing event row.
+    std::string coalesced_event_id;
     {
       std::lock_guard<std::mutex> lk(mu_);
 
       // Coalescing: if the previous detection for this key ended recently,
       // re-open the existing event row instead of creating a new one.
+      // We don't return early: an SDO + detection labels are still inserted so
+      // each detection occurrence is recorded within the coalesced event.
       if (coalesce_window_ms_ > 0) {
         auto lei = last_event_.find(key);
         if (lei != last_event_.end() && lei->second.real_end_ms > 0) {
           const uint64_t cur = now_ms();
           if (cur >= lei->second.real_end_ms &&
               cur - lei->second.real_end_ms <= coalesce_window_ms_) {
-            open_[key] = lei->second.event_id;
+            coalesced_event_id = lei->second.event_id;
+            open_[key] = coalesced_event_id;
             lei->second.real_end_ms = 0;  // mark as re-opened
-            return;
           }
         }
       }
 
-      // Rate limiting: drop the event if this camera has hit its hourly budget.
-      if (max_events_per_hour_ > 0) {
+      // Rate limiting: only for new events, not coalesced detections.
+      if (coalesced_event_id.empty() && max_events_per_hour_ > 0) {
         auto& times = recent_event_times_[ev.camera_ip];
         const uint64_t cutoff = now_ms() - 3600000;
         while (!times.empty() && times.front() < cutoff) times.pop_front();
@@ -857,7 +861,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // 2. Compute timestamps and IDs (no lock -- needs ip_to_mac_ which is read-only).
     const uint64_t    ts_ms      = now_ms() - pre_ms;  // padded start
     const std::string now_str    = utc_now_iso8601();
-    const std::string event_id   = generate_uuid();
+    // Use the existing event ID when coalescing; generate a fresh one otherwise.
+    const std::string event_id   = coalesced_event_id.empty() ? generate_uuid()
+                                                              : coalesced_event_id;
     const std::string sdo_id     = generate_uuid();
     const std::string sdr_id     = generate_uuid();
     const std::string thumb_id   = db_->make_thumbnail_id(ev.camera_ip, ts_ms);
@@ -901,13 +907,24 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     {
       std::lock_guard<std::mutex> lk(mu_);
 
-      db_->insert_event(event_id, ts_ms, ev.camera_ip, sdt_json, thumb_id, now_str);
+      if (coalesced_event_id.empty()) {
+        // New event: insert event row, open it, and record rate-limit timestamp.
+        db_->insert_event(event_id, ts_ms, ev.camera_ip, sdt_json, thumb_id, now_str);
+        open_[key] = event_id;
+        if (max_events_per_hour_ > 0)
+          recent_event_times_[ev.camera_ip].push_back(now_ms());
+      }
+
+      // Always insert SDO + smartDetectRaw for every detection occurrence,
+      // even when coalescing -- this records each hit within the merged event.
       db_->insert_sdo(sdo_id, event_id, thumb_id, ev.camera_ip,
                       obj_type, attributes, ts_ms, now_str);
       db_->insert_smart_detect_raw(sdr_id, ev.camera_ip, ts_ms, obj_type, now_str);
 
       // Insert detectionLabels rows so events appear in Protect's find-anything
       // endpoint (which does INNER JOIN on detectionLabels WHERE objectId IS NULL).
+      // When coalescing, skip the event-level row (objectId IS NULL) -- the
+      // surviving event already has one; only insert the SDO-level row.
       {
         std::vector<std::string> label_names = {
           "eventType:smartDetectZone",
@@ -917,18 +934,13 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           label_names.push_back("camera:" + cam_uuid);
         const std::vector<int> lids = db_->upsert_labels(label_names, now_str);
         if (!lids.empty()) {
-          db_->insert_detection_label(event_id, "",      lids, now_str);
-          db_->insert_detection_label(event_id, sdo_id, lids, now_str);
+          if (coalesced_event_id.empty())
+            db_->insert_detection_label(event_id, "", lids, now_str);  // event-level
+          db_->insert_detection_label(event_id, sdo_id, lids, now_str);  // SDO-level
         }
       }
 
-      open_[key] = event_id;
-
-      // Rate limiting: record this event's wall-clock creation time.
-      if (max_events_per_hour_ > 0)
-        recent_event_times_[ev.camera_ip].push_back(now_ms());
-
-      // 4d. Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.
+      // Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.
       if (!snapshot.empty()) {
         if (!ubv_dir.empty()) {
           const std::string ubv_path =
@@ -947,7 +959,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // alarm_url is non-empty when the camera advertised an alarm service via
     // GetServices; empty means it is not Protect-managed -- skip in that case.
     // The AlarmNotifier always uses its configured --uos_url (host:port).
-    if (alarm_notif && !cam_mac.empty() && !ev.alarm_url.empty()) {
+    // Only notify for new events, not for detections coalesced into an existing one.
+    if (coalesced_event_id.empty() && alarm_notif &&
+        !cam_mac.empty() && !ev.alarm_url.empty()) {
       alarm_notif->notify(obj_type, cam_mac, event_id, ts_ms);
     }
 

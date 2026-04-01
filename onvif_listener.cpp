@@ -428,6 +428,16 @@ struct XmlDoc {
   }
 };
 
+// Extract the path (and optional query) component from a URL string.
+// "http://192.168.1.1:80/onvif/events?x=1" -> "/onvif/events?x=1"
+// Returns "/" when no path is found.
+static std::string url_path(const std::string& url) {
+  const auto scheme_end = url.find("://");
+  const auto start = (scheme_end == std::string::npos) ? 0 : scheme_end + 3;
+  const auto slash = url.find('/', start);
+  return (slash == std::string::npos) ? "/" : url.substr(slash);
+}
+
 // -------------------------------------------------------
 // Pair of URLs discovered via GetServices
 // -------------------------------------------------------
@@ -649,8 +659,8 @@ class CameraWorker {
         if (xaddr.empty()) continue;
 
         if (ns.find("events") != std::string::npos && result.event_url == event_url()) {
-          LOG(INFO) << '[' << cfg_.ip << "] event service URL: " << xaddr;
-          result.event_url = xaddr;
+          result.event_url = "http://" + cfg_.ip + url_path(xaddr);
+          LOG(INFO) << '[' << cfg_.ip << "] event service URL: " << result.event_url;
         } else if (ns.find("alarm") != std::string::npos) {
           LOG(INFO) << '[' << cfg_.ip << "] alarm service URL: " << xaddr;
           result.alarm_url = xaddr;
