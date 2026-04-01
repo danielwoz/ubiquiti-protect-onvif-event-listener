@@ -386,13 +386,12 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "[coalesce_history] done (" << n << " event(s) merged)";
   }
 
-  // Purge smartDetectRaws rows orphaned by coalesce operations that ran before
-  // the per-event cleanup was added.
+  // Purge rows orphaned by coalesce operations across all dependent tables
+  // (smartDetectRaws, thumbnails, smartDetectObjects, detectionLabels).
   {
-    const int n = det_rec.purge_orphaned_smart_detect_raws();
+    const int n = det_rec.purge_orphaned_rows();
     if (n > 0)
-      LOG(INFO) << "[startup] purged " << n
-                << " orphaned smartDetectRaws row(s)";
+      LOG(INFO) << "[startup] purged " << n << " orphaned row(s)";
   }
 
   for (auto cam : cameras) {

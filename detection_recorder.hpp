@@ -178,12 +178,15 @@ class DetectionRecorder {
   /// coalesce_window_sec is 0.
   int coalesce_history(int days = 30);
 
-  /// Delete smartDetectRaws rows for third-party cameras whose timestamp does
-  /// not fall within any existing smartDetectZone event for that camera.
-  /// Intended to be called once at startup to clean up rows orphaned by
-  /// coalesce operations that pre-date the smartDetectRaws cleanup fix.
-  /// Returns the number of rows deleted.
-  int purge_orphaned_smart_detect_raws();
+  /// Delete orphaned rows from all dependent tables (smartDetectRaws,
+  /// thumbnails, smartDetectObjects, detectionLabels) in a single startup
+  /// sweep.  A row is orphaned when its parent event no longer exists.
+  /// smartDetectRaws uses a timestamp-range match (no eventId column);
+  /// the others match directly on eventId.  thumbnails and smartDetectObjects
+  /// are additionally filtered to third-party cameras; detectionLabels has no
+  /// cameraId column so all orphaned rows are removed.
+  /// Returns the total number of rows deleted across all tables.
+  int purge_orphaned_rows();
 
   /// Set the object detector used to locate subjects for thumbnail cropping.
   /// If not called (or set to nullptr), falls back to the smart-crop heuristic.
@@ -309,6 +312,18 @@ class DetectionRecorder {
     /// does not fall within any existing smartDetectZone event for that camera.
     /// Returns the number of rows deleted.
     virtual int purge_orphaned_smart_detect_raws() { return 0; }
+
+    /// Delete thumbnails rows for third-party cameras whose eventId no longer
+    /// references an existing event. Returns the number of rows deleted.
+    virtual int purge_orphaned_thumbnails() { return 0; }
+
+    /// Delete smartDetectObjects rows for third-party cameras whose eventId no
+    /// longer references an existing event. Returns the number of rows deleted.
+    virtual int purge_orphaned_smart_detect_objects() { return 0; }
+
+    /// Delete detectionLabels rows whose eventId no longer references an
+    /// existing event. Returns the number of rows deleted.
+    virtual int purge_orphaned_detection_labels() { return 0; }
   };
 
   /// Factory for testing: injects a custom backend (skips PostgreSQL connect).

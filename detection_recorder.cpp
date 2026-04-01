@@ -390,6 +390,21 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     return (msg && *msg) ? msg : PQerrorMessage(conn_);
   }
 
+  // Execute a no-parameter DELETE and return the row count; logs on failure.
+  int exec_purge(const char* sql, const char* label) {
+    maybe_reconnect();
+    PGresult* res = PQexec(conn_, sql);
+    int deleted = 0;
+    if (PQresultStatus(res) == PGRES_COMMAND_OK) {
+      const char* tag = PQcmdTuples(res);
+      if (tag && *tag) deleted = std::atoi(tag);
+    } else {
+      LOG(ERROR) << "[pg] " << label << " failed: " << pg_errmsg(res);
+    }
+    PQclear(res);
+    return deleted;
+  }
+
   // Execute a parameterized DML statement; logs errors to stderr (non-fatal).
   void exec_params(const char*        sql,
                    int                nparams,
@@ -651,12 +666,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   }
 
   int purge_orphaned_smart_detect_raws() override {
-    maybe_reconnect();
-    // Delete smartDetectRaws rows for third-party cameras whose timestamp does
-    // not fall within any existing smartDetectZone event for that camera.
-    // This catches rows left behind by historical coalesce operations that ran
-    // before the smartDetectRaws cleanup was added.
-    PGresult* res = PQexec(conn_,
+    return exec_purge(
         "DELETE FROM \"smartDetectRaws\" sdr"
         " USING cameras c"
         " WHERE c.id = sdr.\"cameraId\""
@@ -667,17 +677,42 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         "         AND e.type = 'smartDetectZone'"
         "         AND e.start <= sdr.timestamp"
         "         AND (e.\"end\" IS NULL OR e.\"end\" >= sdr.timestamp)"
-        "   )");
-    int deleted = 0;
-    if (PQresultStatus(res) == PGRES_COMMAND_OK) {
-      const char* tag = PQcmdTuples(res);
-      if (tag && *tag) deleted = std::atoi(tag);
-    } else {
-      LOG(ERROR) << "[pg] purge_orphaned_smart_detect_raws failed: "
-                 << pg_errmsg(res);
-    }
-    PQclear(res);
-    return deleted;
+        "   )",
+        "purge_orphaned_smart_detect_raws");
+  }
+
+  int purge_orphaned_thumbnails() override {
+    return exec_purge(
+        "DELETE FROM thumbnails t"
+        " USING cameras c"
+        " WHERE c.id = t.\"cameraId\""
+        "   AND c.\"isThirdPartyCamera\" = true"
+        "   AND NOT EXISTS ("
+        "       SELECT 1 FROM events e WHERE e.id = t.\"eventId\""
+        "   )",
+        "purge_orphaned_thumbnails");
+  }
+
+  int purge_orphaned_smart_detect_objects() override {
+    return exec_purge(
+        "DELETE FROM \"smartDetectObjects\" o"
+        " USING cameras c"
+        " WHERE c.id = o.\"cameraId\""
+        "   AND c.\"isThirdPartyCamera\" = true"
+        "   AND NOT EXISTS ("
+        "       SELECT 1 FROM events e WHERE e.id = o.\"eventId\""
+        "   )",
+        "purge_orphaned_smart_detect_objects");
+  }
+
+  int purge_orphaned_detection_labels() override {
+    // detectionLabels has no cameraId column; all orphaned rows are removed.
+    return exec_purge(
+        "DELETE FROM \"detectionLabels\" dl"
+        " WHERE NOT EXISTS ("
+        "       SELECT 1 FROM events e WHERE e.id = dl.\"eventId\""
+        "   )",
+        "purge_orphaned_detection_labels");
   }
 
   void write_thumbnail(const std::string&              thumb_id,
@@ -1078,8 +1113,13 @@ int DetectionRecorder::coalesce_history(int days) {
   return merged;
 }
 
-int DetectionRecorder::purge_orphaned_smart_detect_raws() {
-  return db_->purge_orphaned_smart_detect_raws();
+int DetectionRecorder::purge_orphaned_rows() {
+  int total = 0;
+  total += db_->purge_orphaned_smart_detect_raws();
+  total += db_->purge_orphaned_thumbnails();
+  total += db_->purge_orphaned_smart_detect_objects();
+  total += db_->purge_orphaned_detection_labels();
+  return total;
 }
 
 void DetectionRecorder::set_default_object_type(const std::string& type) {
