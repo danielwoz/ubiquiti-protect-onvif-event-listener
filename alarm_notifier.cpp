@@ -126,6 +126,7 @@ std::string AlarmNotifier::http_get(const std::string& url) {
 
   struct curl_slist* headers = nullptr;
   headers = curl_slist_append(headers, "Accept: application/json");
+  headers = curl_slist_append(headers, "X-Source: unifi-os");
 
   curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
   curl_easy_setopt(curl, CURLOPT_TIMEOUT,        5L);  // NOLINT(runtime/int)
@@ -159,6 +160,7 @@ void AlarmNotifier::http_post(const std::string& url, const std::string& body) {
   struct curl_slist* headers = nullptr;
   headers = curl_slist_append(headers, "Content-Type: application/json");
   headers = curl_slist_append(headers, "Accept: application/json");
+  headers = curl_slist_append(headers, "X-Source: unifi-os");
 
   // Discard response body.
   auto discard = +[](char*, size_t s, size_t n, void*) -> size_t { return s * n; };
