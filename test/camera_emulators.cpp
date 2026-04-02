@@ -376,6 +376,142 @@ std::pair<int, std::string> DahuaSD4A425DBEmulator::handle(
 }
 
 // ============================================================
+// AxisReferenceParamsEmulator
+// ============================================================
+AxisReferenceParamsEmulator::AxisReferenceParamsEmulator()
+  : OnvifCameraEmulator("192.168.100.200"),
+    token_("urn:uuid:axis-ref-params-test-00000000") {}
+
+std::pair<int, std::string> AxisReferenceParamsEmulator::handle(
+    const std::string& /*path*/,
+    const std::string& soap_action,
+    const std::string& body) {
+  std::lock_guard<std::mutex> lk(mu_);
+  const auto tail = action_tail(soap_action);
+
+  if (tail == "GetServicesRequest") {
+    // Advertise /onvif/services as the single event XAddr (Axis style).
+    std::string resp =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<SOAP-ENV:Envelope"
+      "  xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+      "  xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\""
+      "  xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+      "<SOAP-ENV:Body>"
+      "<tds:GetServicesResponse>"
+      "<tds:Service>"
+      "<tds:Namespace>http://www.onvif.org/ver10/events/wsdl</tds:Namespace>"
+      "<tds:XAddr>http://" + real_ip_ + "/onvif/services</tds:XAddr>"
+      "<tds:Version>"
+      "<tt:Major>2</tt:Major><tt:Minor>60</tt:Minor>"
+      "</tds:Version>"
+      "</tds:Service>"
+      "</tds:GetServicesResponse>"
+      "</SOAP-ENV:Body>"
+      "</SOAP-ENV:Envelope>";
+    return {200, rewrite_urls(resp)};
+  }
+
+  if (tail == "CreatePullPointSubscriptionRequest") {
+    subscribed_ = true;
+    // SubscriptionReference/Address = /onvif/services (same endpoint).
+    // ReferenceParameters carry the subscription token that the listener
+    // must forward verbatim in all subsequent PullMessages and Renew calls.
+    std::string resp =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<SOAP-ENV:Envelope"
+      "  xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+      "  xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\""
+      "  xmlns:wsa5=\"http://www.w3.org/2005/08/addressing\""
+      "  xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\">"
+      "<SOAP-ENV:Body>"
+      "<tev:CreatePullPointSubscriptionResponse>"
+      "<tev:SubscriptionReference>"
+      "<wsa5:Address>http://" + real_ip_ + "/onvif/services</wsa5:Address>"
+      "<wsa5:ReferenceParameters>"
+      "<wsnt:Identifier>" + token_ + "</wsnt:Identifier>"
+      "</wsa5:ReferenceParameters>"
+      "</tev:SubscriptionReference>"
+      "<wsnt:CurrentTime>2026-01-01T00:00:00Z</wsnt:CurrentTime>"
+      "<wsnt:TerminationTime>2026-01-01T00:02:00Z</wsnt:TerminationTime>"
+      "</tev:CreatePullPointSubscriptionResponse>"
+      "</SOAP-ENV:Body>"
+      "</SOAP-ENV:Envelope>";
+    return {200, rewrite_urls(resp)};
+  }
+
+  // For PullMessages and Renew, validate that the token was forwarded.
+  const bool token_present = body.find(token_) != std::string::npos;
+  if (!token_present) {
+    // Axis returns HTTP 400 ter:InvalidArgs when ReferenceParameters are missing.
+    return {400,
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<SOAP-ENV:Envelope"
+      "  xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+      "  xmlns:ter=\"http://www.onvif.org/ver10/error\">"
+      "<SOAP-ENV:Body>"
+      "<SOAP-ENV:Fault>"
+      "<SOAP-ENV:Code><SOAP-ENV:Value>SOAP-ENV:Sender</SOAP-ENV:Value></SOAP-ENV:Code>"
+      "<SOAP-ENV:Reason><SOAP-ENV:Text>ter:InvalidArgs</SOAP-ENV:Text></SOAP-ENV:Reason>"
+      "</SOAP-ENV:Fault>"
+      "</SOAP-ENV:Body>"
+      "</SOAP-ENV:Envelope>"};
+  }
+
+  if (tail == "RenewRequest") {
+    return {200,
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<SOAP-ENV:Envelope"
+      "  xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+      "  xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\">"
+      "<SOAP-ENV:Body>"
+      "<wsnt:RenewResponse>"
+      "<wsnt:TerminationTime>2026-01-01T00:04:00Z</wsnt:TerminationTime>"
+      "</wsnt:RenewResponse>"
+      "</SOAP-ENV:Body>"
+      "</SOAP-ENV:Envelope>"};
+  }
+
+  if (tail == "PullMessagesRequest") {
+    // Return one CellMotionDetector/Motion Changed event.
+    return {200,
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<SOAP-ENV:Envelope"
+      "  xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+      "  xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\""
+      "  xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\""
+      "  xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+      "<SOAP-ENV:Body>"
+      "<tev:PullMessagesResponse>"
+      "<tev:CurrentTime>2026-01-01T00:00:00Z</tev:CurrentTime>"
+      "<tev:TerminationTime>2026-01-01T00:02:00Z</tev:TerminationTime>"
+      "<wsnt:NotificationMessage>"
+      "<wsnt:Topic"
+      "  Dialect=\"http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet\">"
+      "tns1:RuleEngine/CellMotionDetector/Motion"
+      "</wsnt:Topic>"
+      "<wsnt:Message>"
+      "<tt:Message UtcTime=\"2026-01-01T00:00:01Z\""
+      "            PropertyOperation=\"Changed\">"
+      "<tt:Source>"
+      "<tt:SimpleItem Name=\"VideoSourceConfigurationToken\" Value=\"1\"/>"
+      "<tt:SimpleItem Name=\"Rule\" Value=\"AxisMotionRule\"/>"
+      "</tt:Source>"
+      "<tt:Data>"
+      "<tt:SimpleItem Name=\"IsMotion\" Value=\"true\"/>"
+      "</tt:Data>"
+      "</tt:Message>"
+      "</wsnt:Message>"
+      "</wsnt:NotificationMessage>"
+      "</tev:PullMessagesResponse>"
+      "</SOAP-ENV:Body>"
+      "</SOAP-ENV:Envelope>"};
+  }
+
+  return {400, ""};
+}
+
+// ============================================================
 // UosEmulator
 // ============================================================
 

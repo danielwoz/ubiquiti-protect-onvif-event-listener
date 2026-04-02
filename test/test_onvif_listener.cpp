@@ -398,6 +398,42 @@ static void test_unvr_cell_motion(const std::string& jsonl) {
 }
 
 // ============================================================
+// Test: Axis-style WS-Addressing ReferenceParameters forwarding
+//
+// Uses AxisReferenceParamsEmulator which multiplexes all ONVIF operations
+// through /onvif/services and identifies subscriptions via ReferenceParameters.
+// The emulator returns HTTP 400 for PullMessages and Renew when the token is
+// absent from the request body, so the test passes only if the listener
+// correctly extracts and forwards the token in every subsequent call.
+// ============================================================
+static void test_axis_ref_params() {
+  AxisReferenceParamsEmulator emu;
+  emu.start();
+
+  onvif::CameraConfig cfg;
+  cfg.ip                 = emu.local_address();
+  cfg.user               = "root";
+  cfg.password           = "password";
+  cfg.retry_interval_sec = 1;
+
+  // Collect a few motion events to confirm that PullMessages succeeded
+  // (which requires the ref_params token to have been forwarded).
+  auto r = collect({cfg}, 3, std::chrono::seconds(30));
+
+  CHECK(!r.timed_out, "axis: timed out waiting for events (possible missing "
+        "ReferenceParameters forwarding)");
+  CHECK(r.events.size() >= 3, "axis: expected >= 3 events");
+
+  for (const auto& ev : r.events) {
+    if (ev.topic.empty()) continue;
+    CHECK(ev.topic.find("CellMotionDetector") != std::string::npos,
+          "axis: unexpected topic: " + ev.topic);
+    CHECK(ev.camera_ip == emu.local_address(),
+          "axis: camera_ip mismatch: " + ev.camera_ip);
+  }
+}
+
+// ============================================================
 // Test: Both cameras concurrently -- events arrive from both
 // ============================================================
 static void test_both_cameras(const std::string& hikvision_jsonl,
@@ -519,6 +555,8 @@ int main(int argc, char* argv[]) {
   run_test("unvr_1_47", [&] { test_unvr_cell_motion(unvr_1_47_jsonl); });
   run_test("both_cameras",
            [&] { test_both_cameras(hikvision_jsonl, dahua_jsonl); });
+  run_test("axis_ref_params",
+           [] { test_axis_ref_params(); });
 
   onvif::global_cleanup();
 

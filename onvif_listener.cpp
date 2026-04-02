@@ -229,7 +229,8 @@ std::string build_soap(
   const std::string& password,
   const std::string& body_xml,
   const std::string& wsa_to     = "",
-  const std::string& wsa_action = "") {
+  const std::string& wsa_action = "",
+  const std::string& ref_params = "") {
   WSSecurity ws = make_wssecurity(password);
 
   std::ostringstream s;
@@ -262,6 +263,11 @@ std::string build_soap(
     s << "    <wsa5:To>" << wsa_to << "</wsa5:To>\n";
   if (!wsa_action.empty())
     s << "    <wsa5:Action>" << wsa_action << "</wsa5:Action>\n";
+  // WS-Addressing ReferenceParameters: forwarded verbatim so cameras like Axis
+  // that multiplex all ONVIF operations through a single endpoint can route the
+  // request to the correct subscription.
+  if (!ref_params.empty())
+    s << ref_params << "\n";
 
   s << "  </SOAP-ENV:Header>\n"
        "  <SOAP-ENV:Body>\n"
@@ -426,6 +432,24 @@ struct XmlDoc {
     if (b == std::string::npos) return {};
     return s.substr(b, s.find_last_not_of(" \t\r\n") - b + 1);
   }
+
+  // Serialize the inner XML (children) of the first node matched by expr.
+  // Returns an empty string if the expression matches nothing or the node
+  // has no children.  Used to capture ReferenceParameters verbatim.
+  std::string inner_xml(const std::string& expr) const {
+    auto obj = xpath(expr);
+    if (!obj || obj->type != XPATH_NODESET ||
+        !obj->nodesetval || obj->nodesetval->nodeNr == 0) return {};
+    xmlNodePtr node = obj->nodesetval->nodeTab[0];
+    if (!node->children) return {};
+    xmlBufferPtr buf = xmlBufferCreate();
+    if (!buf) return {};
+    for (xmlNodePtr child = node->children; child; child = child->next)
+      xmlNodeDump(buf, doc, child, 0, 0);
+    std::string result(reinterpret_cast<const char*>(xmlBufferContent(buf)));
+    xmlBufferFree(buf);
+    return result;
+  }
 };
 
 // Extract the path (and optional query) component from a URL string.
@@ -444,6 +468,19 @@ static std::string url_path(const std::string& url) {
 struct DiscoveredServices {
   std::string event_url;   // events service XAddr (fallback: /onvif/event_service)
   std::string alarm_url;   // alarm service XAddr; empty = no alarm service found
+};
+
+// -------------------------------------------------------
+// Result of CreatePullPointSubscription
+// -------------------------------------------------------
+struct Subscription {
+  std::string url;        // SubscriptionReference/Address
+  std::string ref_params;  // inner XML of SubscriptionReference/ReferenceParameters;
+                          // empty when the camera provides none.
+                          // Must be forwarded verbatim in the SOAP header of
+                          // subsequent PullMessages and Renew calls so that
+                          // cameras using WS-Addressing routing (e.g. Axis)
+                          // can identify the subscription.
 };
 
 // -------------------------------------------------------
@@ -506,8 +543,8 @@ class CameraWorker {
         continue;
       }
 
-      const std::string& sub_url = *sub_or;
-      if (sub_url.empty()) {
+      const Subscription& sub = *sub_or;
+      if (sub.url.empty()) {
         if (consecutive_failures == 0)
           streak_start = std::chrono::steady_clock::now();
         ++consecutive_failures;
@@ -533,7 +570,7 @@ class CameraWorker {
 
       // Successful subscription -- reset the failure counter.
       consecutive_failures = 0;
-      LOG(INFO) << '[' << cfg_.ip << "] subscription -> " << sub_url;
+      LOG(INFO) << '[' << cfg_.ip << "] subscription -> " << sub.url;
 
       auto renew_at =
         std::chrono::steady_clock::now() + std::chrono::seconds(90);
@@ -541,13 +578,13 @@ class CameraWorker {
       bool inner_ok = true;
       while (running_ && inner_ok) {
         if (std::chrono::steady_clock::now() >= renew_at) {
-          absl::Status rs = renew(sub_url);
+          absl::Status rs = renew(sub.url, sub.ref_params);
           if (!rs.ok())
             LOG(WARNING) << '[' << cfg_.ip << "] renew error: " << rs.message();
           renew_at = std::chrono::steady_clock::now()
                      + std::chrono::seconds(90);
         }
-        absl::Status ps = pull(sub_url, sv.alarm_url);
+        absl::Status ps = pull(sub.url, sub.ref_params, sv.alarm_url);
         if (!ps.ok()) {
           if (consecutive_failures == 0)
             streak_start = std::chrono::steady_clock::now();
@@ -691,8 +728,10 @@ class CameraWorker {
     return resp_or;
   }
 
-  // CreatePullPointSubscription -> subscription URL (empty string on HTTP error)
-  absl::StatusOr<std::string> create_subscription(const std::string& ev_url) {
+  // CreatePullPointSubscription -> Subscription{url, ref_params}
+  // url is empty string on HTTP error; ref_params may be empty when the camera
+  // does not include WS-Addressing ReferenceParameters.
+  absl::StatusOr<Subscription> create_subscription(const std::string& ev_url) {
     static const char* ACTION =
       "http://www.onvif.org/ver10/events/wsdl/EventPortType/"
       "CreatePullPointSubscriptionRequest";
@@ -712,21 +751,29 @@ class CameraWorker {
                            << "] CreatePullPointSubscription HTTP "
                            << resp.status_code << ": "
                            << resp.body.substr(0, 300);
-      return std::string{};
+      return Subscription{};
     }
 
     auto doc_or = XmlDoc::Create(resp.body);
     if (!doc_or.ok()) {
       LOG(ERROR) << '[' << cfg_.ip << "] parse sub URL: "
                  << doc_or.status().message();
-      return std::string{};
+      return Subscription{};
     }
-    return XmlDoc::trim(
+
+    Subscription sub;
+    sub.url = XmlDoc::trim(
       doc_or->text("//*[local-name()='SubscriptionReference']"
                    "/*[local-name()='Address']"));
+    sub.ref_params = doc_or->inner_xml(
+      "//*[local-name()='SubscriptionReference']"
+      "/*[local-name()='ReferenceParameters']");
+    if (!sub.ref_params.empty())
+      LOG(INFO) << '[' << cfg_.ip << "] subscription has ReferenceParameters";
+    return sub;
   }
 
-  absl::Status renew(const std::string& sub_url) {
+  absl::Status renew(const std::string& sub_url, const std::string& ref_params) {
     static const char* ACTION =
       "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest";
 
@@ -735,7 +782,8 @@ class CameraWorker {
       "      <wsnt:TerminationTime>PT120S</wsnt:TerminationTime>\n"
       "    </wsnt:Renew>\n";
 
-    auto soap = build_soap(cfg_.user, cfg_.password, body, sub_url, ACTION);
+    auto soap = build_soap(cfg_.user, cfg_.password, body, sub_url, ACTION,
+                           ref_params);
     auto resp_or = soap_post_r(sub_url, soap, ACTION, 15);
     if (!resp_or.ok()) return resp_or.status();
     if (resp_or->status_code == 200)
@@ -746,7 +794,8 @@ class CameraWorker {
     return absl::OkStatus();
   }
 
-  absl::Status pull(const std::string& sub_url, const std::string& alarm_url) {
+  absl::Status pull(const std::string& sub_url, const std::string& ref_params,
+                    const std::string& alarm_url) {
     static const char* ACTION =
       "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/"
       "PullMessagesRequest";
@@ -757,7 +806,8 @@ class CameraWorker {
       "      <tev:Timeout>PT5S</tev:Timeout>\n"
       "    </tev:PullMessages>\n";
 
-    auto soap = build_soap(cfg_.user, cfg_.password, body, sub_url, ACTION);
+    auto soap = build_soap(cfg_.user, cfg_.password, body, sub_url, ACTION,
+                           ref_params);
     // HTTP timeout > SOAP pull timeout (5 s) to allow for network headroom
     auto resp_or = soap_post_r(sub_url, soap, ACTION, 20);
     if (!resp_or.ok()) return resp_or.status();

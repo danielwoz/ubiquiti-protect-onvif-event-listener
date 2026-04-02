@@ -160,6 +160,43 @@ class DahuaSD4A425DBEmulator : public OnvifCameraEmulator {
 };
 
 // ============================================================
+// AxisReferenceParamsEmulator -- synthetic Axis-style camera
+//
+// Exercises the WS-Addressing ReferenceParameters forwarding path.
+// All ONVIF operations are served by a single /onvif/services endpoint,
+// matching the behaviour of real Axis cameras.  The emulator:
+//
+//   GetServices             → advertises /onvif/services as event XAddr
+//   CreatePullPointSub      → returns a SubscriptionReference whose
+//                             Address is /onvif/services and whose
+//                             ReferenceParameters carry a fixed UUID token
+//   PullMessages / Renew    → return HTTP 400 when the token is absent from
+//                             the request body (i.e. not forwarded by the
+//                             listener); return 200 + events when present
+//
+// The test passes only if the listener correctly threads the token through
+// every subsequent PullMessages and Renew call.
+// ============================================================
+class AxisReferenceParamsEmulator : public OnvifCameraEmulator {
+ public:
+  AxisReferenceParamsEmulator();
+
+  /// UUID token that must appear in PullMessages / Renew request bodies.
+  const std::string& token() const { return token_; }
+
+ protected:
+  std::pair<int, std::string> handle(
+    const std::string& path,
+    const std::string& soap_action,
+    const std::string& body) override;
+
+ private:
+  const std::string token_;
+  std::mutex        mu_;
+  bool              subscribed_{false};
+};
+
+// ============================================================
 // UosEmulator -- fake UOS external automation manager (port 11010 role)
 //
 // Accepts:
