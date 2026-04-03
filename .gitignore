@@ -36,3 +36,6 @@ thumbnails/
 !pgo_arm64.profdata
 .claude/
 dist/
+
+# Docker ARM64 build cache (records last successfully built commit SHA)
+.docker_arm64_cache

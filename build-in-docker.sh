@@ -18,6 +18,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="onvif-recorder-builder"
 CACHE_VOL="onvif-recorder-bazel-cache"
 
+# File that records the git commit SHA of the last successful ARM64 Docker build.
+# Lets the pre-push hook (and manual invocations) skip a rebuild when nothing has
+# changed since the previous run.  Listed in .gitignore.
+ARM64_BUILD_CACHE="$SCRIPT_DIR/.docker_arm64_cache"
+
 BUILD_X86=true
 BUILD_ARM64=true
 RUN_TESTS=false
@@ -32,6 +37,15 @@ for arg in "$@"; do
         *) echo "Unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
+
+# Current HEAD commit SHA -- used to detect whether anything changed since the
+# last successful ARM64 Docker build.
+CURRENT_SHA=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || echo "")
+
+# --rebuild clears the ARM64 build cache so the next run always rebuilds.
+if $REBUILD_IMAGE; then
+    rm -f "$ARM64_BUILD_CACHE"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Build the Docker image (once, or when --rebuild is passed)
@@ -105,8 +119,14 @@ if $RUN_TESTS; then
 fi
 
 if $BUILD_ARM64; then
-    echo "==> Building ARM64 binary ..."
-    run "arm64" "build --config=arm64 //:onvif_recorder \
-      && cp -f bazel-bin/onvif_recorder dist/onvif_recorder.arm64"
-    echo "==> dist/onvif_recorder.arm64"
+    CACHED_SHA=$(cat "$ARM64_BUILD_CACHE" 2>/dev/null || echo "")
+    if [ -n "$CURRENT_SHA" ] && [ "$CURRENT_SHA" = "$CACHED_SHA" ]; then
+        echo "==> ARM64 Docker build skipped (already built at $(git -C "$SCRIPT_DIR" log -1 --oneline 2>/dev/null || echo "$CURRENT_SHA"))"
+    else
+        echo "==> Building ARM64 binary ..."
+        run "arm64" "build --config=arm64 //:onvif_recorder \
+          && cp -f bazel-bin/onvif_recorder dist/onvif_recorder.arm64"
+        echo "==> dist/onvif_recorder.arm64"
+        echo "$CURRENT_SHA" > "$ARM64_BUILD_CACHE"
+    fi
 fi
