@@ -299,8 +299,8 @@ echo "SASL stub built"
 
 # 10. Build LLVM profile runtime for aarch64.
 #     libclang_rt.profile-aarch64.a is needed for --config=pgo_instrument ARM64 builds.
-#     Ubuntu 22.04 ships clang-14 but omits the aarch64 cross-compilation runtime,
-#     so we build it from the LLVM 14.0.0 source.
+#     Ubuntu omits the aarch64 cross-compilation runtime, so we build it from the
+#     matching LLVM source (version detected at repository-rule time in arm64_sysroot.bzl).
 echo "Building ARM64 LLVM profile runtime..."
 mkdir -p "$REPO/resource_dir/include"
 mkdir -p "$REPO/resource_dir/lib/linux"
@@ -367,9 +367,31 @@ def _arm64_sysroot_impl(rctx):
             sha256 = sha256,
         )
 
-    # 2. Pre-download LLVM 14 compiler-rt profile runtime sources.
-    #    rctx.download() has network access; bash execute() does not.
-    _llvm_base = "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-14.0.0/compiler-rt/lib/profile/"
+    # 2. Pre-download compiler-rt profile runtime sources matching the installed
+    #    clang version.  rctx.download() has network access; bash execute() does not.
+    #    The profile runtime source must match the clang binary: between LLVM 14 and
+    #    15+ the __llvm_profile_header struct was reorganised (DataSize/CountersSize
+    #    fields were removed), so using LLVM 14 sources with clang-15+ fails to compile.
+    #    We detect the clang major version at repository-rule time and download the
+    #    matching llvmorg-X.0.0 tag.  Falls back to 14 if detection fails.
+    clang_major = 14
+    clang_ver = rctx.execute(["/usr/bin/clang", "--version"])
+    if clang_ver.return_code == 0:
+        marker = "version "
+        idx = clang_ver.stdout.find(marker)
+        if idx >= 0:
+            rest = clang_ver.stdout[idx + len(marker):]
+            major_str = rest.split(".")[0].strip()
+            if len(major_str) > 0 and major_str[0] >= "1" and major_str[0] <= "9":
+                clang_major = int(major_str)
+    # Use the release/X.x branch (e.g. release/18.x) rather than a specific tag:
+    # LLVM 14-17 start at X.0.0 but LLVM 18+ start at X.1.0, so "llvmorg-X.0.0"
+    # does not exist for newer versions.  The release/X.x branch always exists and
+    # tracks the latest patch of that major release.
+    _llvm_base = (
+        "https://raw.githubusercontent.com/llvm/llvm-project/release/{}.x".format(clang_major) +
+        "/compiler-rt/lib/profile/"
+    )
     for f in [
         "InstrProfiling.h",
         "InstrProfilingInternal.h",
