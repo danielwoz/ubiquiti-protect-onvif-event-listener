@@ -93,7 +93,7 @@ unifi_camera_config.hpp/.cpp  — Load camera credentials from UniFi Protect DB
 main.cpp                      — Binary entry point
 
 .githooks/
-  pre-push                    — shared pre-push hook (lint + tests + PGO bench)
+  pre-push                    — shared pre-push hook (lint + x86 tests + Docker ARM64 build)
                                 Activate with: bazel run //:install_hooks
 
 third_party/
@@ -162,6 +162,9 @@ python3 -m cpplint *.cpp *.hpp test/*.cpp test/*.hpp
 
 # 2. All tests pass (Bazel-cached; fast on repeat runs)
 scripts/bz test --config=x86 //test:all
+
+# 3. ARM64 Docker build (validates sysroot/toolchain on ubuntu:24.04 + clang-18)
+./build-in-docker.sh --arm64
 ```
 
 > **Note:** these steps are a manual checklist for Claude to follow in conversation.
@@ -175,6 +178,7 @@ scripts/bz test --config=x86 //test:all
 > This runs `git config core.hooksPath .githooks` so Git uses the `.githooks/pre-push`
 > file that is checked into the repository. Anyone who clones the repo runs the same
 > one-time command to activate the hooks.
+> The hook skips the Docker ARM64 build automatically when Docker is not available.
 
 > **IMPORTANT:** Never use `git push --no-verify`. The pre-push hook exists to prevent
 > broken commits reaching the repository. If the hook fails, fix the underlying issue
