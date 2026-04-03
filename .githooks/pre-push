@@ -2,3 +2,12 @@
 set -e
 python3 -m cpplint *.cpp *.hpp test/*.cpp test/*.hpp
 scripts/bz test --config=x86 //test:all
+
+# Docker ARM64 build -- validates the sysroot setup on ubuntu:24.04 (clang-18).
+# Skipped silently when Docker is not available or not running.
+if docker info &>/dev/null 2>&1; then
+    echo "[pre-push] Docker available -- verifying ARM64 build..."
+    ./build-in-docker.sh --arm64
+else
+    echo "[pre-push] Docker not available -- skipping ARM64 Docker build"
+fi
