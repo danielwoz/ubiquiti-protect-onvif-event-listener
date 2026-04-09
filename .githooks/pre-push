@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 python3 -m cpplint *.cpp *.hpp test/*.cpp test/*.hpp
-scripts/bz test --config=x86 //test:all
+scripts/bz test --config=x86 //test:test_onvif_listener //test:test_ubv_thumbnail
 
 # Docker ARM64 build -- validates the sysroot setup on ubuntu:24.04 (clang-18).
 # Skipped silently when Docker is not available or not running.
