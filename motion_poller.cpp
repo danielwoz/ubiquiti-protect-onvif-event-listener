@@ -34,6 +34,7 @@
 #include "alarm_notifier.hpp"
 #include "jpeg_crop.hpp"
 #include "object_detect.hpp"
+#include "ubv_thumbnail.hpp"
 
 namespace onvif {
 
@@ -124,8 +125,12 @@ struct MotionPoller::Impl {
   std::map<std::string, std::string> id_to_mac;
   const object_detect::ObjectDetector* detector{nullptr};
   AlarmNotifier* alarm_notifier{nullptr};
+  std::string ubv_dir;
   int poll_interval_sec{10};
   uint32_t coalesce_window_sec{30};
+
+  // UBV path cache: MAC -> (date string, file path).
+  std::map<std::string, std::pair<std::string, std::string>> ubv_cache;
 
   // High-water mark: last processed motion event start per camera.
   std::map<std::string, uint64_t> hwm;
@@ -223,6 +228,10 @@ void MotionPoller::set_detector(
 
 void MotionPoller::set_alarm_notifier(AlarmNotifier* notifier) {
   impl_->alarm_notifier = notifier;
+}
+
+void MotionPoller::set_ubv_dir(const std::string& dir) {
+  impl_->ubv_dir = dir;
 }
 
 void MotionPoller::set_poll_interval(int sec) {
@@ -342,7 +351,6 @@ void MotionPoller::poll_loop() {
         // Fetch the thumbnail JPEG from the thumbnails table.
         impl_->maybe_reconnect();
         const char* tp[] = { thumb_id.c_str() };
-        const int fmt[] = { 1 };  // binary result
         PGresult* thumb_res = PQexecParams(impl_->conn,
           "SELECT content FROM thumbnails WHERE id = $1",
           1, nullptr, tp, nullptr, nullptr, 1);
@@ -476,6 +484,29 @@ void MotionPoller::poll_loop() {
             LOG(ERROR) << "[motion_poller] insert thumbnail: "
                        << PQerrorMessage(impl_->conn);
           PQclear(r);
+        }
+
+        // Write UBV thumbnail file (native Protect path).
+        if (!impl_->ubv_dir.empty()) {
+          auto mac_it2 = impl_->id_to_mac.find(cam_id);
+          if (mac_it2 != impl_->id_to_mac.end()) {
+            const std::string& mac = mac_it2->second;
+            std::time_t tsec = static_cast<std::time_t>(start_ms / 1000);
+            std::tm ttm{};
+            gmtime_r(&tsec, &ttm);
+            char dbuf[16];
+            std::strftime(dbuf, sizeof(dbuf), "%Y/%m/%d", &ttm);
+            std::string dstr(dbuf);
+
+            auto& cached = impl_->ubv_cache[mac];
+            if (cached.first != dstr) {
+              cached.first = dstr;
+              cached.second = ubv::protect_path(impl_->ubv_dir, mac, start_ms);
+            }
+            auto us = ubv::append(cached.second, {start_ms, cropped});
+            if (!us.ok())
+              LOG(WARNING) << "[motion_poller] ubv append: " << us.message();
+          }
         }
 
         // Fire alarm notification.

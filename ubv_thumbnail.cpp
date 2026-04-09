@@ -14,8 +14,12 @@
 
 #include "ubv_thumbnail.hpp"
 
+#include <dirent.h>
+#include <sys/stat.h>
+
 #include <array>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <string>
 #include <utility>
@@ -276,6 +280,55 @@ absl::Status append(const std::string& path, const Frame& frame) {
       return absl::InternalError("ubv::append: write error on " + path);
   }
   return absl::OkStatus();
+}
+
+// ---------------------------------------------------------------------------
+// protect_path -- build native Protect UBV thumbnail path
+// ---------------------------------------------------------------------------
+
+// Recursive mkdir (like mkdir -p).
+static void mkdirs(const std::string& path) {
+  struct stat st{};
+  if (stat(path.c_str(), &st) == 0) return;
+  // Ensure parent exists.
+  size_t slash = path.rfind('/');
+  if (slash != std::string::npos && slash > 0)
+    mkdirs(path.substr(0, slash));
+  mkdir(path.c_str(), 0755);
+}
+
+std::string protect_path(const std::string& base_dir,
+                         const std::string& mac,
+                         uint64_t timestamp_ms) {
+  // Compute YYYY/MM/DD from timestamp.
+  std::time_t sec = static_cast<std::time_t>(timestamp_ms / 1000);
+  std::tm tm{};
+  gmtime_r(&sec, &tm);
+  char date_buf[16];
+  std::strftime(date_buf, sizeof(date_buf), "%Y/%m/%d", &tm);
+
+  std::string dir = base_dir + "/" + date_buf;
+  mkdirs(dir);
+
+  // Look for an existing file for this MAC in today's directory.
+  std::string prefix = mac + "_0_thumbnails_";
+  DIR* d = opendir(dir.c_str());
+  if (d) {
+    struct dirent* entry;
+    while ((entry = readdir(d)) != nullptr) {
+      std::string name = entry->d_name;
+      if (name.compare(0, prefix.size(), prefix) == 0 &&
+          name.size() > 4 &&
+          name.compare(name.size() - 4, 4, ".ubv") == 0) {
+        closedir(d);
+        return dir + "/" + name;
+      }
+    }
+    closedir(d);
+  }
+
+  // No existing file -- create a new path.
+  return dir + "/" + prefix + std::to_string(timestamp_ms) + ".ubv";
 }
 
 }  // namespace ubv

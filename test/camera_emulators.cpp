@@ -512,6 +512,55 @@ std::pair<int, std::string> AxisReferenceParamsEmulator::handle(
 }
 
 // ============================================================
+// ReolinkCameraEmulator
+// ============================================================
+
+// Extract the first raw GetServices response from a JSONL file.
+static std::string extract_get_services(const std::string& path) {
+  std::ifstream f(path);
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty()) continue;
+    auto e = parse_line(line);
+    if (action_tail(e.soap_action) == "GetServicesRequest" &&
+        !e.response.empty())
+      return e.response;
+  }
+  return "";
+}
+
+ReolinkCameraEmulator::ReolinkCameraEmulator(const std::string& jsonl_path)
+  : OnvifCameraEmulator(peek_camera_ip(jsonl_path)) {
+  session_ = RecordedSession::from_jsonl(jsonl_path);
+  raw_get_services_ = extract_get_services(jsonl_path);
+}
+
+std::pair<int, std::string> ReolinkCameraEmulator::handle(
+  const std::string& /*path*/,
+  const std::string& soap_action,
+  const std::string& /*body*/) {
+  std::lock_guard<std::mutex> lk(mu_);
+  const auto tail = action_tail(soap_action);
+
+  std::pair<int, std::string> resp;
+  if (tail == "GetServicesRequest") {
+    // Serve the raw GetServices response (preserving the tad: namespace bug).
+    resp = {200, raw_get_services_};
+  } else if (tail == "CreatePullPointSubscriptionRequest") {
+    resp = next_clamp(session_.create_sub, create_idx_);
+  } else if (tail == "PullMessagesRequest") {
+    resp = next_cycle(session_.pull, pull_idx_);
+  } else if (tail == "RenewRequest") {
+    resp = next_clamp(session_.renew, renew_idx_);
+  } else {
+    resp = {400, ""};
+  }
+
+  resp.second = rewrite_urls(resp.second);
+  return resp;
+}
+
+// ============================================================
 // UosEmulator
 // ============================================================
 

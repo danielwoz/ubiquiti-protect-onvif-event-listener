@@ -197,6 +197,33 @@ class AxisReferenceParamsEmulator : public OnvifCameraEmulator {
 };
 
 // ============================================================
+// ReolinkCameraEmulator -- Reolink-style cameras that return malformed
+// GetServices XML (undeclared tad: namespace prefix in Capabilities).
+// Uses the raw GetServices response from the JSONL recording.
+//
+// Events use tns1:RuleEngine/MyRuleDetector/{PeopleDetect,VehicleDetect,...}
+// with data["State"] = "true"/"false".
+// ============================================================
+class ReolinkCameraEmulator : public OnvifCameraEmulator {
+ public:
+  explicit ReolinkCameraEmulator(const std::string& jsonl_path);
+
+ protected:
+  std::pair<int, std::string> handle(
+    const std::string& path,
+    const std::string& soap_action,
+    const std::string& body) override;
+
+ private:
+  RecordedSession session_;
+  std::string     raw_get_services_;  ///< verbatim GetServices response
+  std::size_t     create_idx_{0};
+  std::size_t     pull_idx_{0};
+  std::size_t     renew_idx_{0};
+  std::mutex      mu_;
+};
+
+// ============================================================
 // UosEmulator -- fake UOS external automation manager (port 11010 role)
 //
 // Accepts:

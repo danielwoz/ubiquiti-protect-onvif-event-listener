@@ -72,4 +72,21 @@ absl::Status encode(const std::string& path, const std::vector<Frame>& frames);
 /// Returns error Status on I/O error.
 absl::Status append(const std::string& path, const Frame& frame);
 
+/// Build the native Protect UBV thumbnail path for a camera and create
+/// the date directory if it does not exist.
+///
+/// The returned path follows the Protect convention:
+///   {base_dir}/YYYY/MM/DD/{MAC}_0_thumbnails_{epoch_ms}.ubv
+///
+/// If a file for this MAC already exists in that day's directory it is reused
+/// (the epoch_ms in the existing filename is kept).  Otherwise a new path is
+/// returned using @p timestamp_ms for the filename timestamp.
+///
+/// @p base_dir  The Protect video root (e.g. /srv/unifi-protect/video).
+/// @p mac       Camera MAC (uppercase, no colons, e.g. "FC5F49CA68D4").
+/// @p timestamp_ms  Milliseconds since epoch of the frame being written.
+std::string protect_path(const std::string& base_dir,
+                         const std::string& mac,
+                         uint64_t timestamp_ms);
+
 }  // namespace ubv

@@ -949,6 +949,8 @@ void DetectionRecorder::set_max_events_per_hour(uint32_t n) {
 void DetectionRecorder::set_ubv_dir(const std::string& dir) {
   std::lock_guard<std::mutex> lk(mu_);
   ubv_dir_ = dir;
+  // Create the base directory if it doesn't exist (needed for legacy
+  // IP-based flat paths; Protect-native paths create subdirs on demand).
   struct stat st{};
   if (stat(dir.c_str(), &st) != 0)
     mkdir(dir.c_str(), 0755);
@@ -1158,8 +1160,28 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       // Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.
       if (!snapshot.empty()) {
         if (!ubv_dir.empty()) {
-          const std::string ubv_path =
-            ubv_dir + "/" + ev.camera_ip + "_thumbnails.ubv";
+          std::string ubv_path;
+          if (!cam_mac.empty()) {
+            // Native Protect path: {base}/YYYY/MM/DD/{MAC}_0_thumbnails_{ts}.ubv
+            std::time_t sec = static_cast<std::time_t>(ts_ms / 1000);
+            std::tm tm{};
+            gmtime_r(&sec, &tm);
+            char date_buf[16];
+            std::strftime(date_buf, sizeof(date_buf), "%Y/%m/%d", &tm);
+            std::string date_str(date_buf);
+            {
+              std::lock_guard<std::mutex> cache_lk(mu_);
+              auto& cached = ubv_path_cache_[cam_mac];
+              if (cached.first != date_str) {
+                cached.first = date_str;
+                cached.second = ubv::protect_path(ubv_dir, cam_mac, ts_ms);
+              }
+              ubv_path = cached.second;
+            }
+          } else {
+            // Legacy fallback: flat directory with IP-based naming.
+            ubv_path = ubv_dir + "/" + ev.camera_ip + "_thumbnails.ubv";
+          }
           auto s = ubv::append(ubv_path, {ts_ms, snapshot});
           if (!s.ok()) {
             LOG(WARNING) << "[ubv] append failed (non-fatal): " << s.message();

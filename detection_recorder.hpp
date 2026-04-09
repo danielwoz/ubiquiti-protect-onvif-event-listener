@@ -371,8 +371,14 @@ class DetectionRecorder {
   // Written before run(); read-only after that.
   std::map<std::string, std::string> camera_macs_;
 
-  // Directory for per-camera UBV thumbnail files; empty = disabled.
+  // Base directory for UBV thumbnail files; empty = disabled.
+  // When set, files are written using the native Protect path convention:
+  //   {ubv_dir}/YYYY/MM/DD/{MAC}_0_thumbnails_{epoch_ms}.ubv
   std::string ubv_dir_;
+
+  // Cache: MAC -> (date string "YYYY/MM/DD", resolved UBV file path).
+  // Avoids directory scans on every thumbnail write.
+  std::map<std::string, std::pair<std::string, std::string>> ubv_path_cache_;
 
   // Tracks the UUID of each open (not-yet-ended) event row in `events`.
   // Key: (camera_ip, detection_type)

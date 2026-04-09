@@ -22,6 +22,8 @@
  *   - polls motion events from first-party cameras and runs NanoDet-M detection
  */
 
+#include <sys/stat.h>
+
 #include <csignal>
 
 #include <chrono>
@@ -280,8 +282,17 @@ int main(int argc, char* argv[]) {
 
   const std::string db_conn     = absl::GetFlag(FLAGS_db_conn);
   const std::string db_host     = absl::GetFlag(FLAGS_db_host);
-  const std::string thumbs_dir  = absl::GetFlag(FLAGS_ubv_dir);
   const std::string event_log   = absl::GetFlag(FLAGS_event_log);
+
+  // UBV thumbnail directory: use --ubv_dir if set, otherwise auto-detect
+  // the native Protect video directory on Dream Routers / NVRs.
+  std::string thumbs_dir = absl::GetFlag(FLAGS_ubv_dir);
+  if (thumbs_dir.empty()) {
+    static const char kProtectVideoDir[] = "/srv/unifi-protect/video";
+    struct stat st{};
+    if (stat(kProtectVideoDir, &st) == 0 && S_ISDIR(st.st_mode))
+      thumbs_dir = kProtectVideoDir;
+  }
   const std::string raw_log     = absl::GetFlag(FLAGS_raw_log);
   const std::string change_log  = absl::GetFlag(FLAGS_change_log);
   const std::string rollback    = absl::GetFlag(FLAGS_rollback);
@@ -301,8 +312,7 @@ int main(int argc, char* argv[]) {
   LOG(INFO) << "Event log   : " << (event_log.empty() ? "(disabled)" : event_log);
   LOG(INFO) << "Raw log     : " << (raw_log.empty() ? "(disabled)" : raw_log);
   LOG(INFO) << "Change log  : " << (change_log.empty() ? "(disabled)" : change_log);
-  if (!thumbs_dir.empty())
-    LOG(INFO) << "UBV dir     : " << thumbs_dir;
+  LOG(INFO) << "UBV dir     : " << (thumbs_dir.empty() ? "(disabled)" : thumbs_dir);
 
   // Camera DB config (shared by all camera-config functions).
   unifi::DbConfig cam_db;
@@ -514,6 +524,8 @@ int main(int argc, char* argv[]) {
         motion_poller->set_camera_ids(fp_ids);
         motion_poller->set_camera_macs(fp_macs);
         motion_poller->set_detector(detector.get());
+        if (!thumbs_dir.empty())
+          motion_poller->set_ubv_dir(thumbs_dir);
         motion_poller->set_poll_interval(
             absl::GetFlag(FLAGS_poll_interval_sec));
         motion_poller->set_coalesce_window(

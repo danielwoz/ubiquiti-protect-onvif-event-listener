@@ -104,6 +104,11 @@ filegroup(
     srcs = ["testdata/unvr_cell_motion_1_47_20260321.jsonl"],
 )
 
+filegroup(
+    name = "reolink_bullet_raw_log",
+    srcs = ["testdata/reolink_bullet.jsonl"],
+)
+
 cc_test(
     name = "test_onvif_listener",
     srcs = ["test_onvif_listener.cpp"],
@@ -123,6 +128,7 @@ cc_test(
         "$(location //test:unvr_251_raw_log)",
         "$(location //test:unvr_1_45_raw_log)",
         "$(location //test:unvr_1_47_raw_log)",
+        "$(location //test:reolink_bullet_raw_log)",
     ],
     data = [
         "//test:tsan_suppressions",
@@ -140,6 +146,7 @@ cc_test(
         "//test:unvr_251_raw_log",
         "//test:unvr_1_45_raw_log",
         "//test:unvr_1_47_raw_log",
+        "//test:reolink_bullet_raw_log",
     ],
     deps = [
         "//:onvif_listener",

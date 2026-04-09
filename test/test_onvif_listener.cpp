@@ -434,6 +434,47 @@ static void test_axis_ref_params() {
 }
 
 // ============================================================
+// Test: Reolink camera with malformed GetServices XML
+//
+// The Reolink RLC-811A returns GetServices XML containing an undeclared
+// "tad:" namespace prefix in Capabilities elements.  Before the fix
+// (xmlReadMemory with XML_PARSE_RECOVER), libxml2 would fail to parse
+// the response, preventing event subscription.  This test verifies that
+// the listener tolerates the malformed XML and still receives
+// PeopleDetect Changed events.
+// ============================================================
+static void test_reolink_namespace(const std::string& jsonl) {
+  ReolinkCameraEmulator emu(jsonl);
+  emu.start();
+
+  onvif::CameraConfig cfg;
+  cfg.ip                 = emu.local_address();
+  cfg.user               = "admin";
+  cfg.password           = "password";
+  cfg.retry_interval_sec = 1;
+
+  // The JSONL has Initialized + two Changed PullMessages (true/false).
+  // Collect at least 2 events to prove the subscription worked.
+  auto r = collect({cfg}, 2, std::chrono::seconds(30));
+
+  CHECK(!r.timed_out, "reolink: timed out (namespace bug may have "
+        "prevented subscription)");
+  CHECK(r.events.size() >= 2, "reolink: expected >= 2 events, got: " +
+        std::to_string(r.events.size()));
+
+  bool saw_people_detect = false;
+  for (const auto& ev : r.events) {
+    CHECK(!ev.topic.empty(), "reolink: event topic must not be empty");
+    CHECK(ev.camera_ip == emu.local_address(),
+          "reolink: camera_ip mismatch: " + ev.camera_ip);
+    if (ev.topic.find("PeopleDetect") != std::string::npos)
+      saw_people_detect = true;
+  }
+  CHECK(saw_people_detect,
+        "reolink: expected at least one PeopleDetect topic");
+}
+
+// ============================================================
 // Test: Both cameras concurrently -- events arrive from both
 // ============================================================
 static void test_both_cameras(const std::string& hikvision_jsonl,
@@ -492,7 +533,7 @@ static void test_both_cameras(const std::string& hikvision_jsonl,
 // main
 // ============================================================
 int main(int argc, char* argv[]) {
-  if (argc < 15) {
+  if (argc < 16) {
     std::cerr << "Usage: " << argv[0] << "\n"
               << "  <hikvision_compatible.jsonl>\n"
               << "  <dahua_dh_sd4a425db_hny.jsonl>\n"
@@ -507,7 +548,8 @@ int main(int argc, char* argv[]) {
               << "  <unvr_245.jsonl>\n"
               << "  <unvr_251.jsonl>\n"
               << "  <unvr_1_45.jsonl>\n"
-              << "  <unvr_1_47.jsonl>\n";
+              << "  <unvr_1_47.jsonl>\n"
+              << "  <reolink_bullet.jsonl>\n";
     return 1;
   }
   const std::string hikvision_jsonl      = argv[1];
@@ -524,6 +566,7 @@ int main(int argc, char* argv[]) {
   const std::string unvr_251_jsonl       = argv[12];
   const std::string unvr_1_45_jsonl      = argv[13];
   const std::string unvr_1_47_jsonl      = argv[14];
+  const std::string reolink_jsonl        = argv[15];
 
   onvif::global_init();
 
@@ -553,6 +596,8 @@ int main(int argc, char* argv[]) {
   run_test("unvr_251",  [&] { test_unvr_cell_motion(unvr_251_jsonl); });
   run_test("unvr_1_45", [&] { test_unvr_cell_motion(unvr_1_45_jsonl); });
   run_test("unvr_1_47", [&] { test_unvr_cell_motion(unvr_1_47_jsonl); });
+  run_test("reolink_namespace",
+           [&] { test_reolink_namespace(reolink_jsonl); });
   run_test("both_cameras",
            [&] { test_both_cameras(hikvision_jsonl, dahua_jsonl); });
   run_test("axis_ref_params",

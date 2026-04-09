@@ -136,6 +136,7 @@ cc_library(
         ":alarm_notifier",
         ":jpeg_crop",
         ":object_detect",
+        ":ubv_thumbnail",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:statusor",
     ] + _JPEG + _PQ,

@@ -343,7 +343,13 @@ struct XmlDoc {
 
   static absl::StatusOr<XmlDoc> Create(const std::string& xml) {
     XmlDoc xd;
-    xd.doc = xmlParseDoc(reinterpret_cast<const xmlChar*>(xml.c_str()));
+    // Use recovery mode to handle malformed XML (e.g. undeclared namespace
+    // prefixes like "tad:" in some cameras' GetServices responses) without
+    // printing errors to stderr.
+    xd.doc = xmlReadMemory(xml.c_str(), static_cast<int>(xml.size()),
+                           nullptr, nullptr,
+                           XML_PARSE_RECOVER | XML_PARSE_NOERROR |
+                           XML_PARSE_NOWARNING);
     if (!xd.doc) return absl::InternalError("XML parse error");
     xd.ctx = xmlXPathNewContext(xd.doc);
     if (!xd.ctx) {

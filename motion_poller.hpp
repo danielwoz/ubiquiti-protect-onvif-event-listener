@@ -60,6 +60,10 @@ class MotionPoller {
   /// Set the alarm notifier (optional).  Must outlive the poller.
   void set_alarm_notifier(AlarmNotifier* notifier);
 
+  /// Base directory for UBV thumbnail files (native Protect path convention).
+  /// When set, thumbnails are written alongside Protect's own UBV files.
+  void set_ubv_dir(const std::string& dir);
+
   /// Interval in seconds between poll cycles.  Default: 10.
   void set_poll_interval(int sec);
 
