@@ -83,8 +83,11 @@ Key rules in practice:
 ```
 onvif_listener.hpp/.cpp       — WS-PullPoint ONVIF subscription library
                                   Parses tt:BoundingBox from ONVIF analytics events
-detection_recorder.hpp/.cpp   — Detection → SQLite/PostgreSQL recorder
+detection_recorder.hpp/.cpp   — Detection → PostgreSQL recorder
                                   Crops thumbnails: ONVIF bbox → ML detect → smart crop
+motion_poller.hpp/.cpp        — First-party camera motion → smart detect poller
+                                  Polls events table, runs NanoDet-M on Protect thumbnails
+camera_change_log.hpp/.cpp    — Cameras-table change log and rollback support
 ubv_thumbnail.hpp/.cpp        — UBV container encode/decode (thumbnail storage)
 jpeg_crop.hpp/.cpp            — JPEG decode/crop/re-encode via libjpeg
 object_detect.hpp/.cpp        — NanoDet-M on-device object detection via NCNN
@@ -206,6 +209,10 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--max_events_per_hour` | `10` | Maximum new detection events per camera per hour. Events beyond this limit are dropped. Set to 0 for unlimited. |
 | `--coalesce_history` | `true` | On startup, scan the last `--coalesce_history_days` days of events and merge consecutive detections from the same third-party camera within `--coalesce_window_sec`. Only third-party (ONVIF) cameras are affected. |
 | `--coalesce_history_days` | `30` | Number of days to look back when `--coalesce_history` is set. |
+| `--first_party_cameras` | _(empty)_ | Comma-separated camera IDs of first-party cameras to enable smart detection flags for in the cameras table. |
+| `--poll_interval_sec` | `10` | Seconds between motion-event poll cycles for first-party cameras. |
+| `--change_log` | _(empty)_ | Path for cameras-table change log (JSON Lines). Records old/new values for rollback. |
+| `--rollback` | _(empty)_ | Undo cameras-table changes and exit. Values: `third_party`, `first_party`, `all`. |
 
 Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default is `kError`.
 `enable_verbose_logging()` has been removed from `OnvifListener`; set log level via absl before calling `run()`.

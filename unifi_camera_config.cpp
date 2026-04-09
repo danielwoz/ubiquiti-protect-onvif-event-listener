@@ -16,13 +16,46 @@
 
 #include <libpq-fe.h>
 
+#include <map>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "camera_change_log.hpp"
 
 namespace unifi {
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static std::string build_connstr(const DbConfig& db) {
+  std::string s =
+    "host="    + db.host +
+    " port="   + std::to_string(db.port) +
+    " dbname=" + db.dbname +
+    " user="   + db.user;
+  if (!db.password.empty())
+    s += " password=" + db.password;
+  return s;
+}
+
+// RAII wrapper for PGconn to avoid repetitive cleanup code.
+struct PgConn {
+  PGconn* conn{nullptr};
+  explicit PgConn(const DbConfig& db) {
+    conn = PQconnectdb(build_connstr(db).c_str());
+  }
+  ~PgConn() { if (conn) PQfinish(conn); }
+  PgConn(const PgConn&)            = delete;
+  PgConn& operator=(const PgConn&) = delete;
+  bool ok() const { return PQstatus(conn) == CONNECTION_OK; }
+  std::string error() const { return PQerrorMessage(conn); }
+};
 
 // ---------------------------------------------------------------------------
 // Minimal flat-JSON string-value extractor.
@@ -76,23 +109,28 @@ static std::string json_get(const std::string& json, const std::string& key) {
 }
 
 // ---------------------------------------------------------------------------
+// Build a PostgreSQL array literal from a vector of strings:
+//   {"id1","id2","id3"}
+// ---------------------------------------------------------------------------
+static std::string pg_array(const std::vector<std::string>& ids) {
+  std::string out = "{";
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (i > 0) out += ',';
+    out += "\"" + ids[i] + "\"";
+  }
+  out += '}';
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// load_cameras (third-party)
+// ---------------------------------------------------------------------------
 
 absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     const DbConfig& db) {
-  std::string connstr =
-    "host="   + db.host   +
-    " port="  + std::to_string(db.port) +
-    " dbname=" + db.dbname +
-    " user="  + db.user;
-  if (!db.password.empty())
-    connstr += " password=" + db.password;
-
-  PGconn* conn = PQconnectdb(connstr.c_str());
-  if (PQstatus(conn) != CONNECTION_OK) {
-    std::string err = PQerrorMessage(conn);
-    PQfinish(conn);
-    return absl::InternalError("unifi::load_cameras: " + err);
-  }
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError("unifi::load_cameras: " + pg.error());
 
   const char* sql =
     "SELECT id, mac, host, \"thirdPartyCameraInfo\" "
@@ -101,11 +139,10 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     "  AND \"isAdopted\" = true "
     "  AND host IS NOT NULL";
 
-  PGresult* res = PQexec(conn, sql);
+  PGresult* res = PQexec(pg.conn, sql);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     std::string err = PQresultErrorMessage(res);
     PQclear(res);
-    PQfinish(conn);
     return absl::InternalError("unifi::load_cameras query: " + err);
   }
 
@@ -125,16 +162,10 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     std::string port         = json_get(info, "port");
     if (username.empty() || password.empty()) continue;
 
-    // Build ip as "host" or "host:port" depending on whether the camera uses
-    // a non-standard ONVIF port.  Port 80 is the HTTP default and omitted so
-    // that camera_ip values in the events table stay backwards-compatible with
-    // existing rows written before port support was added.
     std::string ip = host_c;
     if (!port.empty() && port != "80" && port != "0")
       ip += ":" + port;
 
-    // Build the config first so we can use http_base() for URL construction,
-    // keeping "http://" + ip in exactly one place.
     onvif::CameraConfig cam;
     cam.id       = std::string(id_c);
     cam.mac      = mac_c ? std::string(mac_c) : std::string();
@@ -142,13 +173,11 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     cam.user     = username;
     cam.password = password;
 
-    // Rebase snapshot URL onto the configured host:port so that cameras on
-    // non-standard ports use the correct address regardless of what Protect
-    // stored in snapshotUrl.
     if (!snapshot_url.empty()) {
       const auto scheme_end = snapshot_url.find("://");
-      const auto path_start = (scheme_end == std::string::npos) ? 0 : scheme_end + 3;
-      const auto slash      = snapshot_url.find('/', path_start);
+      const auto path_start =
+          (scheme_end == std::string::npos) ? 0 : scheme_end + 3;
+      const auto slash = snapshot_url.find('/', path_start);
       cam.snapshot_url = cam.http_base()
           + ((slash == std::string::npos) ? "/" : snapshot_url.substr(slash));
     }
@@ -157,51 +186,178 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
   }
 
   PQclear(res);
-  PQfinish(conn);
   return cameras;
 }
 
 // ---------------------------------------------------------------------------
+// load_first_party_cameras (by explicit ID list)
+// ---------------------------------------------------------------------------
 
-absl::Status enable_smart_detect(
-    const std::vector<onvif::CameraConfig>& cameras,
+absl::StatusOr<std::vector<FirstPartyCamera>> load_first_party_cameras(
+    const std::vector<std::string>& camera_ids,
     const DbConfig& db) {
-  if (cameras.empty()) return absl::OkStatus();
+  if (camera_ids.empty()) return std::vector<FirstPartyCamera>{};
 
-  std::string connstr =
-    "host="    + db.host   +
-    " port="   + std::to_string(db.port) +
-    " dbname=" + db.dbname +
-    " user="   + db.user;
-  if (!db.password.empty())
-    connstr += " password=" + db.password;
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError(
+        "unifi::load_first_party_cameras: " + pg.error());
 
-  PGconn* conn = PQconnectdb(connstr.c_str());
-  if (PQstatus(conn) != CONNECTION_OK) {
-    std::string err = PQerrorMessage(conn);
-    PQfinish(conn);
-    return absl::InternalError("unifi::enable_smart_detect: " + err);
+  std::string arr = pg_array(camera_ids);
+  const char* sql =
+    "SELECT id, name, mac "
+    "FROM cameras "
+    "WHERE id = ANY($1) "
+    "  AND \"isThirdPartyCamera\" = false "
+    "  AND \"isAdopted\" = true";
+
+  const char* params[1] = { arr.c_str() };
+  PGresult* res = PQexecParams(pg.conn, sql, 1, nullptr, params,
+                               nullptr, nullptr, 0);
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    return absl::InternalError(
+        "unifi::load_first_party_cameras query: " + err);
   }
 
-  // Ensure smartDetectTypes (featureFlags) includes all four detection types
-  // plus "licensePlate".  Including "licensePlate" in featureFlags is required
-  // to unlock the smart-detections panel in the Protect timelapse/playback UI:
-  // the frontend checks featureFlags.smartDetectTypes.includes("licensePlate")
-  // to decide whether to show that panel for third-party cameras.  We do NOT
-  // add "licensePlate" to smartDetectSettings.objectTypes so that no license-
-  // plate recording slots are consumed.
-  //
-  // The condition also fires when a camera already has some types but is
-  // missing "licensePlate" (e.g. cameras seeded by an older recorder build
-  // that only wrote ["person","vehicle"]).
-  //
-  // Cast via ::jsonb so jsonb_set works even though the columns are json type.
+  std::vector<FirstPartyCamera> cameras;
+  int nrows = PQntuples(res);
+  for (int i = 0; i < nrows; ++i) {
+    FirstPartyCamera c;
+    c.id   = PQgetvalue(res, i, 0);
+    c.name = PQgetisnull(res, i, 1) ? "" : PQgetvalue(res, i, 1);
+    c.mac  = PQgetisnull(res, i, 2) ? "" : PQgetvalue(res, i, 2);
+    cameras.push_back(std::move(c));
+  }
+
+  PQclear(res);
+  return cameras;
+}
+
+// ---------------------------------------------------------------------------
+// load_all_nonsmartdetect_first_party (auto-discover)
+// ---------------------------------------------------------------------------
+
+absl::StatusOr<std::vector<FirstPartyCamera>>
+load_all_nonsmartdetect_first_party(const DbConfig& db) {
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError(
+        "unifi::load_all_nonsmartdetect_first_party: " + pg.error());
+
+  const char* sql =
+    "SELECT id, name, mac "
+    "FROM cameras "
+    "WHERE \"isThirdPartyCamera\" = false "
+    "  AND \"isAdopted\" = true "
+    "  AND (\"featureFlags\"::jsonb->>'hasSmartDetect' IS NULL "
+    "       OR \"featureFlags\"::jsonb->>'hasSmartDetect' = 'false')";
+
+  PGresult* res = PQexec(pg.conn, sql);
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    return absl::InternalError(
+        "unifi::load_all_nonsmartdetect_first_party query: " + err);
+  }
+
+  std::vector<FirstPartyCamera> cameras;
+  int nrows = PQntuples(res);
+  for (int i = 0; i < nrows; ++i) {
+    FirstPartyCamera c;
+    c.id   = PQgetvalue(res, i, 0);
+    c.name = PQgetisnull(res, i, 1) ? "" : PQgetvalue(res, i, 1);
+    c.mac  = PQgetisnull(res, i, 2) ? "" : PQgetvalue(res, i, 2);
+    cameras.push_back(std::move(c));
+  }
+
+  PQclear(res);
+  return cameras;
+}
+
+// ---------------------------------------------------------------------------
+// enable_smart_detect — internal per-camera implementation
+// ---------------------------------------------------------------------------
+
+static absl::Status enable_smart_detect_impl(
+    PGconn* conn,
+    const std::string& cam_id,
+    CameraChangeLog* log) {
+  // When logging, capture old values first.
+  if (log) {
+    const char* sel_sql =
+      "SELECT \"featureFlags\"::jsonb->'smartDetectTypes', "
+      "       \"smartDetectSettings\"::jsonb->'objectTypes' "
+      "FROM cameras WHERE id = $1";
+    const char* p[1] = { cam_id.c_str() };
+    PGresult* sel = PQexecParams(conn, sel_sql, 1, nullptr, p,
+                                 nullptr, nullptr, 0);
+    if (PQresultStatus(sel) == PGRES_TUPLES_OK && PQntuples(sel) > 0) {
+      std::string old_sdt = PQgetisnull(sel, 0, 0)
+          ? "" : PQgetvalue(sel, 0, 0);
+      std::string old_ot  = PQgetisnull(sel, 0, 1)
+          ? "" : PQgetvalue(sel, 0, 1);
+      // We'll log after the UPDATE succeeds, using these captured values.
+      PQclear(sel);
+
+      // Perform the UPDATE.
+      const char* upd_sql =
+        "UPDATE cameras "
+        "SET \"featureFlags\" = jsonb_set("
+        "      \"featureFlags\"::jsonb,"
+        "      '{smartDetectTypes}',"
+        "      '[\"person\",\"vehicle\",\"animal\","
+        "\"package\",\"licensePlate\"]'::jsonb"
+        "    )::json,"
+        "    \"smartDetectSettings\" = jsonb_set("
+        "      \"smartDetectSettings\"::jsonb,"
+        "      '{objectTypes}',"
+        "      '[\"person\",\"vehicle\",\"animal\",\"package\"]'::jsonb"
+        "    )::json,"
+        "    \"updatedAt\" = NOW() "
+        "WHERE id = $1 "
+        "  AND ("
+        "    (\"featureFlags\"::jsonb -> 'smartDetectTypes') IS NULL"
+        "    OR (\"featureFlags\"::jsonb -> 'smartDetectTypes') = '[]'::jsonb"
+        "    OR NOT (\"featureFlags\"::jsonb -> 'smartDetectTypes')"
+        "           @> '\"licensePlate\"'::jsonb"
+        "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') IS NULL"
+        "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') = '[]'::jsonb"
+        "  )";
+      PGresult* upd = PQexecParams(conn, upd_sql, 1, nullptr, p,
+                                   nullptr, nullptr, 0);
+      if (PQresultStatus(upd) != PGRES_COMMAND_OK) {
+        std::string err = PQresultErrorMessage(upd);
+        PQclear(upd);
+        return absl::InternalError(
+            "unifi::enable_smart_detect update: " + err);
+      }
+      // Log only if the UPDATE actually changed a row.
+      const char* ct = PQcmdTuples(upd);
+      if (ct && ct[0] != '0') {
+        static const char kNewSdt[] =
+            "[\"person\",\"vehicle\",\"animal\","
+            "\"package\",\"licensePlate\"]";
+        static const char kNewOt[] =
+            "[\"person\",\"vehicle\",\"animal\",\"package\"]";
+        log->record(cam_id, "featureFlags.smartDetectTypes", old_sdt, kNewSdt);
+        log->record(cam_id, "smartDetectSettings.objectTypes", old_ot, kNewOt);
+      }
+      PQclear(upd);
+      return absl::OkStatus();
+    }
+    PQclear(sel);
+  }
+
+  // No-log path (or SELECT failed — fall through to normal UPDATE).
   const char* sql =
     "UPDATE cameras "
     "SET \"featureFlags\" = jsonb_set("
     "      \"featureFlags\"::jsonb,"
     "      '{smartDetectTypes}',"
-    "      '[\"person\",\"vehicle\",\"animal\",\"package\",\"licensePlate\"]'::jsonb"
+    "      '[\"person\",\"vehicle\",\"animal\","
+    "\"package\",\"licensePlate\"]'::jsonb"
     "    )::json,"
     "    \"smartDetectSettings\" = jsonb_set("
     "      \"smartDetectSettings\"::jsonb,"
@@ -218,49 +374,70 @@ absl::Status enable_smart_detect(
     "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') IS NULL"
     "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') = '[]'::jsonb"
     "  )";
-
-  for (const auto& cam : cameras) {
-    const char* params[1] = { cam.id.c_str() };
-    PGresult* res = PQexecParams(conn, sql, 1, nullptr, params,
-                                 nullptr, nullptr, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-      std::string err = PQresultErrorMessage(res);
-      PQclear(res);
-      PQfinish(conn);
-      return absl::InternalError("unifi::enable_smart_detect update: " + err);
-    }
+  const char* params[1] = { cam_id.c_str() };
+  PGresult* res = PQexecParams(conn, sql, 1, nullptr, params,
+                               nullptr, nullptr, 0);
+  if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+    std::string err = PQresultErrorMessage(res);
     PQclear(res);
+    return absl::InternalError("unifi::enable_smart_detect update: " + err);
   }
-
-  PQfinish(conn);
+  PQclear(res);
   return absl::OkStatus();
 }
 
 // ---------------------------------------------------------------------------
+// enable_smart_detect (CameraConfig overload — third-party cameras)
+// ---------------------------------------------------------------------------
 
-absl::Status ensure_smart_detect_zones(
+absl::Status enable_smart_detect(
     const std::vector<onvif::CameraConfig>& cameras,
-    const DbConfig& db) {
+    const DbConfig& db,
+    CameraChangeLog* log) {
   if (cameras.empty()) return absl::OkStatus();
 
-  std::string connstr =
-    "host="    + db.host   +
-    " port="   + std::to_string(db.port) +
-    " dbname=" + db.dbname +
-    " user="   + db.user;
-  if (!db.password.empty())
-    connstr += " password=" + db.password;
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError("unifi::enable_smart_detect: " + pg.error());
 
-  PGconn* conn = PQconnectdb(connstr.c_str());
-  if (PQstatus(conn) != CONNECTION_OK) {
-    std::string err = PQerrorMessage(conn);
-    PQfinish(conn);
-    return absl::InternalError("unifi::ensure_smart_detect_zones: " + err);
+  for (const auto& cam : cameras) {
+    auto s = enable_smart_detect_impl(pg.conn, cam.id, log);
+    if (!s.ok()) return s;
   }
+  return absl::OkStatus();
+}
 
-  // A single full-frame Default zone covering all smart-detect types.  Matches
-  // the format written by Protect for native smart cameras so the UI treats it
-  // identically (scope_all_smart_cameras_with_zones filter requires length > 0).
+// ---------------------------------------------------------------------------
+// enable_smart_detect (FirstPartyCamera overload)
+// ---------------------------------------------------------------------------
+
+absl::Status enable_smart_detect(
+    const std::vector<FirstPartyCamera>& cameras,
+    const DbConfig& db,
+    CameraChangeLog* log) {
+  if (cameras.empty()) return absl::OkStatus();
+
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError("unifi::enable_smart_detect: " + pg.error());
+
+  for (const auto& cam : cameras) {
+    auto s = enable_smart_detect_impl(pg.conn, cam.id, log);
+    if (!s.ok()) return s;
+  }
+  return absl::OkStatus();
+}
+
+// ---------------------------------------------------------------------------
+// ensure_smart_detect_zones — internal implementation
+//
+// Updates cameras in @p ids that have an empty smartDetectZones array.
+// ---------------------------------------------------------------------------
+
+static absl::Status ensure_zones_impl(
+    PGconn* conn,
+    const std::vector<std::string>& ids,
+    CameraChangeLog* log) {
   static const char kDefaultZone[] =
     "[{\"id\":1,\"name\":\"Default\",\"color\":\"#AB46BC\","
     "\"points\":[[0,0],[1,0],[1,1],[0,1]],\"sensitivity\":50,"
@@ -269,49 +446,148 @@ absl::Status ensure_smart_detect_zones(
     "\"triggerAccessTypes\":[],\"enableAccessLPOnlyMode\":false,"
     "\"mergeId\":\"Default-1\"}]";
 
-  // Update all adopted ONVIF cameras that currently have an empty zone list.
+  if (log) {
+    // When logging: per-camera SELECT + UPDATE to capture old value.
+    for (const auto& id : ids) {
+      const char* sel_sql =
+        "SELECT \"smartDetectZones\"::text "
+        "FROM cameras WHERE id = $1 "
+        "  AND (\"smartDetectZones\" IS NULL "
+        "       OR \"smartDetectZones\"::jsonb = '[]'::jsonb)";
+      const char* p[1] = { id.c_str() };
+      PGresult* sel = PQexecParams(conn, sel_sql, 1, nullptr, p,
+                                   nullptr, nullptr, 0);
+      if (PQresultStatus(sel) != PGRES_TUPLES_OK || PQntuples(sel) == 0) {
+        PQclear(sel);
+        continue;  // already has zones
+      }
+      std::string old_val = PQgetisnull(sel, 0, 0)
+          ? "" : PQgetvalue(sel, 0, 0);
+      PQclear(sel);
+
+      const char* upd_sql =
+        "UPDATE cameras "
+        "SET \"smartDetectZones\" = $1::json, "
+        "    \"updatedAt\" = NOW() "
+        "WHERE id = $2 "
+        "  AND (\"smartDetectZones\" IS NULL "
+        "       OR \"smartDetectZones\"::jsonb = '[]'::jsonb)";
+      const char* up[2] = { kDefaultZone, id.c_str() };
+      PGresult* upd = PQexecParams(conn, upd_sql, 2, nullptr, up,
+                                   nullptr, nullptr, 0);
+      if (PQresultStatus(upd) != PGRES_COMMAND_OK) {
+        std::string err = PQresultErrorMessage(upd);
+        PQclear(upd);
+        return absl::InternalError(
+            "unifi::ensure_smart_detect_zones update: " + err);
+      }
+      const char* ct = PQcmdTuples(upd);
+      if (ct && ct[0] != '0')
+        log->record(id, "smartDetectZones", old_val, kDefaultZone);
+      PQclear(upd);
+    }
+    return absl::OkStatus();
+  }
+
+  // Batch update (no-log path): single UPDATE for all provided camera IDs.
+  std::string arr = pg_array(ids);
   const char* sql =
     "UPDATE cameras "
     "SET \"smartDetectZones\" = $1::json, "
     "    \"updatedAt\" = NOW() "
-    "WHERE \"isThirdPartyCamera\" = true "
+    "WHERE id = ANY($2) "
     "  AND (\"smartDetectZones\" IS NULL "
     "       OR \"smartDetectZones\"::jsonb = '[]'::jsonb)";
-
-  const char* params[1] = { kDefaultZone };
-  PGresult* res = PQexecParams(conn, sql, 1, nullptr, params,
+  const char* params[2] = { kDefaultZone, arr.c_str() };
+  PGresult* res = PQexecParams(conn, sql, 2, nullptr, params,
                                nullptr, nullptr, 0);
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     std::string err = PQresultErrorMessage(res);
     PQclear(res);
-    PQfinish(conn);
     return absl::InternalError(
         "unifi::ensure_smart_detect_zones update: " + err);
   }
   PQclear(res);
-  PQfinish(conn);
   return absl::OkStatus();
 }
 
 // ---------------------------------------------------------------------------
+// ensure_smart_detect_zones (CameraConfig overload — third-party cameras)
+// ---------------------------------------------------------------------------
 
-absl::Status set_rtsp_audio(bool enable, const DbConfig& db) {
-  std::string connstr =
-    "host="    + db.host   +
-    " port="   + std::to_string(db.port) +
-    " dbname=" + db.dbname +
-    " user="   + db.user;
-  if (!db.password.empty())
-    connstr += " password=" + db.password;
+absl::Status ensure_smart_detect_zones(
+    const std::vector<onvif::CameraConfig>& cameras,
+    const DbConfig& db,
+    CameraChangeLog* log) {
+  if (cameras.empty()) return absl::OkStatus();
 
-  PGconn* conn = PQconnectdb(connstr.c_str());
-  if (PQstatus(conn) != CONNECTION_OK) {
-    std::string err = PQerrorMessage(conn);
-    PQfinish(conn);
-    return absl::InternalError("unifi::set_rtsp_audio: " + err);
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError(
+        "unifi::ensure_smart_detect_zones: " + pg.error());
+
+  std::vector<std::string> ids;
+  ids.reserve(cameras.size());
+  for (const auto& c : cameras) ids.push_back(c.id);
+  return ensure_zones_impl(pg.conn, ids, log);
+}
+
+// ---------------------------------------------------------------------------
+// ensure_smart_detect_zones (FirstPartyCamera overload)
+// ---------------------------------------------------------------------------
+
+absl::Status ensure_smart_detect_zones(
+    const std::vector<FirstPartyCamera>& cameras,
+    const DbConfig& db,
+    CameraChangeLog* log) {
+  if (cameras.empty()) return absl::OkStatus();
+
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError(
+        "unifi::ensure_smart_detect_zones: " + pg.error());
+
+  std::vector<std::string> ids;
+  ids.reserve(cameras.size());
+  for (const auto& c : cameras) ids.push_back(c.id);
+  return ensure_zones_impl(pg.conn, ids, log);
+}
+
+// ---------------------------------------------------------------------------
+// set_rtsp_audio
+// ---------------------------------------------------------------------------
+
+absl::Status set_rtsp_audio(bool enable, const DbConfig& db,
+                             CameraChangeLog* log) {
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError("unifi::set_rtsp_audio: " + pg.error());
+
+  if (log) {
+    // Per-camera: capture old value before update.
+    const char* sel_sql =
+      "SELECT id, "
+      "       \"thirdPartyCameraInfo\"::jsonb->>'enableRtspAudio' "
+      "FROM cameras "
+      "WHERE \"isThirdPartyCamera\" = true "
+      "  AND \"isAdopted\" = true "
+      "  AND (\"thirdPartyCameraInfo\"::jsonb->>'hasAudio') = 'true'";
+    PGresult* sel = PQexec(pg.conn, sel_sql);
+    if (PQresultStatus(sel) == PGRES_TUPLES_OK) {
+      int nrows = PQntuples(sel);
+      for (int i = 0; i < nrows; ++i) {
+        std::string cam_id = PQgetvalue(sel, i, 0);
+        std::string old_val = PQgetisnull(sel, i, 1)
+            ? "" : PQgetvalue(sel, i, 1);
+        log->record(cam_id,
+                    "thirdPartyCameraInfo.enableRtspAudio",
+                    old_val,
+                    enable ? "true" : "false");
+      }
+    }
+    PQclear(sel);
   }
 
-  // Only update cameras that report hasAudio = true.
   const char* val = enable ? "true" : "false";
   const char* sql =
     "UPDATE cameras "
@@ -326,17 +602,173 @@ absl::Status set_rtsp_audio(bool enable, const DbConfig& db) {
     "  AND (\"thirdPartyCameraInfo\"::jsonb->>'hasAudio') = 'true'";
 
   const char* params[1] = { val };
-  PGresult* res = PQexecParams(conn, sql, 1, nullptr, params,
+  PGresult* res = PQexecParams(pg.conn, sql, 1, nullptr, params,
                                nullptr, nullptr, 0);
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     std::string err = PQresultErrorMessage(res);
     PQclear(res);
-    PQfinish(conn);
     return absl::InternalError("unifi::set_rtsp_audio update: " + err);
   }
   PQclear(res);
-  PQfinish(conn);
   return absl::OkStatus();
+}
+
+// ---------------------------------------------------------------------------
+// rollback_camera_changes
+// ---------------------------------------------------------------------------
+
+absl::StatusOr<int> rollback_camera_changes(
+    const std::string& scope,
+    const std::string& log_path,
+    const std::vector<std::string>& first_party_ids,
+    const DbConfig& db) {
+  const bool do_tp = (scope == "third_party" || scope == "all");
+  const bool do_fp = (scope == "first_party" || scope == "all");
+
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError(
+        "unifi::rollback_camera_changes: " + pg.error());
+
+  auto records = CameraChangeLog::read_all(log_path);
+  int updated = 0;
+
+  if (!records.empty()) {
+    // Build the earliest old_value per (camera_id, column).
+    struct Original {
+      std::string old_value;
+    };
+    std::map<std::pair<std::string, std::string>, Original> originals;
+    for (const auto& r : records) {
+      auto key = std::make_pair(r.camera_id, r.column);
+      if (originals.find(key) == originals.end())
+        originals[key] = { r.old_value };
+    }
+
+    // Determine which camera IDs are first-party (from the provided list).
+    std::set<std::string> fp_set(first_party_ids.begin(),
+                                  first_party_ids.end());
+
+    for (const auto& [key, orig] : originals) {
+      const auto& cam_id = key.first;
+      const auto& column = key.second;
+
+      // Check scope: is this camera in the right set?
+      bool is_fp = fp_set.count(cam_id) > 0;
+      if (is_fp && !do_fp) continue;
+      if (!is_fp && !do_tp) continue;
+
+      // Apply the original value back.  Map column names to SQL.
+      std::string sql;
+      if (column == "featureFlags.smartDetectTypes") {
+        sql =
+          "UPDATE cameras "
+          "SET \"featureFlags\" = jsonb_set("
+          "      \"featureFlags\"::jsonb,"
+          "      '{smartDetectTypes}',"
+          "      $1::jsonb"
+          "    )::json,"
+          "    \"updatedAt\" = NOW() "
+          "WHERE id = $2";
+      } else if (column == "smartDetectSettings.objectTypes") {
+        sql =
+          "UPDATE cameras "
+          "SET \"smartDetectSettings\" = jsonb_set("
+          "      \"smartDetectSettings\"::jsonb,"
+          "      '{objectTypes}',"
+          "      $1::jsonb"
+          "    )::json,"
+          "    \"updatedAt\" = NOW() "
+          "WHERE id = $2";
+      } else if (column == "smartDetectZones") {
+        sql =
+          "UPDATE cameras "
+          "SET \"smartDetectZones\" = $1::json, "
+          "    \"updatedAt\" = NOW() "
+          "WHERE id = $2";
+      } else if (column == "thirdPartyCameraInfo.enableRtspAudio") {
+        sql =
+          "UPDATE cameras "
+          "SET \"thirdPartyCameraInfo\" = jsonb_set("
+          "      \"thirdPartyCameraInfo\"::jsonb,"
+          "      '{enableRtspAudio}',"
+          "      $1::jsonb"
+          "    )::json,"
+          "    \"updatedAt\" = NOW() "
+          "WHERE id = $2";
+      } else {
+        LOG(WARNING) << "[rollback] unknown column: " << column
+                     << " (camera " << cam_id << ")";
+        continue;
+      }
+
+      // Use the recorded old value.  If empty, reset to empty array / null.
+      std::string val = orig.old_value.empty() ? "[]" : orig.old_value;
+      const char* params[2] = { val.c_str(), cam_id.c_str() };
+      PGresult* res = PQexecParams(pg.conn, sql.c_str(), 2, nullptr, params,
+                                   nullptr, nullptr, 0);
+      if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        LOG(WARNING) << "[rollback] failed for camera " << cam_id
+                     << " col " << column << ": "
+                     << PQresultErrorMessage(res);
+      } else {
+        const char* ct = PQcmdTuples(res);
+        if (ct && ct[0] != '0') ++updated;
+      }
+      PQclear(res);
+    }
+
+    LOG(INFO) << "[rollback] restored " << updated
+              << " camera column(s) from change log";
+    return updated;
+  }
+
+  // No change log file — guesstimate based on current code.
+  if (do_tp) {
+    LOG(INFO) << "[rollback] no change log found; resetting third-party "
+              << "cameras to empty smart detect config";
+
+    const char* sql =
+      "UPDATE cameras "
+      "SET \"featureFlags\" = jsonb_set("
+      "      jsonb_set("
+      "        \"featureFlags\"::jsonb,"
+      "        '{smartDetectTypes}',"
+      "        '[]'::jsonb"
+      "      ),"
+      "      '{hasSmartDetect}',"
+      "      'null'::jsonb"
+      "    )::json,"
+      "    \"smartDetectSettings\" = jsonb_set("
+      "      \"smartDetectSettings\"::jsonb,"
+      "      '{objectTypes}',"
+      "      '[]'::jsonb"
+      "    )::json,"
+      "    \"smartDetectZones\" = '[]'::json,"
+      "    \"updatedAt\" = NOW() "
+      "WHERE \"isThirdPartyCamera\" = true "
+      "  AND \"isAdopted\" = true";
+
+    PGresult* res = PQexec(pg.conn, sql);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+      std::string err = PQresultErrorMessage(res);
+      PQclear(res);
+      return absl::InternalError(
+          "unifi::rollback guesstimate update: " + err);
+    }
+    const char* ct = PQcmdTuples(res);
+    if (ct) updated = std::atoi(ct);
+    PQclear(res);
+
+    LOG(INFO) << "[rollback] reset " << updated << " third-party camera(s)";
+  }
+
+  if (do_fp) {
+    LOG(WARNING) << "[rollback] no change log found; cannot rollback "
+                 << "first-party cameras without a log";
+  }
+
+  return updated;
 }
 
 }  // namespace unifi

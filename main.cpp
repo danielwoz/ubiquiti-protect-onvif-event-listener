@@ -19,6 +19,7 @@
  *   - optionally writes every parsed event as JSON Lines (--event_log)
  *   - optionally writes every raw SOAP exchange as JSON Lines (--raw_log)
  *   - records human/vehicle detection intervals to the UniFi Protect PostgreSQL DB
+ *   - polls motion events from first-party cameras and runs NanoDet-M detection
  */
 
 #include <csignal>
@@ -34,6 +35,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
@@ -43,7 +45,9 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "alarm_notifier.hpp"
+#include "camera_change_log.hpp"
 #include "detection_recorder.hpp"
+#include "motion_poller.hpp"
 #include "object_detect.hpp"
 #include "onvif_listener.hpp"
 #include "unifi_camera_config.hpp"
@@ -113,6 +117,25 @@ ABSL_FLAG(bool, coalesce_history, true,
     "that are within --coalesce_window_sec of each other.");
 ABSL_FLAG(int32_t, coalesce_history_days, 30,
     "Number of days to look back when --coalesce_history is set.");
+
+// --- New flags for first-party support, change log, and rollback ---
+
+ABSL_FLAG(std::string, change_log, "",
+    "Path for the cameras-table change log (JSON Lines). Records every "
+    "cameras-table modification with old/new values for rollback support. "
+    "Empty (default) disables change logging.");
+ABSL_FLAG(std::string, rollback, "",
+    "Undo cameras-table changes and exit. "
+    "Values: 'third_party', 'first_party', 'all'. "
+    "Uses --change_log file if it exists; otherwise guesstimates "
+    "from current code for third-party cameras.");
+ABSL_FLAG(std::string, first_party_cameras, "",
+    "Comma-separated camera IDs of first-party cameras to enable smart "
+    "detection flags for in the cameras table. Enables the Protect UI "
+    "smart detection panel for those cameras.");
+ABSL_FLAG(int32_t, poll_interval_sec, 10,
+    "Seconds between motion-event poll cycles for first-party cameras. "
+    "Only active when first-party cameras are discovered.");
 
 // ============================================================
 // JSON helpers (used only by EventRecorder)
@@ -215,9 +238,30 @@ class EventRecorder {
 // Signal handling
 // ============================================================
 static onvif::OnvifListener* g_listener = nullptr;
+static onvif::MotionPoller*  g_poller   = nullptr;
 
 static void signal_handler(int) {
   if (g_listener) g_listener->stop();
+  if (g_poller)   g_poller->stop();
+}
+
+// ============================================================
+// Parse comma-separated IDs into a vector
+// ============================================================
+static std::vector<std::string> parse_csv(const std::string& s) {
+  std::vector<std::string> result;
+  size_t pos = 0;
+  while (pos < s.size()) {
+    size_t comma = s.find(',', pos);
+    if (comma == std::string::npos) comma = s.size();
+    std::string item = s.substr(pos, comma - pos);
+    // Trim whitespace.
+    while (!item.empty() && item.front() == ' ') item.erase(item.begin());
+    while (!item.empty() && item.back() == ' ')  item.pop_back();
+    if (!item.empty()) result.push_back(std::move(item));
+    pos = comma + 1;
+  }
+  return result;
 }
 
 // ============================================================
@@ -239,6 +283,9 @@ int main(int argc, char* argv[]) {
   const std::string thumbs_dir  = absl::GetFlag(FLAGS_ubv_dir);
   const std::string event_log   = absl::GetFlag(FLAGS_event_log);
   const std::string raw_log     = absl::GetFlag(FLAGS_raw_log);
+  const std::string change_log  = absl::GetFlag(FLAGS_change_log);
+  const std::string rollback    = absl::GetFlag(FLAGS_rollback);
+  const std::string fp_cam_str  = absl::GetFlag(FLAGS_first_party_cameras);
   const uint32_t pre_buf_sec    =
       static_cast<uint32_t>(absl::GetFlag(FLAGS_pre_buffer_sec));
   const uint32_t post_buf_sec   =
@@ -253,10 +300,55 @@ int main(int argc, char* argv[]) {
   LOG(INFO) << "Max/hr      : " << absl::GetFlag(FLAGS_max_events_per_hour);
   LOG(INFO) << "Event log   : " << (event_log.empty() ? "(disabled)" : event_log);
   LOG(INFO) << "Raw log     : " << (raw_log.empty() ? "(disabled)" : raw_log);
+  LOG(INFO) << "Change log  : " << (change_log.empty() ? "(disabled)" : change_log);
   if (!thumbs_dir.empty())
     LOG(INFO) << "UBV dir     : " << thumbs_dir;
 
+  // Camera DB config (shared by all camera-config functions).
+  unifi::DbConfig cam_db;
+  cam_db.host = db_host.empty() ? "/run/postgresql" : db_host;
+
+  // Parse first-party camera IDs.
+  const auto fp_camera_ids = parse_csv(fp_cam_str);
+
+  // ----------------------------------------------------------------
+  // Rollback mode: undo cameras-table changes and exit.
+  // ----------------------------------------------------------------
+  if (!rollback.empty()) {
+    if (rollback != "third_party" && rollback != "first_party" &&
+        rollback != "all") {
+      LOG(ERROR) << "Fatal: --rollback must be 'third_party', "
+                 << "'first_party', or 'all' (got '" << rollback << "')";
+      return 1;
+    }
+    // Force verbose for rollback output.
+    absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfo);
+
+    auto result = unifi::rollback_camera_changes(
+        rollback, change_log, fp_camera_ids, cam_db);
+    if (!result.ok()) {
+      LOG(ERROR) << "Fatal: " << result.status().message();
+      return 1;
+    }
+    LOG(INFO) << "[rollback] complete, " << *result << " camera(s) updated";
+    return 0;
+  }
+
   onvif::global_init();
+
+  // Open the change log if configured.
+  std::unique_ptr<unifi::CameraChangeLog> change_log_storage;
+  unifi::CameraChangeLog* cam_log = nullptr;
+  if (!change_log.empty()) {
+    auto cl_or = unifi::CameraChangeLog::Create(change_log);
+    if (!cl_or.ok()) {
+      LOG(ERROR) << "Fatal: " << cl_or.status().message();
+      onvif::global_cleanup();
+      return 1;
+    }
+    change_log_storage = std::move(*cl_or);
+    cam_log = change_log_storage.get();
+  }
 
   // EventRecorder (optional)
   std::unique_ptr<EventRecorder> event_rec_storage;
@@ -334,11 +426,9 @@ int main(int argc, char* argv[]) {
   if (!thumbs_dir.empty())
     det_rec.set_ubv_dir(thumbs_dir);
 
-  // Camera configs are loaded from the UniFi Protect database.
-  // --db_host overrides the host; empty = use the local Unix socket.
-  unifi::DbConfig cam_db;
-  cam_db.host = db_host.empty() ? "/run/postgresql" : db_host;
-
+  // ----------------------------------------------------------------
+  // Load third-party cameras from the UniFi Protect database.
+  // ----------------------------------------------------------------
   auto cams_or = unifi::load_cameras(cam_db);
   if (!cams_or.ok()) {
     LOG(ERROR) << "Fatal: " << cams_or.status().message();
@@ -347,13 +437,14 @@ int main(int argc, char* argv[]) {
   }
   auto cameras = std::move(*cams_or);
 
-  if (auto s = unifi::enable_smart_detect(cameras, cam_db); !s.ok()) {
+  if (auto s = unifi::enable_smart_detect(cameras, cam_db, cam_log); !s.ok()) {
     LOG(ERROR) << "Fatal: " << s.message();
     onvif::global_cleanup();
     return 1;
   }
 
-  if (auto s = unifi::ensure_smart_detect_zones(cameras, cam_db); !s.ok()) {
+  if (auto s = unifi::ensure_smart_detect_zones(cameras, cam_db, cam_log);
+      !s.ok()) {
     LOG(ERROR) << "Fatal: " << s.message();
     onvif::global_cleanup();
     return 1;
@@ -363,7 +454,7 @@ int main(int argc, char* argv[]) {
     const std::string rtsp_audio = absl::GetFlag(FLAGS_rtsp_audio);
     if (rtsp_audio == "enable" || rtsp_audio == "disable") {
       const bool enable = (rtsp_audio == "enable");
-      if (auto s = unifi::set_rtsp_audio(enable, cam_db); !s.ok()) {
+      if (auto s = unifi::set_rtsp_audio(enable, cam_db, cam_log); !s.ok()) {
         LOG(ERROR) << "Fatal: " << s.message();
         onvif::global_cleanup();
         return 1;
@@ -373,10 +464,76 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // ----------------------------------------------------------------
+  // First-party camera flag modification (opt-in via --first_party_cameras).
+  // ----------------------------------------------------------------
+  if (!fp_camera_ids.empty()) {
+    auto fp_or = unifi::load_first_party_cameras(fp_camera_ids, cam_db);
+    if (!fp_or.ok()) {
+      LOG(ERROR) << "Warning: " << fp_or.status().message();
+    } else {
+      auto& fp_cams = *fp_or;
+      LOG(INFO) << "[first_party] " << fp_cams.size()
+                << " camera(s) matched for flag modification";
+      for (const auto& c : fp_cams)
+        LOG(INFO) << "[first_party]   " << c.id << " (" << c.name << ")";
+
+      if (auto s = unifi::enable_smart_detect(fp_cams, cam_db, cam_log);
+          !s.ok()) {
+        LOG(ERROR) << "Warning: " << s.message();
+      }
+      if (auto s = unifi::ensure_smart_detect_zones(fp_cams, cam_db, cam_log);
+          !s.ok()) {
+        LOG(ERROR) << "Warning: " << s.message();
+      }
+    }
+  }
+
+  // ----------------------------------------------------------------
+  // Auto-discover first-party cameras for motion polling.
+  // ----------------------------------------------------------------
+  std::unique_ptr<onvif::MotionPoller> motion_poller;
+  {
+    auto fp_all_or = unifi::load_all_nonsmartdetect_first_party(cam_db);
+    if (fp_all_or.ok() && !fp_all_or->empty() && detector) {
+      const auto& fp_all = *fp_all_or;
+      LOG(INFO) << "[motion_poller] discovered " << fp_all.size()
+                << " first-party camera(s) without smart detection";
+
+      std::vector<std::string> fp_ids;
+      std::map<std::string, std::string> fp_macs;
+      for (const auto& c : fp_all) {
+        fp_ids.push_back(c.id);
+        if (!c.mac.empty()) fp_macs[c.id] = c.mac;
+        LOG(INFO) << "[motion_poller]   " << c.id << " (" << c.name << ")";
+      }
+
+      auto mp_or = onvif::MotionPoller::Create(db_conn);
+      if (mp_or.ok()) {
+        motion_poller = std::move(*mp_or);
+        motion_poller->set_camera_ids(fp_ids);
+        motion_poller->set_camera_macs(fp_macs);
+        motion_poller->set_detector(detector.get());
+        motion_poller->set_poll_interval(
+            absl::GetFlag(FLAGS_poll_interval_sec));
+        motion_poller->set_coalesce_window(
+            static_cast<uint32_t>(absl::GetFlag(FLAGS_coalesce_window_sec)));
+      } else {
+        LOG(ERROR) << "[motion_poller] " << mp_or.status().message();
+      }
+    } else if (fp_all_or.ok() && !fp_all_or->empty() && !detector) {
+      LOG(INFO) << "[motion_poller] " << fp_all_or->size()
+                << " first-party camera(s) found but --detect/--model_dir "
+                << "not set; motion polling disabled";
+    }
+  }
+
   // AlarmNotifier: triggers UniFi Protect security alarms for ONVIF cameras.
   onvif::AlarmNotifier alarm_notifier(absl::GetFlag(FLAGS_uos_url));
   alarm_notifier.refresh_alarms();
   det_rec.set_alarm_notifier(&alarm_notifier);
+  if (motion_poller)
+    motion_poller->set_alarm_notifier(&alarm_notifier);
 
   // Optional startup coalescing: merge nearby events already in the database.
   // Purge stuck-open events (end IS NULL older than 5 minutes) left behind
@@ -413,11 +570,21 @@ int main(int argc, char* argv[]) {
   if (!raw_log.empty())
     listener.enable_raw_recording(raw_log);
 
+  // Start the motion poller before the listener (non-blocking).
+  if (motion_poller) {
+    g_poller = motion_poller.get();
+    motion_poller->start();
+  }
+
   listener.run([event_rec, &det_rec](const onvif::OnvifEvent& ev) {
     if (event_rec) event_rec->write(ev);
     det_rec.on_event(ev);
   });
 
+  // Clean shutdown.
+  if (motion_poller)
+    motion_poller->stop();
+  g_poller   = nullptr;
   g_listener = nullptr;
   onvif::global_cleanup();
   LOG(INFO) << "Done";

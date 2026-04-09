@@ -104,14 +104,41 @@ cc_library(
 )
 
 cc_library(
+    name = "camera_change_log",
+    srcs = ["camera_change_log.cpp"],
+    hdrs = ["camera_change_log.hpp"],
+    deps = [
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "unifi_camera_config",
     srcs = ["unifi_camera_config.cpp"],
     hdrs = ["unifi_camera_config.hpp"],
     deps = [
+        ":camera_change_log",
         ":onvif_listener",
+        "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
     ] + _PQ,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "motion_poller",
+    srcs = ["motion_poller.cpp"],
+    hdrs = ["motion_poller.hpp"],
+    deps = [
+        ":alarm_notifier",
+        ":jpeg_crop",
+        ":object_detect",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:statusor",
+    ] + _JPEG + _PQ,
     visibility = ["//visibility:public"],
 )
 
@@ -121,7 +148,9 @@ cc_binary(
     linkstatic = True,
     deps = [
         ":alarm_notifier",
+        ":camera_change_log",
         ":detection_recorder",
+        ":motion_poller",
         ":object_detect",
         ":onvif_listener",
         ":unifi_camera_config",

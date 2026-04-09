@@ -6,9 +6,9 @@ package) to the UniFi Protect PostgreSQL database so they appear natively in the
 Protect UI — including timeline clips, thumbnails, smart detection search, and
 security alarms.
 
-> **Note:** This software is only needed for third-party cameras adopted into
-> UniFi Protect via the ONVIF integration. Native UniFi cameras have built-in
-> smart detection and do not require this tool.
+> **Note:** This tool is designed for third-party ONVIF cameras but can also
+> add smart detection to **first-party UniFi cameras that lack native AI**
+> (e.g. G3 Instant). See [First-party camera support](#first-party-camera-support).
 
 ---
 
@@ -189,6 +189,92 @@ ExecStart=/root/onvif_recorder --rtsp_audio=enable
 
 Note: this updates the database on every startup. If you only need a one-time change,
 set the flag once, restart the service, then remove the flag and restart again.
+
+### First-party camera support
+
+The recorder can add smart detection to **first-party UniFi cameras that lack
+native AI** (e.g. UVC G3 Instant). These cameras already generate `motion` events
+in Protect with thumbnails — the recorder polls for those events, runs NanoDet-M
+on the existing thumbnail, and inserts smart detection records when a person,
+vehicle, or animal is found.
+
+**How it works:**
+
+1. On startup the recorder auto-discovers all adopted first-party cameras where
+   `featureFlags.hasSmartDetect` is null or false.
+2. A background thread polls the `events` table for completed `motion` events
+   from those cameras.
+3. For each motion event, the recorder fetches the thumbnail Protect already
+   stored, runs NanoDet-M, and — if a relevant subject is detected — inserts
+   a `smartDetectZone` event with all associated records (thumbnail, smart
+   detect object, smart detect raw, alarm notification).
+
+**Requirements:** NanoDet-M must be enabled (`--detect` or `--detect_override`
+with `--model_dir`). Without the model, first-party cameras are discovered but
+the motion poller does not start.
+
+**Optional: enable the Protect UI smart detection panel** for specific cameras
+by passing their database IDs via `--first_party_cameras`. This updates
+`featureFlags.smartDetectTypes` and `smartDetectZones` in the cameras table so
+the Protect UI shows smart detections for those cameras. Without this flag,
+detections are still recorded and alarms still fire — you just won't see them
+in the smart detection timeline filter.
+
+To find your camera IDs, run on the router:
+
+```sql
+psql -h /run/postgresql -p 5433 -U postgres unifi-protect -c "
+SELECT id, name, model
+FROM cameras
+WHERE \"isThirdPartyCamera\" = false AND \"isAdopted\" = true
+ORDER BY name;
+"
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--first_party_cameras` | _(disabled)_ | Comma-separated camera IDs to enable smart detection flags for in the cameras table. Only needed if you want these cameras to appear in the Protect smart detection UI. |
+| `--poll_interval_sec` | `10` | Seconds between motion-event poll cycles for first-party cameras. |
+
+**Example — enable G3 Instant smart detection with UI support:**
+```bash
+ExecStart=/root/onvif_recorder \
+  --detect_override --model_dir=/root/models \
+  --first_party_cameras=6713fe0a01583d03e400051c,6713fa9e023c3d03e4000451
+```
+
+---
+
+### Change log and rollback
+
+The recorder can log every cameras-table modification it makes to a JSON Lines
+file and undo those changes on demand. This is useful for safely experimenting
+with camera flag changes and reverting if something goes wrong.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--change_log` | _(disabled)_ | Path for the cameras-table change log (JSON Lines). Each line records the camera ID, column name, old value, and new value. |
+| `--rollback` | _(disabled)_ | Undo cameras-table changes and **exit**. Values: `third_party` (only third-party cameras), `first_party` (only cameras from `--first_party_cameras`), `all` (both). |
+
+When `--rollback` is set, the recorder reads the change log (if it exists),
+applies the original values back to the database, and exits. If no change log
+file exists and the scope includes third-party cameras, the recorder performs a
+best-effort reset — clearing `smartDetectTypes`, `objectTypes`, and
+`smartDetectZones` to empty arrays for all third-party cameras.
+
+**Example — enable change logging in the service file:**
+```bash
+ExecStart=/root/onvif_recorder \
+  --detect_override --model_dir=/root/models \
+  --change_log=/root/cam_changes.jsonl
+```
+
+**Example — rollback all changes and exit:**
+```bash
+/root/onvif_recorder --rollback=all --change_log=/root/cam_changes.jsonl
+```
+
+---
 
 ### Detection buffers
 
@@ -376,7 +462,9 @@ libldap.so.2  liblber.so.2
 
 ```
 onvif_listener.hpp/.cpp       — WS-PullPoint ONVIF subscription library
-detection_recorder.hpp/.cpp   — Detection → SQLite/PostgreSQL recorder
+detection_recorder.hpp/.cpp   — Detection → PostgreSQL recorder
+motion_poller.hpp/.cpp        — First-party camera motion → smart detect poller
+camera_change_log.hpp/.cpp    — Cameras-table change log and rollback support
 ubv_thumbnail.hpp/.cpp        — UBV container encode/decode (thumbnail storage)
 unifi_camera_config.hpp/.cpp  — Load camera credentials from UniFi Protect DB
 main.cpp                      — Binary entry point
