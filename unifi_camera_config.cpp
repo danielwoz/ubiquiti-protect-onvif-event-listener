@@ -288,7 +288,8 @@ static absl::Status enable_smart_detect_impl(
   if (log) {
     const char* sel_sql =
       "SELECT \"featureFlags\"::jsonb->'smartDetectTypes', "
-      "       \"smartDetectSettings\"::jsonb->'objectTypes' "
+      "       \"smartDetectSettings\"::jsonb->'objectTypes', "
+      "       \"featureFlags\"::jsonb->'hasSmartDetect' "
       "FROM cameras WHERE id = $1";
     const char* p[1] = { cam_id.c_str() };
     PGresult* sel = PQexecParams(conn, sel_sql, 1, nullptr, p,
@@ -298,18 +299,20 @@ static absl::Status enable_smart_detect_impl(
           ? "" : PQgetvalue(sel, 0, 0);
       std::string old_ot  = PQgetisnull(sel, 0, 1)
           ? "" : PQgetvalue(sel, 0, 1);
+      std::string old_hsd = PQgetisnull(sel, 0, 2)
+          ? "" : PQgetvalue(sel, 0, 2);
       // We'll log after the UPDATE succeeds, using these captured values.
       PQclear(sel);
 
       // Perform the UPDATE.
       const char* upd_sql =
         "UPDATE cameras "
-        "SET \"featureFlags\" = jsonb_set("
+        "SET \"featureFlags\" = jsonb_set(jsonb_set("
         "      \"featureFlags\"::jsonb,"
         "      '{smartDetectTypes}',"
         "      '[\"person\",\"vehicle\",\"animal\","
         "\"package\",\"licensePlate\"]'::jsonb"
-        "    )::json,"
+        "    ), '{hasSmartDetect}', 'true'::jsonb)::json,"
         "    \"smartDetectSettings\" = jsonb_set("
         "      \"smartDetectSettings\"::jsonb,"
         "      '{objectTypes}',"
@@ -324,6 +327,8 @@ static absl::Status enable_smart_detect_impl(
         "           @> '\"licensePlate\"'::jsonb"
         "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') IS NULL"
         "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') = '[]'::jsonb"
+        "    OR (\"featureFlags\"::jsonb -> 'hasSmartDetect') IS NULL"
+        "    OR (\"featureFlags\"::jsonb -> 'hasSmartDetect') <> 'true'::jsonb"
         "  )";
       PGresult* upd = PQexecParams(conn, upd_sql, 1, nullptr, p,
                                    nullptr, nullptr, 0);
@@ -343,6 +348,7 @@ static absl::Status enable_smart_detect_impl(
             "[\"person\",\"vehicle\",\"animal\",\"package\"]";
         log->record(cam_id, "featureFlags.smartDetectTypes", old_sdt, kNewSdt);
         log->record(cam_id, "smartDetectSettings.objectTypes", old_ot, kNewOt);
+        log->record(cam_id, "featureFlags.hasSmartDetect", old_hsd, "true");
       }
       PQclear(upd);
       return absl::OkStatus();
@@ -353,12 +359,12 @@ static absl::Status enable_smart_detect_impl(
   // No-log path (or SELECT failed — fall through to normal UPDATE).
   const char* sql =
     "UPDATE cameras "
-    "SET \"featureFlags\" = jsonb_set("
+    "SET \"featureFlags\" = jsonb_set(jsonb_set("
     "      \"featureFlags\"::jsonb,"
     "      '{smartDetectTypes}',"
     "      '[\"person\",\"vehicle\",\"animal\","
     "\"package\",\"licensePlate\"]'::jsonb"
-    "    )::json,"
+    "    ), '{hasSmartDetect}', 'true'::jsonb)::json,"
     "    \"smartDetectSettings\" = jsonb_set("
     "      \"smartDetectSettings\"::jsonb,"
     "      '{objectTypes}',"
@@ -373,6 +379,8 @@ static absl::Status enable_smart_detect_impl(
     "           @> '\"licensePlate\"'::jsonb"
     "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') IS NULL"
     "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') = '[]'::jsonb"
+    "    OR (\"featureFlags\"::jsonb -> 'hasSmartDetect') IS NULL"
+    "    OR (\"featureFlags\"::jsonb -> 'hasSmartDetect') <> 'true'::jsonb"
     "  )";
   const char* params[1] = { cam_id.c_str() };
   PGresult* res = PQexecParams(conn, sql, 1, nullptr, params,
@@ -686,6 +694,16 @@ absl::StatusOr<int> rollback_camera_changes(
           "SET \"smartDetectZones\" = $1::json, "
           "    \"updatedAt\" = NOW() "
           "WHERE id = $2";
+      } else if (column == "featureFlags.hasSmartDetect") {
+        sql =
+          "UPDATE cameras "
+          "SET \"featureFlags\" = jsonb_set("
+          "      \"featureFlags\"::jsonb,"
+          "      '{hasSmartDetect}',"
+          "      $1::jsonb"
+          "    )::json,"
+          "    \"updatedAt\" = NOW() "
+          "WHERE id = $2";
       } else if (column == "thirdPartyCameraInfo.enableRtspAudio") {
         sql =
           "UPDATE cameras "
@@ -702,8 +720,16 @@ absl::StatusOr<int> rollback_camera_changes(
         continue;
       }
 
-      // Use the recorded old value.  If empty, reset to empty array / null.
-      std::string val = orig.old_value.empty() ? "[]" : orig.old_value;
+      // Use the recorded old value.  If empty, reset to empty array (for
+      // array columns) or null (for scalar columns like hasSmartDetect).
+      std::string val;
+      if (!orig.old_value.empty()) {
+        val = orig.old_value;
+      } else if (column == "featureFlags.hasSmartDetect") {
+        val = "null";
+      } else {
+        val = "[]";
+      }
       const char* params[2] = { val.c_str(), cam_id.c_str() };
       PGresult* res = PQexecParams(pg.conn, sql.c_str(), 2, nullptr, params,
                                    nullptr, nullptr, 0);
