@@ -284,11 +284,19 @@ static absl::Status enable_smart_detect_impl(
     PGconn* conn,
     const std::string& cam_id,
     CameraChangeLog* log) {
+  static const char kSmartDetectSettings[] =
+      "{\"objectTypes\":[\"person\",\"vehicle\",\"animal\",\"package\"],"
+      "\"audioTypes\":[],"
+      "\"autoTrackingObjectTypes\":[],"
+      "\"autoTrackingWithZoom\":true,"
+      "\"autoTrackingTimeoutSec\":20,"
+      "\"detectionRange\":{\"max\":null,\"min\":null},"
+      "\"enableTamperDetection\":false}";
   // When logging, capture old values first.
   if (log) {
     const char* sel_sql =
       "SELECT \"featureFlags\"::jsonb->'smartDetectTypes', "
-      "       \"smartDetectSettings\"::jsonb->'objectTypes', "
+      "       \"smartDetectSettings\"::text, "
       "       \"featureFlags\"::jsonb->'hasSmartDetect' "
       "FROM cameras WHERE id = $1";
     const char* p[1] = { cam_id.c_str() };
@@ -297,7 +305,7 @@ static absl::Status enable_smart_detect_impl(
     if (PQresultStatus(sel) == PGRES_TUPLES_OK && PQntuples(sel) > 0) {
       std::string old_sdt = PQgetisnull(sel, 0, 0)
           ? "" : PQgetvalue(sel, 0, 0);
-      std::string old_ot  = PQgetisnull(sel, 0, 1)
+      std::string old_sds = PQgetisnull(sel, 0, 1)
           ? "" : PQgetvalue(sel, 0, 1);
       std::string old_hsd = PQgetisnull(sel, 0, 2)
           ? "" : PQgetvalue(sel, 0, 2);
@@ -313,11 +321,7 @@ static absl::Status enable_smart_detect_impl(
         "      '[\"person\",\"vehicle\",\"animal\","
         "\"package\",\"licensePlate\"]'::jsonb"
         "    ), '{hasSmartDetect}', 'true'::jsonb)::json,"
-        "    \"smartDetectSettings\" = jsonb_set("
-        "      \"smartDetectSettings\"::jsonb,"
-        "      '{objectTypes}',"
-        "      '[\"person\",\"vehicle\",\"animal\",\"package\"]'::jsonb"
-        "    )::json,"
+        "    \"smartDetectSettings\" = $2::json,"
         "    \"updatedAt\" = NOW() "
         "WHERE id = $1 "
         "  AND ("
@@ -327,10 +331,12 @@ static absl::Status enable_smart_detect_impl(
         "           @> '\"licensePlate\"'::jsonb"
         "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') IS NULL"
         "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') = '[]'::jsonb"
+        "    OR (\"smartDetectSettings\"::jsonb -> 'audioTypes') IS NULL"
         "    OR (\"featureFlags\"::jsonb -> 'hasSmartDetect') IS NULL"
         "    OR (\"featureFlags\"::jsonb -> 'hasSmartDetect') <> 'true'::jsonb"
         "  )";
-      PGresult* upd = PQexecParams(conn, upd_sql, 1, nullptr, p,
+      const char* up[2] = { cam_id.c_str(), kSmartDetectSettings };
+      PGresult* upd = PQexecParams(conn, upd_sql, 2, nullptr, up,
                                    nullptr, nullptr, 0);
       if (PQresultStatus(upd) != PGRES_COMMAND_OK) {
         std::string err = PQresultErrorMessage(upd);
@@ -344,10 +350,8 @@ static absl::Status enable_smart_detect_impl(
         static const char kNewSdt[] =
             "[\"person\",\"vehicle\",\"animal\","
             "\"package\",\"licensePlate\"]";
-        static const char kNewOt[] =
-            "[\"person\",\"vehicle\",\"animal\",\"package\"]";
         log->record(cam_id, "featureFlags.smartDetectTypes", old_sdt, kNewSdt);
-        log->record(cam_id, "smartDetectSettings.objectTypes", old_ot, kNewOt);
+        log->record(cam_id, "smartDetectSettings", old_sds, kSmartDetectSettings);
         log->record(cam_id, "featureFlags.hasSmartDetect", old_hsd, "true");
       }
       PQclear(upd);
@@ -365,11 +369,7 @@ static absl::Status enable_smart_detect_impl(
     "      '[\"person\",\"vehicle\",\"animal\","
     "\"package\",\"licensePlate\"]'::jsonb"
     "    ), '{hasSmartDetect}', 'true'::jsonb)::json,"
-    "    \"smartDetectSettings\" = jsonb_set("
-    "      \"smartDetectSettings\"::jsonb,"
-    "      '{objectTypes}',"
-    "      '[\"person\",\"vehicle\",\"animal\",\"package\"]'::jsonb"
-    "    )::json,"
+    "    \"smartDetectSettings\" = $2::json,"
     "    \"updatedAt\" = NOW() "
     "WHERE id = $1 "
     "  AND ("
@@ -379,11 +379,12 @@ static absl::Status enable_smart_detect_impl(
     "           @> '\"licensePlate\"'::jsonb"
     "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') IS NULL"
     "    OR (\"smartDetectSettings\"::jsonb -> 'objectTypes') = '[]'::jsonb"
+    "    OR (\"smartDetectSettings\"::jsonb -> 'audioTypes') IS NULL"
     "    OR (\"featureFlags\"::jsonb -> 'hasSmartDetect') IS NULL"
     "    OR (\"featureFlags\"::jsonb -> 'hasSmartDetect') <> 'true'::jsonb"
     "  )";
-  const char* params[1] = { cam_id.c_str() };
-  PGresult* res = PQexecParams(conn, sql, 1, nullptr, params,
+  const char* params[2] = { cam_id.c_str(), kSmartDetectSettings };
+  PGresult* res = PQexecParams(conn, sql, 2, nullptr, params,
                                nullptr, nullptr, 0);
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     std::string err = PQresultErrorMessage(res);
@@ -678,14 +679,11 @@ absl::StatusOr<int> rollback_camera_changes(
           "    )::json,"
           "    \"updatedAt\" = NOW() "
           "WHERE id = $2";
-      } else if (column == "smartDetectSettings.objectTypes") {
+      } else if (column == "smartDetectSettings.objectTypes" ||
+                 column == "smartDetectSettings") {
         sql =
           "UPDATE cameras "
-          "SET \"smartDetectSettings\" = jsonb_set("
-          "      \"smartDetectSettings\"::jsonb,"
-          "      '{objectTypes}',"
-          "      $1::jsonb"
-          "    )::json,"
+          "SET \"smartDetectSettings\" = $1::json,"
           "    \"updatedAt\" = NOW() "
           "WHERE id = $2";
       } else if (column == "smartDetectZones") {
@@ -765,11 +763,7 @@ absl::StatusOr<int> rollback_camera_changes(
       "      '{hasSmartDetect}',"
       "      'null'::jsonb"
       "    )::json,"
-      "    \"smartDetectSettings\" = jsonb_set("
-      "      \"smartDetectSettings\"::jsonb,"
-      "      '{objectTypes}',"
-      "      '[]'::jsonb"
-      "    )::json,"
+      "    \"smartDetectSettings\" = '{\"objectTypes\":[]}'::json,"
       "    \"smartDetectZones\" = '[]'::json,"
       "    \"updatedAt\" = NOW() "
       "WHERE \"isThirdPartyCamera\" = true "
