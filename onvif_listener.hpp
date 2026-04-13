@@ -123,11 +123,14 @@ class OnvifListener {
 
     /// Spawn one thread per camera. Invoke cb for every received event
     /// (from the camera's own thread -- cb must be thread-safe).
-    /// Blocks until stop() is called and all threads have joined.
+    /// Blocks until stop() is called and all threads have exited (or a
+    /// 30-second shutdown deadline expires, at which point stuck threads
+    /// are detached so the process can exit cleanly).
     void run(EventCallback cb);
 
     /// Signal all camera threads to stop. Safe to call from any thread
-    /// or signal handler; run() returns once all threads have joined.
+    /// or signal handler; run() returns once all threads have joined
+    /// or the shutdown deadline has been reached.
     void stop();
 
  private:
