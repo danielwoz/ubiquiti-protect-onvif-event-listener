@@ -335,8 +335,14 @@ class DetectionRecorder {
     /// existing event. Returns the number of rows deleted.
     virtual int purge_orphaned_detection_labels() { return 0; }
 
+    /// Delete all orphaned rows across smartDetectRaws, thumbnails,
+    /// smartDetectObjects, and detectionLabels in a single transaction.
+    /// Returns the total number of rows deleted.
+    virtual int purge_all_orphaned_rows() { return 0; }
+
     /// Delete stuck-open events (end IS NULL) for third-party cameras whose
     /// start is older than older_than_ms, plus their dependent rows.
+    /// All deletes run in a single transaction.
     /// Returns the number of event rows deleted.
     virtual int purge_stale_open_events(uint64_t /*older_than_ms*/) { return 0; }
   };

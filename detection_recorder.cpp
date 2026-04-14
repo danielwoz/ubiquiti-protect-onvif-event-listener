@@ -395,6 +395,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   }
 
   // Execute a no-parameter DELETE and return the row count; logs on failure.
+  // Returns -1 on error so callers can detect failure.
   int exec_purge(const char* sql, const char* label) {
     maybe_reconnect();
     PGresult* res = PQexec(conn_, sql);
@@ -404,9 +405,33 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
       if (tag && *tag) deleted = std::atoi(tag);
     } else {
       LOG(ERROR) << "[pg] " << label << " failed: " << pg_errmsg(res);
+      PQclear(res);
+      return -1;
     }
     PQclear(res);
     return deleted;
+  }
+
+  // Transaction helpers.
+  bool begin_txn() {
+    PGresult* r = PQexec(conn_, "BEGIN");
+    bool ok = PQresultStatus(r) == PGRES_COMMAND_OK;
+    if (!ok) LOG(ERROR) << "[pg] BEGIN failed: " << pg_errmsg(r);
+    PQclear(r);
+    return ok;
+  }
+  bool commit_txn() {
+    PGresult* r = PQexec(conn_, "COMMIT");
+    bool ok = PQresultStatus(r) == PGRES_COMMAND_OK;
+    if (!ok) LOG(ERROR) << "[pg] COMMIT failed: " << pg_errmsg(r);
+    PQclear(r);
+    return ok;
+  }
+  void rollback_txn() {
+    PGresult* r = PQexec(conn_, "ROLLBACK");
+    if (PQresultStatus(r) != PGRES_COMMAND_OK)
+      LOG(ERROR) << "[pg] ROLLBACK failed: " << pg_errmsg(r);
+    PQclear(r);
   }
 
   // Execute a parameterized DML statement; logs errors to stderr (non-fatal).
@@ -739,8 +764,43 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         "purge_orphaned_detection_labels");
   }
 
+  int purge_all_orphaned_rows() override {
+    maybe_reconnect();
+    if (!begin_txn()) return 0;
+    int total = 0;
+    int n;
+    n = purge_orphaned_smart_detect_raws();
+    if (n < 0) {
+      rollback_txn();
+      return 0;
+    }
+    total += n;
+    n = purge_orphaned_thumbnails();
+    if (n < 0) {
+      rollback_txn();
+      return 0;
+    }
+    total += n;
+    n = purge_orphaned_smart_detect_objects();
+    if (n < 0) {
+      rollback_txn();
+      return 0;
+    }
+    total += n;
+    n = purge_orphaned_detection_labels();
+    if (n < 0) {
+      rollback_txn();
+      return 0;
+    }
+    total += n;
+    if (!commit_txn()) return 0;
+    return total;
+  }
+
   int purge_stale_open_events(uint64_t older_than_ms) override {
     maybe_reconnect();
+    if (!begin_txn()) return 0;
+
     const std::string cutoff = std::to_string(
         static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -748,8 +808,23 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         - older_than_ms);
     const char* p[] = { cutoff.c_str() };
 
+    // Helper: run a parameterized DELETE inside the transaction.
+    // Returns false on error (caller should rollback).
+    auto exec_step = [&](const char* sql, const char* label) -> bool {
+      PGresult* r = PQexecParams(
+          conn_, sql, 1, nullptr, p, nullptr, nullptr, 0);
+      if (PQresultStatus(r) != PGRES_COMMAND_OK) {
+        LOG(ERROR) << "[pg] purge_stale_open_events (" << label
+                   << "): " << pg_errmsg(r);
+        PQclear(r);
+        return false;
+      }
+      PQclear(r);
+      return true;
+    };
+
     // Delete dependent rows first (smartDetectRaws by timestamp window).
-    PGresult* r = PQexecParams(conn_,
+    if (!exec_step(
         "DELETE FROM \"smartDetectRaws\" sdr"
         " USING events e"
         " JOIN cameras c ON c.id = e.\"cameraId\""
@@ -761,12 +836,9 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         "   AND sdr.\"cameraId\" = e.\"cameraId\""
         "   AND sdr.timestamp >= e.start"
         "   AND sdr.timestamp <= e.start + 60000",
-        1, nullptr, p, nullptr, nullptr, 0);
-    if (PQresultStatus(r) != PGRES_COMMAND_OK)
-      LOG(ERROR) << "[pg] purge_stale_open_events (raws): " << pg_errmsg(r);
-    PQclear(r);
+        "raws")) { rollback_txn(); return 0; }
 
-    r = PQexecParams(conn_,
+    if (!exec_step(
         "DELETE FROM thumbnails t"
         " USING events e"
         " JOIN cameras c ON c.id = e.\"cameraId\""
@@ -776,12 +848,9 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         "   AND e.\"end\" IS NULL"
         "   AND e.start < $1::bigint"
         "   AND t.\"eventId\" = e.id",
-        1, nullptr, p, nullptr, nullptr, 0);
-    if (PQresultStatus(r) != PGRES_COMMAND_OK)
-      LOG(ERROR) << "[pg] purge_stale_open_events (thumbnails): " << pg_errmsg(r);
-    PQclear(r);
+        "thumbnails")) { rollback_txn(); return 0; }
 
-    r = PQexecParams(conn_,
+    if (!exec_step(
         "DELETE FROM \"smartDetectObjects\" o"
         " USING events e"
         " JOIN cameras c ON c.id = e.\"cameraId\""
@@ -791,12 +860,9 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         "   AND e.\"end\" IS NULL"
         "   AND e.start < $1::bigint"
         "   AND o.\"eventId\" = e.id",
-        1, nullptr, p, nullptr, nullptr, 0);
-    if (PQresultStatus(r) != PGRES_COMMAND_OK)
-      LOG(ERROR) << "[pg] purge_stale_open_events (sdo): " << pg_errmsg(r);
-    PQclear(r);
+        "sdo")) { rollback_txn(); return 0; }
 
-    r = PQexecParams(conn_,
+    if (!exec_step(
         "DELETE FROM \"detectionLabels\" dl"
         " USING events e"
         " JOIN cameras c ON c.id = e.\"cameraId\""
@@ -806,13 +872,10 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         "   AND e.\"end\" IS NULL"
         "   AND e.start < $1::bigint"
         "   AND dl.\"eventId\" = e.id",
-        1, nullptr, p, nullptr, nullptr, 0);
-    if (PQresultStatus(r) != PGRES_COMMAND_OK)
-      LOG(ERROR) << "[pg] purge_stale_open_events (labels): " << pg_errmsg(r);
-    PQclear(r);
+        "labels")) { rollback_txn(); return 0; }
 
     // Delete the stale event rows and return count.
-    r = PQexecParams(conn_,
+    PGresult* r = PQexecParams(conn_,
         "DELETE FROM events e"
         " USING cameras c"
         " WHERE c.id = e.\"cameraId\""
@@ -827,9 +890,15 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
       const char* tag = PQcmdTuples(r);
       if (tag && *tag) deleted = std::atoi(tag);
     } else {
-      LOG(ERROR) << "[pg] purge_stale_open_events (events): " << pg_errmsg(r);
+      LOG(ERROR) << "[pg] purge_stale_open_events (events): "
+                 << pg_errmsg(r);
+      PQclear(r);
+      rollback_txn();
+      return 0;
     }
     PQclear(r);
+
+    if (!commit_txn()) return 0;
     return deleted;
   }
 
@@ -1169,15 +1238,13 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
             char date_buf[16];
             std::strftime(date_buf, sizeof(date_buf), "%Y/%m/%d", &tm);
             std::string date_str(date_buf);
-            {
-              std::lock_guard<std::mutex> cache_lk(mu_);
-              auto& cached = ubv_path_cache_[cam_mac];
-              if (cached.first != date_str) {
-                cached.first = date_str;
-                cached.second = ubv::protect_path(ubv_dir, cam_mac, ts_ms);
-              }
-              ubv_path = cached.second;
+            // mu_ is already held by the outer lock_guard (line ~1194).
+            auto& cached = ubv_path_cache_[cam_mac];
+            if (cached.first != date_str) {
+              cached.first = date_str;
+              cached.second = ubv::protect_path(ubv_dir, cam_mac, ts_ms);
             }
+            ubv_path = cached.second;
           } else {
             // Legacy fallback: flat directory with IP-based naming.
             ubv_path = ubv_dir + "/" + ev.camera_ip + "_thumbnails.ubv";
@@ -1275,12 +1342,7 @@ int DetectionRecorder::coalesce_history(int days) {
 }
 
 int DetectionRecorder::purge_orphaned_rows() {
-  int total = 0;
-  total += db_->purge_orphaned_smart_detect_raws();
-  total += db_->purge_orphaned_thumbnails();
-  total += db_->purge_orphaned_smart_detect_objects();
-  total += db_->purge_orphaned_detection_labels();
-  return total;
+  return db_->purge_all_orphaned_rows();
 }
 
 int DetectionRecorder::purge_stale_open_events(uint64_t older_than_ms) {
