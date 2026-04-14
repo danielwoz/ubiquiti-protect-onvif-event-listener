@@ -129,6 +129,17 @@ cc_library(
 )
 
 cc_library(
+    name = "protect_ui_patch",
+    srcs = ["protect_ui_patch.cpp"],
+    hdrs = ["protect_ui_patch.hpp"],
+    deps = [
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:status",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "motion_poller",
     srcs = ["motion_poller.cpp"],
     hdrs = ["motion_poller.hpp"],
@@ -154,6 +165,7 @@ cc_binary(
         ":motion_poller",
         ":object_detect",
         ":onvif_listener",
+        ":protect_ui_patch",
         ":unifi_camera_config",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",

@@ -52,6 +52,7 @@
 #include "motion_poller.hpp"
 #include "object_detect.hpp"
 #include "onvif_listener.hpp"
+#include "protect_ui_patch.hpp"
 #include "unifi_camera_config.hpp"
 
 // ============================================================
@@ -138,6 +139,11 @@ ABSL_FLAG(std::string, first_party_cameras, "",
 ABSL_FLAG(int32_t, poll_interval_sec, 10,
     "Seconds between motion-event poll cycles for first-party cameras. "
     "Only active when first-party cameras are discovered.");
+ABSL_FLAG(bool, patch_alarm_picker, false,
+    "Live-patch the Protect UI (swai.js) to allow third-party cameras "
+    "in the alarm creation picker. The patch is idempotent and re-applied "
+    "on every startup so it survives firmware updates. The original file "
+    "is backed up to swai.js.bak before each patch.");
 
 // ============================================================
 // JSON helpers (used only by EventRecorder)
@@ -341,10 +347,26 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     LOG(INFO) << "[rollback] complete, " << *result << " camera(s) updated";
+
+    // Revert Protect UI patches if they were applied.
+    auto ui_s = protect_ui::revert_alarm_picker();
+    if (!ui_s.ok())
+      LOG(WARNING) << "[rollback] " << ui_s.message();
+
     return 0;
   }
 
   onvif::global_init();
+
+  // Patch the Protect UI alarm picker to include third-party cameras.
+  if (absl::GetFlag(FLAGS_patch_alarm_picker)) {
+    auto s = protect_ui::patch_alarm_picker();
+    if (s.ok()) {
+      LOG(INFO) << "[ui_patch] success";
+    } else {
+      LOG(WARNING) << "[ui_patch] " << s.message();
+    }
+  }
 
   // Open the change log if configured.
   std::unique_ptr<unifi::CameraChangeLog> change_log_storage;

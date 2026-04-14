@@ -88,6 +88,7 @@ detection_recorder.hpp/.cpp   — Detection → PostgreSQL recorder
 motion_poller.hpp/.cpp        — First-party camera motion → smart detect poller
                                   Polls events table, runs NanoDet-M on Protect thumbnails
 camera_change_log.hpp/.cpp    — Cameras-table change log and rollback support
+protect_ui_patch.hpp/.cpp     — Live-patch Protect UI alarm picker for third-party cameras
 ubv_thumbnail.hpp/.cpp        — UBV container encode/decode (thumbnail storage)
 jpeg_crop.hpp/.cpp            — JPEG decode/crop/re-encode via libjpeg
 object_detect.hpp/.cpp        — NanoDet-M on-device object detection via NCNN
@@ -213,6 +214,7 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--poll_interval_sec` | `10` | Seconds between motion-event poll cycles for first-party cameras. |
 | `--change_log` | _(empty)_ | Path for cameras-table change log (JSON Lines). Records old/new values for rollback. |
 | `--rollback` | _(empty)_ | Undo cameras-table changes and exit. Values: `third_party`, `first_party`, `all`. |
+| `--patch_alarm_picker` | `false` | Live-patch the Protect UI to allow third-party cameras in the alarm creation picker. Re-applied on every startup so it survives firmware updates. |
 
 Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default is `kError`.
 `enable_verbose_logging()` has been removed from `OnvifListener`; set log level via absl before calling `run()`.
