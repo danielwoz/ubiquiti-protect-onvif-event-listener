@@ -982,24 +982,34 @@ void OnvifListener::run(EventCallback cb) {
     threads.emplace_back([ptr] { ptr->run(); });
   }
 
-  // Wait for threads with a deadline.  If a camera thread is stuck in a
-  // blocking curl call (or any other syscall) after stop() is called, we
-  // detach it rather than blocking the entire process forever.
+  // Block until stop() is called or every worker finishes on its own
+  // (e.g. max_consecutive_failures reached).
+  while (running_) {
+    bool all_done = true;
+    for (auto& w : workers) {
+      if (!w->finished()) {
+        all_done = false;
+        break;
+      }
+    }
+    if (all_done) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+
+  // Signal all workers to stop (idempotent if already false).
+  running_ = false;
+
+  // Give threads a deadline to finish after the stop signal.  If a camera
+  // thread is stuck in a blocking curl call we detach it rather than
+  // blocking the entire process forever.
   constexpr int kJoinTimeoutSec = 30;
   auto deadline = std::chrono::steady_clock::now()
                   + std::chrono::seconds(kJoinTimeoutSec);
   for (size_t i = 0; i < threads.size(); ++i) {
-    auto remaining = deadline - std::chrono::steady_clock::now();
-    if (remaining <= std::chrono::seconds(0)) {
-      LOG(ERROR) << '[' << cameras_[i].ip
-                 << "] thread did not stop within " << kJoinTimeoutSec
-                 << "s -- detaching";
-      threads[i].detach();
+    if (workers[i]->finished()) {
+      threads[i].join();
       continue;
     }
-    // Poll with 1-second granularity until the thread finishes or the
-    // deadline expires.  std::thread has no timed join, so we spin-check
-    // via a condition variable that the worker signals on exit.
     bool joined = false;
     while (std::chrono::steady_clock::now() < deadline) {
       if (workers[i]->finished()) {
