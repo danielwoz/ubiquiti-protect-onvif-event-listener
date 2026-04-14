@@ -82,7 +82,7 @@ cc_library(
     hdrs = ["alarm_notifier.hpp"],
     deps = [
         "@com_google_absl//absl/log:log",
-    ] + _CURL,
+    ] + _CURL + _PQ,
     visibility = ["//visibility:public"],
 )
 
@@ -172,7 +172,7 @@ cc_binary(
         "@com_google_absl//absl/log:globals",
         "@com_google_absl//absl/log:initialize",
         "@com_google_absl//absl/log:log",
-    ],
+    ] + _PQ,
 )
 
 sh_binary(

@@ -237,11 +237,11 @@ class UosEmulator : public OnvifCameraEmulator {
  public:
   UosEmulator();
 
-  /// Replace the alarm list JSON returned by GET /api/v1/alarms.
+  /// Replace the automations JSON returned by GET /api/automations.
   /// Call before start() or while running; thread-safe.
   void set_alarms_json(const std::string& json);
 
-  /// Returns every POST body received at /api/v1/alarms/events.
+  /// Returns the URL path of every POST received at /api/automations/*/run.
   std::vector<std::string> posted_events() const;
 
   /// Base URL of this server, e.g. "http://127.0.0.1:54321".

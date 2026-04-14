@@ -566,7 +566,7 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
 struct TestContext {
   std::string                      ubv_dir;
   // Optional: set before run_standard_script() to inject MACs into CameraConfigs
-  // so AlarmNotifier can include them in UOS POST scope fields.
+  // so AlarmNotifier can match them against automation source filters.
   std::string                      mac108;
   std::string                      mac109;
   // Optional: UOS base URL to advertise in GetServices alarm service entries.
@@ -1377,20 +1377,19 @@ static void test_onvif_bbox_crop(const std::string& ubv_dir) {
 }
 
 // ============================================================
-// AlarmNotifier: single person alarm fires exactly once on person detection
+// AlarmNotifier: single person automation fires exactly once on person detection
 // ============================================================
 static void test_alarm_notify_person() {
-  static const char kAlarms[] =
-    "[{\"id\":\"3a4b5c6d-7e8f-9012-a3b4-c5d6e7f80912\","
-    "\"title\":\"Person Alert\","
-    "\"triggers_data\":[[{\"id\":\"smartDetectType:person\","
-    "\"is_matched_externally\":true}]]}]";
+  static const char kAutomations[] =
+    "[{\"id\":\"aaa111\",\"enable\":true,\"deleted\":false,"
+    "\"sources\":[],"
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"person\"}}]}]";
 
   UosEmulator uos;
-  uos.set_alarms_json(kAlarms);
+  uos.set_alarms_json(kAutomations);
   uos.start();
 
-  onvif::AlarmNotifier notifier(uos.base_url());
+  onvif::AlarmNotifier notifier(uos.base_url(), "test-user-id");
   notifier.refresh_alarms();
   notifier.notify("person", "AABBCCDDEEFF", "event-uuid-abc", 1234567890000ULL);
 
@@ -1400,35 +1399,34 @@ static void test_alarm_notify_person() {
         + std::to_string(posted.size()));
 
   if (!posted.empty()) {
-    const std::string& body = posted[0];
-    CHECK(body.find("smartDetectType:person") != std::string::npos,
-          "alarm_notify_person: POST body missing event key");
-    CHECK(body.find("3a4b5c6d-7e8f-9012-a3b4-c5d6e7f80912") != std::string::npos,
-          "alarm_notify_person: POST body missing alarm ID");
-    CHECK(body.find("AABBCCDDEEFF") != std::string::npos,
-          "alarm_notify_person: POST body missing camera MAC in scope");
+    CHECK(posted[0].find("aaa111") != std::string::npos,
+          "alarm_notify_person: POST path missing automation ID");
+    CHECK(posted[0].find("/run") != std::string::npos,
+          "alarm_notify_person: POST path missing /run");
   }
 }
 
 // ============================================================
-// AlarmNotifier: type filtering — person alarm ignores vehicle events;
-// vehicle alarm ignores person events
+// AlarmNotifier: type filtering — person automation ignores vehicle events;
+// vehicle automation ignores person events
 // ============================================================
 static void test_alarm_type_filtering() {
-  static const char kAlarms[] =
-    "[{\"id\":\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\","
-    "\"triggers_data\":[[{\"id\":\"smartDetectType:person\"}]]},"
-    "{\"id\":\"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\","
-    "\"triggers_data\":[[{\"id\":\"smartDetectType:vehicle\"}]]}]";
+  static const char kAutomations[] =
+    "[{\"id\":\"person_auto\",\"enable\":true,\"deleted\":false,"
+    "\"sources\":[],"
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"person\"}}]},"
+    "{\"id\":\"vehicle_auto\",\"enable\":true,\"deleted\":false,"
+    "\"sources\":[],"
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"vehicle\"}}]}]";
 
   UosEmulator uos;
-  uos.set_alarms_json(kAlarms);
+  uos.set_alarms_json(kAutomations);
   uos.start();
 
-  onvif::AlarmNotifier notifier(uos.base_url());
+  onvif::AlarmNotifier notifier(uos.base_url(), "test-user-id");
   notifier.refresh_alarms();
 
-  // Person detection → only person alarm fires.
+  // Person detection → only person automation fires.
   notifier.notify("person", "112233445566", "evt-p", 1000ULL);
   {
     const auto p = uos.posted_events();
@@ -1436,14 +1434,14 @@ static void test_alarm_type_filtering() {
           "alarm_type_filtering: person: expected 1 POST, got "
           + std::to_string(p.size()));
     if (!p.empty()) {
-      CHECK(p[0].find("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") != std::string::npos,
-            "alarm_type_filtering: person POST must reference person alarm");
-      CHECK(p[0].find("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb") == std::string::npos,
-            "alarm_type_filtering: person POST must not reference vehicle alarm");
+      CHECK(p[0].find("person_auto") != std::string::npos,
+            "alarm_type_filtering: person POST must reference person automation");
+      CHECK(p[0].find("vehicle_auto") == std::string::npos,
+            "alarm_type_filtering: person POST must not reference vehicle automation");
     }
   }
 
-  // Vehicle detection → only vehicle alarm fires.
+  // Vehicle detection → only vehicle automation fires.
   notifier.notify("vehicle", "112233445566", "evt-v", 2000ULL);
   {
     const auto p = uos.posted_events();
@@ -1451,23 +1449,23 @@ static void test_alarm_type_filtering() {
           "alarm_type_filtering: vehicle: expected 2 total POSTs, got "
           + std::to_string(p.size()));
     if (p.size() == 2) {
-      CHECK(p[1].find("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb") != std::string::npos,
-            "alarm_type_filtering: vehicle POST must reference vehicle alarm");
-      CHECK(p[1].find("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") == std::string::npos,
-            "alarm_type_filtering: vehicle POST must not reference person alarm");
+      CHECK(p[1].find("vehicle_auto") != std::string::npos,
+            "alarm_type_filtering: vehicle POST must reference vehicle automation");
+      CHECK(p[1].find("person_auto") == std::string::npos,
+            "alarm_type_filtering: vehicle POST must not reference person automation");
     }
   }
 }
 
 // ============================================================
-// AlarmNotifier: empty alarm list → zero POSTs
+// AlarmNotifier: empty automation list → zero POSTs
 // ============================================================
 static void test_alarm_no_alarms() {
   UosEmulator uos;
   uos.set_alarms_json("[]");
   uos.start();
 
-  onvif::AlarmNotifier notifier(uos.base_url());
+  onvif::AlarmNotifier notifier(uos.base_url(), "test-user-id");
   notifier.refresh_alarms();
   notifier.notify("person", "AABBCCDDEEFF", "evt-x", 999ULL);
 
@@ -1477,11 +1475,11 @@ static void test_alarm_no_alarms() {
 }
 
 // ============================================================
-// AlarmNotifier: UOS unreachable → no crash, no POSTs
+// AlarmNotifier: Protect API unreachable → no crash, no POSTs
 // ============================================================
 static void test_alarm_uos_unreachable() {
   // Port 1 is never open for regular users; curl returns ECONNREFUSED immediately.
-  onvif::AlarmNotifier notifier("http://127.0.0.1:1");
+  onvif::AlarmNotifier notifier("http://127.0.0.1:1", "test-user-id");
   notifier.refresh_alarms();  // must not crash
   notifier.notify("person", "AABBCCDDEEFF", "evt-y", 500ULL);  // must not crash
   CHECK(true, "alarm_uos_unreachable: did not crash or hang");
@@ -1496,17 +1494,19 @@ static void test_alarm_uos_unreachable() {
 // that every POST includes the camera MAC in the scope.
 // ============================================================
 static void test_alarm_integration_e2e(const std::string& ubv_dir) {
-  static const char kAlarms[] =
-    "[{\"id\":\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\","
-    "\"triggers_data\":[[{\"id\":\"smartDetectType:person\"}]]},"
-    "{\"id\":\"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\","
-    "\"triggers_data\":[[{\"id\":\"smartDetectType:vehicle\"}]]}]";
+  static const char kAutomations[] =
+    "[{\"id\":\"person_auto\",\"enable\":true,\"deleted\":false,"
+    "\"sources\":[],"
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"person\"}}]},"
+    "{\"id\":\"vehicle_auto\",\"enable\":true,\"deleted\":false,"
+    "\"sources\":[],"
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"vehicle\"}}]}]";
 
   UosEmulator uos;
-  uos.set_alarms_json(kAlarms);
+  uos.set_alarms_json(kAutomations);
   uos.start();
 
-  onvif::AlarmNotifier notifier(uos.base_url());
+  onvif::AlarmNotifier notifier(uos.base_url(), "test-user-id");
   notifier.refresh_alarms();
 
   TestContext ctx;
@@ -1537,15 +1537,16 @@ static void test_alarm_integration_e2e(const std::string& ubv_dir) {
   //   2 person detections × 1 alarm = 2 POSTs
   //   1 vehicle detection × 1 alarm = 1 POST
   //   Total: 3 POSTs
+  // posted_events() now returns URL paths like /api/automations/{id}/run.
   const auto posted = uos.posted_events();
   CHECK(posted.size() == 3,
-        "alarm_integration_e2e: expected 3 UOS POSTs (2 person + 1 vehicle), got "
+        "alarm_integration_e2e: expected 3 POSTs (2 person + 1 vehicle), got "
         + std::to_string(posted.size()));
 
   int person_posts = 0, vehicle_posts = 0;
-  for (const auto& body : posted) {
-    if (body.find("smartDetectType:person")  != std::string::npos) ++person_posts;
-    if (body.find("smartDetectType:vehicle") != std::string::npos) ++vehicle_posts;
+  for (const auto& path : posted) {
+    if (path.find("person_auto")  != std::string::npos) ++person_posts;
+    if (path.find("vehicle_auto") != std::string::npos) ++vehicle_posts;
   }
   CHECK(person_posts == 2,
         "alarm_integration_e2e: expected 2 person POSTs, got "
@@ -1554,27 +1555,10 @@ static void test_alarm_integration_e2e(const std::string& ubv_dir) {
         "alarm_integration_e2e: expected 1 vehicle POST, got "
         + std::to_string(vehicle_posts));
 
-  // Each POST must carry the triggering camera's MAC in the scope.
-  int with_mac = 0;
-  for (const auto& body : posted) {
-    if (body.find(ctx.mac108) != std::string::npos ||
-        body.find(ctx.mac109) != std::string::npos)
-      ++with_mac;
-  }
-  CHECK(with_mac == static_cast<int>(posted.size()),
-        "alarm_integration_e2e: expected all POSTs to include a camera MAC, only "
-        + std::to_string(with_mac) + " did");
-
-  // Alarm IDs must match their trigger types.
-  for (const auto& body : posted) {
-    if (body.find("smartDetectType:person") != std::string::npos) {
-      CHECK(body.find("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa") != std::string::npos,
-            "alarm_integration_e2e: person POST missing person alarm ID");
-    }
-    if (body.find("smartDetectType:vehicle") != std::string::npos) {
-      CHECK(body.find("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb") != std::string::npos,
-            "alarm_integration_e2e: vehicle POST missing vehicle alarm ID");
-    }
+  // Every POST must target the /run endpoint.
+  for (const auto& path : posted) {
+    CHECK(path.find("/run") != std::string::npos,
+          "alarm_integration_e2e: POST path missing /run: " + path);
   }
 }
 
@@ -1682,26 +1666,25 @@ static void test_camera_object_type_override(const std::string& ubv_dir) {
 }
 
 // ============================================================
-// AlarmNotifier: animal detection fires alarm with animal trigger
+// AlarmNotifier: animal detection fires automation with animal trigger
 // ============================================================
 static void test_alarm_notify_animal() {
-  static const char kAlarms[] =
-    "[{\"id\":\"cccccccc-cccc-cccc-cccc-cccccccccccc\","
-    "\"title\":\"Animal Alert\","
-    "\"triggers_data\":[[{\"id\":\"smartDetectType:animal\","
-    "\"is_matched_externally\":true}]]}"
-    ",{\"id\":\"dddddddd-dddd-dddd-dddd-dddddddddddd\","
-    "\"title\":\"Package Alert\","
-    "\"triggers_data\":[[{\"id\":\"smartDetectType:package\"}]]}]";
+  static const char kAutomations[] =
+    "[{\"id\":\"animal_auto\",\"enable\":true,\"deleted\":false,"
+    "\"sources\":[],"
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"animal\"}}]}"
+    ",{\"id\":\"package_auto\",\"enable\":true,\"deleted\":false,"
+    "\"sources\":[],"
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"package\"}}]}]";
 
   UosEmulator uos;
-  uos.set_alarms_json(kAlarms);
+  uos.set_alarms_json(kAutomations);
   uos.start();
 
-  onvif::AlarmNotifier notifier(uos.base_url());
+  onvif::AlarmNotifier notifier(uos.base_url(), "test-user-id");
   notifier.refresh_alarms();
 
-  // Animal detection → only animal alarm fires.
+  // Animal detection → only animal automation fires.
   notifier.notify("animal", "AABBCCDDEEFF", "evt-animal", 1000ULL);
   {
     const auto p = uos.posted_events();
@@ -1709,16 +1692,14 @@ static void test_alarm_notify_animal() {
           "alarm_notify_animal: expected 1 POST for animal, got "
           + std::to_string(p.size()));
     if (!p.empty()) {
-      CHECK(p[0].find("smartDetectType:animal") != std::string::npos,
-            "alarm_notify_animal: POST missing animal event key");
-      CHECK(p[0].find("cccccccc-cccc-cccc-cccc-cccccccccccc") != std::string::npos,
-            "alarm_notify_animal: POST missing animal alarm ID");
-      CHECK(p[0].find("dddddddd-dddd-dddd-dddd-dddddddddddd") == std::string::npos,
-            "alarm_notify_animal: POST must not reference package alarm");
+      CHECK(p[0].find("animal_auto") != std::string::npos,
+            "alarm_notify_animal: POST missing animal automation ID");
+      CHECK(p[0].find("package_auto") == std::string::npos,
+            "alarm_notify_animal: POST must not reference package automation");
     }
   }
 
-  // Package detection → only package alarm fires.
+  // Package detection → only package automation fires.
   notifier.notify("package", "AABBCCDDEEFF", "evt-package", 2000ULL);
   {
     const auto p = uos.posted_events();
@@ -1726,12 +1707,10 @@ static void test_alarm_notify_animal() {
           "alarm_notify_animal: expected 2 total POSTs after package, got "
           + std::to_string(p.size()));
     if (p.size() == 2) {
-      CHECK(p[1].find("smartDetectType:package") != std::string::npos,
-            "alarm_notify_animal: package POST missing event key");
-      CHECK(p[1].find("dddddddd-dddd-dddd-dddd-dddddddddddd") != std::string::npos,
-            "alarm_notify_animal: package POST missing package alarm ID");
-      CHECK(p[1].find("cccccccc-cccc-cccc-cccc-cccccccccccc") == std::string::npos,
-            "alarm_notify_animal: package POST must not reference animal alarm");
+      CHECK(p[1].find("package_auto") != std::string::npos,
+            "alarm_notify_animal: package POST missing package automation ID");
+      CHECK(p[1].find("animal_auto") == std::string::npos,
+            "alarm_notify_animal: package POST must not reference animal automation");
     }
   }
 }

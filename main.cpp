@@ -22,6 +22,7 @@
  *   - polls motion events from first-party cameras and runs NanoDet-M detection
  */
 
+#include <libpq-fe.h>
 #include <sys/stat.h>
 
 #include <csignal>
@@ -90,9 +91,13 @@ ABSL_FLAG(std::string, raw_log, "",
     "Path for the raw SOAP exchange JSON Lines log file. "
     "Each line is one full HTTP request/response pair (large). "
     "Empty (default) disables this log.");
-ABSL_FLAG(std::string, uos_url, "http://localhost:11010",
-    "Base URL for the UOS external automation manager used to trigger "
-    "UniFi Protect security alarms on detections.");
+ABSL_FLAG(std::string, protect_url, "http://localhost:7080",
+    "Base URL for the local Protect API used to trigger automations "
+    "(e.g. 'Make Sound for detection') on smart detection events.");
+ABSL_FLAG(std::string, protect_user_id, "",
+    "X-UserId header value for Protect API auth bypass from localhost. "
+    "Obtain with: psql -h /run/postgresql -p 5432 -d unifi-core "
+    "-c \"SELECT id FROM users LIMIT 1\"");
 ABSL_FLAG(std::string, default_object_type, "person",
     "Object type reported for generic motion events (CellMotionDetector, "
     "VideoSource/MotionAlarm) when the camera does not identify a type. "
@@ -273,6 +278,71 @@ static std::vector<std::string> parse_csv(const std::string& s) {
 }
 
 // ============================================================
+// Auto-discover the Protect API user ID
+// ============================================================
+static const char kApiKeyPath[] = "/root/.config/onvif-recorder-api-key";
+
+// Read the cached user ID from the config file, or discover it from the
+// unifi-core database and save it.  Returns empty string on failure.
+static std::string discover_protect_user_id() {
+  // 1. Try reading cached value.
+  {
+    std::ifstream f(kApiKeyPath);
+    std::string line;
+    if (f.is_open() && std::getline(f, line) && line.size() >= 32) {
+      // Trim whitespace.
+      while (!line.empty() && (line.back() == '\n' || line.back() == '\r' ||
+                               line.back() == ' '))
+        line.pop_back();
+      if (!line.empty()) {
+        LOG(INFO) << "[alarm] loaded user ID from " << kApiKeyPath;
+        return line;
+      }
+    }
+  }
+
+  // 2. Query unifi-core DB (port 5432) for the owner's user ID.
+  PGconn* conn = PQconnectdb(
+      "host=/run/postgresql port=5432 dbname=unifi-core user=postgres");
+  if (PQstatus(conn) != CONNECTION_OK) {
+    LOG(ERROR) << "[alarm] cannot discover user ID: unifi-core DB: "
+               << PQerrorMessage(conn);
+    PQfinish(conn);
+    return {};
+  }
+
+  PGresult* res = PQexec(conn,
+      "SELECT user_id FROM user_settings LIMIT 1");
+  std::string user_id;
+  if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+    user_id = PQgetvalue(res, 0, 0);
+    // Trim.
+    while (!user_id.empty() && user_id.back() == ' ') user_id.pop_back();
+  }
+  PQclear(res);
+  PQfinish(conn);
+
+  if (user_id.empty()) {
+    LOG(ERROR) << "[alarm] no user_id found in unifi-core user_settings";
+    return {};
+  }
+
+  // 3. Cache to disk for future runs.
+  {
+    // Ensure parent directory exists.
+    (void)mkdir("/root/.config", 0755);
+    std::ofstream f(kApiKeyPath);
+    if (f.is_open()) {
+      f << user_id << '\n';
+      LOG(INFO) << "[alarm] saved user ID to " << kApiKeyPath;
+    } else {
+      LOG(ERROR) << "[alarm] could not write " << kApiKeyPath;
+    }
+  }
+  return user_id;
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 int main(int argc, char* argv[]) {
@@ -282,8 +352,10 @@ int main(int argc, char* argv[]) {
   const bool verbose = absl::GetFlag(FLAGS_verbose);
   if (verbose) {
     absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfo);
+    absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
   } else {
     absl::SetMinLogLevel(absl::LogSeverityAtLeast::kError);
+    absl::SetStderrThreshold(absl::LogSeverityAtLeast::kError);
   }
 
   const std::string db_conn     = absl::GetFlag(FLAGS_db_conn);
@@ -562,12 +634,23 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // AlarmNotifier: triggers UniFi Protect security alarms for ONVIF cameras.
-  onvif::AlarmNotifier alarm_notifier(absl::GetFlag(FLAGS_uos_url));
-  alarm_notifier.refresh_alarms();
-  det_rec.set_alarm_notifier(&alarm_notifier);
-  if (motion_poller)
-    motion_poller->set_alarm_notifier(&alarm_notifier);
+  // AlarmNotifier: triggers Protect automations (e.g. chime play) on detections.
+  // Auto-discover user ID if not explicitly set via flag.
+  std::string protect_user_id = absl::GetFlag(FLAGS_protect_user_id);
+  if (protect_user_id.empty())
+    protect_user_id = discover_protect_user_id();
+
+  std::unique_ptr<onvif::AlarmNotifier> alarm_notifier;
+  if (!protect_user_id.empty()) {
+    alarm_notifier = std::make_unique<onvif::AlarmNotifier>(
+        absl::GetFlag(FLAGS_protect_url), protect_user_id, db_conn);
+    alarm_notifier->refresh_alarms();
+    det_rec.set_alarm_notifier(alarm_notifier.get());
+  } else {
+    LOG(INFO) << "[alarm] user ID not found; automation triggers disabled";
+  }
+  if (motion_poller && alarm_notifier)
+    motion_poller->set_alarm_notifier(alarm_notifier.get());
 
   // Optional startup coalescing: merge nearby events already in the database.
   // Purge stuck-open events (end IS NULL older than 5 minutes) left behind

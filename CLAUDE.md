@@ -214,6 +214,8 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--poll_interval_sec` | `10` | Seconds between motion-event poll cycles for first-party cameras. |
 | `--change_log` | _(empty)_ | Path for cameras-table change log (JSON Lines). Records old/new values for rollback. |
 | `--rollback` | _(empty)_ | Undo cameras-table changes and exit. Values: `third_party`, `first_party`, `all`. |
+| `--protect_url` | `http://localhost:7080` | Base URL for the local Protect API used to trigger automations on smart detection events. |
+| `--protect_user_id` | _(auto-discovered)_ | X-UserId header for Protect API auth bypass. Auto-discovered from unifi-core DB on first run and cached to `/root/.config/onvif-recorder-api-key`. Pass explicitly to override. |
 | `--patch_alarm_picker` | `false` | Live-patch the Protect UI to allow third-party cameras in the alarm creation picker. Re-applied on every startup so it survives firmware updates. |
 
 Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default is `kError`.

@@ -1145,7 +1145,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     const std::string thumb_id   = db_->make_thumbnail_id(ev.camera_ip, ts_ms);
     std::string sdt_json   = smart_detect_types_json(det->type);
     std::string obj_type   = sdo_type(det->type);
-    const std::string attributes = "{\"confidence\":0}";
+    const std::string attributes = "{\"confidence\":0,\"zone\":[1]}";
 
     // 3. Fetch snapshot if the backend needs it.
     std::vector<unsigned char> snapshot;
@@ -1216,8 +1216,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           "eventType:smartDetectZone",
           "smartDetectType:" + obj_type,
         };
-        if (!cam_uuid.empty())
+        if (!cam_uuid.empty()) {
           label_names.push_back("camera:" + cam_uuid);
+          label_names.push_back("zone:" + cam_uuid + ":1");
+        }
         const std::vector<int> lids = db_->upsert_labels(label_names, now_str);
         if (!lids.empty()) {
           if (coalesced_event_id.empty())
@@ -1259,13 +1261,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       }
     }  // lock released
 
-    // 5. Notify UOS alarm manager (HTTP I/O, must be outside lock).
-    // alarm_url is non-empty when the camera advertised an alarm service via
-    // GetServices; empty means it is not Protect-managed -- skip in that case.
-    // The AlarmNotifier always uses its configured --uos_url (host:port).
+    // 5. Trigger Protect automations (HTTP I/O, must be outside lock).
+    // AlarmNotifier calls POST /api/automations/{id}/run on the local Protect API.
     // Only notify for new events, not for detections coalesced into an existing one.
-    if (coalesced_event_id.empty() && alarm_notif &&
-        !cam_mac.empty() && !ev.alarm_url.empty()) {
+    if (coalesced_event_id.empty() && alarm_notif && !cam_mac.empty()) {
       alarm_notif->notify(obj_type, cam_mac, event_id, ts_ms);
     }
 

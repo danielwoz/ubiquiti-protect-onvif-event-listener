@@ -585,10 +585,12 @@ std::pair<int, std::string> UosEmulator::handle(
     const std::string& /*soap_action*/,
     const std::string& body) {
   std::lock_guard<std::mutex> lk(mu_);
-  if (path == "/api/v1/alarms" && body.empty())
+  if (path == "/api/automations" && body.empty())
     return {200, alarms_json_};
-  if (path == "/api/v1/alarms/events" && !body.empty()) {
-    posted_.push_back(body);
+  // Match POST /api/automations/{id}/run
+  if (path.rfind("/api/automations/", 0) == 0 &&
+      path.size() > 18 && path.find("/run") != std::string::npos) {
+    posted_.push_back(path);
     return {200, "{}"};
   }
   return {404, ""};
