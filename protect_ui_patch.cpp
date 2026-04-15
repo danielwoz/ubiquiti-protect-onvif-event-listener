@@ -16,9 +16,11 @@
 
 #include <dirent.h>
 
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -92,6 +94,63 @@ static bool write_file(const std::string& path, const std::string& data) {
 }
 
 // ---------------------------------------------------------------
+// dpkg md5sum verification
+// ---------------------------------------------------------------
+// NOLINTNEXTLINE(whitespace/indent_namespace)
+static const char kDpkgMd5sums[] = "/var/lib/dpkg/info/unifi-protect.md5sums";
+
+// Compute the MD5 hex digest of a file on disk via md5sum(1).
+// Returns empty string on failure.
+static std::string md5_of_file(const std::string& path) {
+  std::string cmd = "md5sum " + path + " 2>/dev/null";
+  std::FILE* p = popen(cmd.c_str(), "r");  // NOLINT(runtime/int)
+  if (!p) return {};
+  char buf[128] = {};
+  char* ok = std::fgets(buf, sizeof(buf), p);
+  pclose(p);
+  if (!ok || std::strlen(buf) < 32) return {};
+  return std::string(buf, 32);
+}
+
+// Load the dpkg md5sums file into a map: relative_path -> md5hex.
+static std::unordered_map<std::string, std::string> load_dpkg_md5sums() {
+  std::unordered_map<std::string, std::string> result;
+  std::ifstream f(kDpkgMd5sums);
+  if (!f) return result;
+  std::string line;
+  while (std::getline(f, line)) {
+    // Format: "<md5hex>  <relative_path>"
+    if (line.size() < 35) continue;
+    std::string md5 = line.substr(0, 32);
+    std::string path = line.substr(34);  // skip "  "
+    result[path] = md5;
+  }
+  return result;
+}
+
+// Look up the expected dpkg md5 for an absolute path.
+// Returns empty string if the file is not in the md5sums database.
+static std::string dpkg_expected_md5(
+    const std::string& abs_path,
+    const std::unordered_map<std::string, std::string>& md5sums) {
+  // dpkg md5sums uses paths relative to /, without leading slash.
+  std::string rel = abs_path;
+  if (!rel.empty() && rel[0] == '/') rel = rel.substr(1);
+  auto it = md5sums.find(rel);
+  if (it == md5sums.end()) return {};
+  return it->second;
+}
+
+// Check if a file on disk matches its dpkg md5sum.
+static bool dpkg_md5_matches(
+    const std::string& abs_path,
+    const std::unordered_map<std::string, std::string>& md5sums) {
+  std::string expected = dpkg_expected_md5(abs_path, md5sums);
+  if (expected.empty()) return false;
+  return md5_of_file(abs_path) == expected;
+}
+
+// ---------------------------------------------------------------
 // Scan the UI dist directory for files matching a prefix
 // (e.g. "swai" matches swai.js, swai-7.0.57.js).
 // ---------------------------------------------------------------
@@ -116,9 +175,18 @@ static std::vector<std::string> find_ui_files(const char* dir,
 // ---------------------------------------------------------------
 // Apply patches to a single file.
 // Returns number of patches applied, or -1 if file not readable.
+//
+// Backup strategy uses dpkg md5sums to validate file integrity:
+//   - If the live file matches its dpkg md5 -> always overwrite .bak
+//     (the live file is a known-good original; any existing .bak may
+//     be stale from a prior firmware version).
+//   - If the live file does NOT match -> do not overwrite .bak
+//     (we would be backing up a modified file).
+//   - If no dpkg md5sums exist (dev machine) -> always back up.
 // ---------------------------------------------------------------
-static int apply_patches(const std::string& path,
-                         const Patch* patches, size_t count) {
+static int apply_patches(
+    const std::string& path, const Patch* patches, size_t count,
+    const std::unordered_map<std::string, std::string>& md5sums) {
   std::string content = read_file(path);
   if (content.empty()) return -1;
 
@@ -136,11 +204,16 @@ static int apply_patches(const std::string& path,
     return 0;
   }
 
-  // Back up before patching.  Always overwrite .bak so it tracks firmware.
+  // Back up the file if it is an unmodified package original.
   std::string bak_path = path + ".bak";
-  if (!write_file(bak_path, content)) {
-    LOG(ERROR) << "[ui_patch] failed to write backup: " << bak_path;
-    return 0;
+  if (md5sums.empty() || dpkg_md5_matches(path, md5sums)) {
+    if (!write_file(bak_path, content)) {
+      LOG(ERROR) << "[ui_patch] failed to write backup: " << bak_path;
+      return 0;
+    }
+  } else {
+    LOG(INFO) << "[ui_patch] " << path
+              << " already modified -- keeping existing .bak";
   }
 
   for (auto& [pos, p] : todo) {
@@ -161,13 +234,14 @@ static int apply_patches(const std::string& path,
 // Public API
 // ---------------------------------------------------------------
 absl::Status patch_alarm_picker() {
+  auto md5sums = load_dpkg_md5sums();
   int total = 0;
   int files_found = 0;
 
   // Patch all swai*.js and vantage*.js variants (versioned and unversioned).
   for (const char* prefix : {"swai", "vantage"}) {
     for (const auto& path : find_ui_files(kUiDir, prefix)) {
-      int n = apply_patches(path, kUiPatches, kUiPatchCount);
+      int n = apply_patches(path, kUiPatches, kUiPatchCount, md5sums);
       if (n >= 0) {
         ++files_found;
         total += n;
@@ -177,7 +251,8 @@ absl::Status patch_alarm_picker() {
 
   // Patch service.js (backend scope filter).
   {
-    int n = apply_patches(kServicePath, kBackendPatches, kBackendPatchCount);
+    int n = apply_patches(kServicePath, kBackendPatches, kBackendPatchCount,
+                          md5sums);
     if (n >= 0) {
       ++files_found;
       total += n;
@@ -200,36 +275,48 @@ absl::Status patch_alarm_picker() {
 }
 
 absl::Status revert_alarm_picker() {
+  auto md5sums = load_dpkg_md5sums();
   int restored = 0;
+
+  auto try_restore = [&](const std::string& path) {
+    std::string bak = path + ".bak";
+    std::string content = read_file(bak);
+    if (content.empty()) return;
+
+    if (!md5sums.empty()) {
+      bool bak_matches = dpkg_md5_matches(bak, md5sums);
+      bool live_matches = dpkg_md5_matches(path, md5sums);
+
+      if (live_matches) {
+        // Live file is already the correct original -- nothing to do.
+        LOG(INFO) << "[ui_patch] " << path << " already matches dpkg md5";
+        return;
+      }
+
+      if (!bak_matches) {
+        // Neither file matches -- .bak is stale but still better than
+        // a patched file.  Warn but proceed with restore.
+        LOG(WARNING) << "[ui_patch] " << bak << " does not match dpkg md5 "
+                     << "-- may be from a prior firmware version";
+      }
+    }
+
+    if (!write_file(path, content)) {
+      LOG(ERROR) << "[ui_patch] failed to restore " << path;
+      return;
+    }
+    LOG(INFO) << "[ui_patch] restored " << path << " from backup";
+    ++restored;
+  };
 
   // Revert all swai*.js.bak and vantage*.js.bak in the UI dist directory.
   for (const char* prefix : {"swai", "vantage"}) {
-    for (const auto& path : find_ui_files(kUiDir, prefix)) {
-      std::string bak = path + ".bak";
-      std::string content = read_file(bak);
-      if (content.empty()) continue;
-      if (!write_file(path, content)) {
-        LOG(ERROR) << "[ui_patch] failed to restore " << path;
-        continue;
-      }
-      LOG(INFO) << "[ui_patch] restored " << path << " from backup";
-      ++restored;
-    }
+    for (const auto& path : find_ui_files(kUiDir, prefix))
+      try_restore(path);
   }
 
   // Revert service.js.
-  {
-    std::string bak = std::string(kServicePath) + ".bak";
-    std::string content = read_file(bak);
-    if (!content.empty()) {
-      if (write_file(kServicePath, content)) {
-        LOG(INFO) << "[ui_patch] restored " << kServicePath << " from backup";
-        ++restored;
-      } else {
-        LOG(ERROR) << "[ui_patch] failed to restore " << kServicePath;
-      }
-    }
-  }
+  try_restore(kServicePath);
 
   if (restored > 0) {
     LOG(INFO) << "[ui_patch] reverted " << restored << " file(s)";
