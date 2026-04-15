@@ -22,6 +22,7 @@
  *   - polls motion events from first-party cameras and runs NanoDet-M detection
  */
 
+#include <curl/curl.h>
 #include <libpq-fe.h>
 #include <sys/stat.h>
 
@@ -66,7 +67,8 @@ ABSL_FLAG(std::string, db_host, "",
     "Override the PostgreSQL host for camera config loading "
     "(empty = use /run/postgresql Unix socket).");
 ABSL_FLAG(std::string, ubv_dir, "",
-    "Directory for per-camera UBV thumbnail files (optional).");
+    "Directory for per-camera UBV thumbnail files. "
+    "Auto-detected on Dream Routers (/srv/unifi-protect/video).");
 ABSL_FLAG(int32_t, pre_buffer_sec, 2,
     "Seconds to buffer before the first detection event.");
 ABSL_FLAG(int32_t, post_buffer_sec, 2,
@@ -74,12 +76,12 @@ ABSL_FLAG(int32_t, post_buffer_sec, 2,
 ABSL_FLAG(bool, verbose, false,
     "Enable verbose logging (INFO level): subscription lifecycle, "
     "events received, and renewals. Default logs errors only.");
-ABSL_FLAG(std::string, model_dir, "",
-    "Directory containing nanodet_m.param and nanodet_m.bin.");
-ABSL_FLAG(bool, detect, false,
-    "Enable NanoDet-M object detection for thumbnail cropping "
-    "(requires --model_dir). Runs as fallback when the camera provides "
-    "no ONVIF bounding box.");
+ABSL_FLAG(std::string, model_dir, "/root/models",
+    "Directory containing nanodet_m.param and nanodet_m.bin. "
+    "Models are downloaded automatically if not present.");
+ABSL_FLAG(bool, detect, true,
+    "Enable NanoDet-M object detection for thumbnail cropping. "
+    "Runs as fallback when the camera provides no ONVIF bounding box.");
 ABSL_FLAG(bool, detect_override, false,
     "Run NanoDet-M on every thumbnail regardless of whether the camera "
     "provides an ONVIF bounding box. Implies --detect.");
@@ -144,7 +146,7 @@ ABSL_FLAG(std::string, first_party_cameras, "",
 ABSL_FLAG(int32_t, poll_interval_sec, 10,
     "Seconds between motion-event poll cycles for first-party cameras. "
     "Only active when first-party cameras are discovered.");
-ABSL_FLAG(bool, patch_alarm_picker, false,
+ABSL_FLAG(bool, patch_alarm_picker, true,
     "Live-patch the Protect UI (swai.js) to allow third-party cameras "
     "in the alarm creation picker. The patch is idempotent and re-applied "
     "on every startup so it survives firmware updates. The original file "
@@ -281,6 +283,73 @@ static std::vector<std::string> parse_csv(const std::string& s) {
 // Auto-discover the Protect API user ID
 // ============================================================
 static const char kApiKeyPath[] = "/root/.config/onvif-recorder-api-key";
+
+// Download a file from a URL to a local path.  Returns true on success.
+static size_t file_write_cb(char* ptr, size_t size, size_t nmemb,
+                            void* userdata) {
+  auto* f = static_cast<std::FILE*>(userdata);
+  return std::fwrite(ptr, size, nmemb, f);
+}
+
+static bool download_file(const std::string& url,
+                          const std::string& path) {
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) return false;
+
+  CURL* curl = curl_easy_init();
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, file_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);  // NOLINT(runtime/int)
+  CURLcode rc = curl_easy_perform(curl);
+  long http_code = 0;  // NOLINT(runtime/int)
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  curl_easy_cleanup(curl);
+  std::fclose(f);
+
+  if (rc != CURLE_OK || http_code != 200) {
+    std::remove(path.c_str());
+    return false;
+  }
+  return true;
+}
+
+static const char* const kParamUrl =
+    "https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/"
+    "nanodet_m.param";
+static const char* const kBinUrl =
+    "https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/"
+    "nanodet_m.bin";
+
+// Ensure NanoDet-M model files exist in model_dir, downloading if needed.
+// Creates the directory if it does not exist.  Returns true if both files
+// are present after the call.
+static bool ensure_models(const std::string& model_dir) {
+  (void)mkdir(model_dir.c_str(), 0755);
+  std::string param = model_dir + "/nanodet_m.param";
+  std::string bin   = model_dir + "/nanodet_m.bin";
+
+  bool need_param = !std::ifstream(param).good();
+  bool need_bin   = !std::ifstream(bin).good();
+  if (!need_param && !need_bin) return true;
+
+  LOG(INFO) << "[detect] downloading NanoDet-M models to " << model_dir;
+  if (need_param) {
+    if (!download_file(kParamUrl, param)) {
+      LOG(ERROR) << "[detect] failed to download nanodet_m.param";
+      return false;
+    }
+  }
+  if (need_bin) {
+    if (!download_file(kBinUrl, bin)) {
+      LOG(ERROR) << "[detect] failed to download nanodet_m.bin";
+      return false;
+    }
+  }
+  LOG(INFO) << "[detect] model download complete";
+  return true;
+}
 
 // Read the cached user ID from the config file, or discover it from the
 // unifi-core database and save it.  Returns empty string on failure.
@@ -498,12 +567,15 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // Optional: load NanoDet-M for thumbnail subject cropping.
+  // Load NanoDet-M for thumbnail subject cropping, downloading if needed.
   std::unique_ptr<object_detect::ObjectDetector> detector;
   const std::string model_dir       = absl::GetFlag(FLAGS_model_dir);
   const bool        detect          = absl::GetFlag(FLAGS_detect);
   const bool        detect_override = absl::GetFlag(FLAGS_detect_override);
   if ((detect || detect_override) && !model_dir.empty()) {
+    if (!ensure_models(model_dir)) {
+      LOG(WARNING) << "[detect] model files missing and download failed";
+    }
     auto det = object_detect::ObjectDetector::Load(
         model_dir + "/nanodet_m.param",
         model_dir + "/nanodet_m.bin");

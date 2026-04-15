@@ -197,14 +197,14 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 |---|---|---|
 | `--db_conn` | `host=/run/postgresql port=5433 dbname=unifi-protect user=postgres` | libpq conninfo for the UniFi Protect database |
 | `--db_host` | _(empty = Unix socket)_ | Override PostgreSQL host for camera config loading |
-| `--ubv_dir` | _(empty)_ | Directory for per-camera UBV thumbnail files (optional) |
+| `--ubv_dir` | _(auto-detected)_ | Directory for per-camera UBV thumbnail files. Auto-detected on Dream Routers (`/srv/unifi-protect/video`). |
 | `--pre_buffer_sec` | `2` | Seconds to buffer before the first detection event |
 | `--post_buffer_sec` | `2` | Seconds to buffer after the last detection event |
 | `--verbose` | `false` | Set absl log level to INFO (lifecycle, events, renewals). Default: ERROR only |
 | `--event_log` | _(disabled)_ | Path for parsed-event JSON Lines log; one line per ONVIF event |
 | `--raw_log` | _(disabled)_ | Path for raw SOAP exchange JSON Lines log; one line per HTTP request/response |
-| `--model_dir` | _(empty)_ | Directory containing `nanodet_m.param` and `nanodet_m.bin` |
-| `--detect` | `false` | Enable NanoDet-M as fallback when the camera provides no ONVIF bbox (requires `--model_dir`) |
+| `--model_dir` | `/root/models` | Directory containing `nanodet_m.param` and `nanodet_m.bin`. Models are downloaded automatically if not present. |
+| `--detect` | `true` | Enable NanoDet-M as fallback when the camera provides no ONVIF bbox |
 | `--detect_override` | `false` | Always run NanoDet-M, ignoring the ONVIF bbox entirely (implies `--detect`) |
 | `--coalesce_window_sec` | `30` | Merge consecutive detections from the same camera into one event if the new detection starts within this many seconds of the previous one ending. Set to 0 to disable. |
 | `--max_events_per_hour` | `10` | Maximum new detection events per camera per hour. Events beyond this limit are dropped. Set to 0 for unlimited. |
@@ -216,7 +216,7 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--rollback` | _(empty)_ | Undo cameras-table changes and exit. Values: `third_party`, `first_party`, `all`. |
 | `--protect_url` | `http://localhost:7080` | Base URL for the local Protect API used to trigger automations on smart detection events. |
 | `--protect_user_id` | _(auto-discovered)_ | X-UserId header for Protect API auth bypass. Auto-discovered from unifi-core DB on first run and cached to `/root/.config/onvif-recorder-api-key`. Pass explicitly to override. |
-| `--patch_alarm_picker` | `false` | Live-patch the Protect UI to allow third-party cameras in the alarm creation picker. Re-applied on every startup so it survives firmware updates. |
+| `--patch_alarm_picker` | `true` | Live-patch the Protect UI to allow third-party cameras in the alarm creation picker. Re-applied on every startup so it survives firmware updates. |
 
 Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default is `kError`.
 `enable_verbose_logging()` has been removed from `OnvifListener`; set log level via absl before calling `run()`.
