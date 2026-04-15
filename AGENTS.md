@@ -177,6 +177,21 @@ benchmark to protect the repository from broken commits. If the hook fails, fix 
 underlying issue. If GitHub drops the SSH connection due to timeout while the hook
 runs, investigate and resolve the cause — bypassing the hook is not an option.
 
+## Release checklist
+
+Every GitHub release **must** include these assets:
+- `onvif_recorder_arm64` — ARM64 release binary (PGO + ThinLTO) built at the tagged commit
+- `onvif-recorder.service` — systemd service file
+
+Steps:
+1. Tag the commit: `git tag v<X.Y.Z> && git push origin v<X.Y.Z>`
+2. Build: `scripts/bz build --config=arm64_release //:onvif_recorder`
+3. Create release with `gh release create` and upload the binary from
+   `~/.cache/bazel/arm64_release/execroot/_main/bazel-out/k8-fastbuild/bin/onvif_recorder`
+   plus `onvif-recorder.service`.
+
+Do not create a release without attaching the ARM64 binary and service file.
+
 ---
 
 ## Build system

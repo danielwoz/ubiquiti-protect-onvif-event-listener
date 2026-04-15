@@ -189,6 +189,30 @@ scripts/bz test --config=x86 //test:all
 > first. If GitHub's SSH connection times out while the hook is running, investigate
 > and resolve the root cause — do not bypass the hook.
 
+## Release checklist
+
+When creating a new GitHub release:
+
+```bash
+# 1. Tag the release commit
+git tag v<X.Y.Z>
+git push origin v<X.Y.Z>
+
+# 2. Build the ARM64 release binary (PGO + ThinLTO)
+scripts/bz build --config=arm64_release //:onvif_recorder
+
+# 3. Create the release with assets
+gh release create v<X.Y.Z> \
+  --title "v<X.Y.Z>" \
+  --notes "release notes here" \
+  ~/.cache/bazel/arm64_release/execroot/_main/bazel-out/k8-fastbuild/bin/onvif_recorder#onvif_recorder_arm64 \
+  onvif-recorder.service
+```
+
+**Required release assets:**
+- `onvif_recorder_arm64` — ARM64 release binary built at the tagged commit
+- `onvif-recorder.service` — systemd service file
+
 ## Command-line flags (runtime)
 
 All configuration is now via `absl::flags`. Pass `--help` for the full list.
