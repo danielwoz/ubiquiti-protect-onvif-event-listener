@@ -14,63 +14,17 @@
 
 #include "camera_change_log.hpp"
 
-#include <chrono>
-#include <cstdio>
-#include <ctime>
 #include <fstream>
-#include <iomanip>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "util.hpp"
 
 namespace unifi {
-
-// ---------------------------------------------------------------------------
-// JSON helpers (minimal, no external dependency)
-// ---------------------------------------------------------------------------
-static std::string json_escape(const std::string& s) {
-  std::string out;
-  out.reserve(s.size() + 4);
-  out += '"';
-  for (unsigned char c : s) {
-    switch (c) {
-      case '"':  out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-      case '\n': out += "\\n";  break;
-      case '\r': out += "\\r";  break;
-      case '\t': out += "\\t";  break;
-      default:
-        if (c < 0x20) {
-          char buf[8];
-          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-          out += buf;
-        } else {
-          out += static_cast<char>(c);
-        }
-    }
-  }
-  out += '"';
-  return out;
-}
-
-static std::string utc_now_iso8601() {
-  auto now = std::chrono::system_clock::now();
-  std::time_t t = std::chrono::system_clock::to_time_t(now);
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()) % 1000;
-  std::tm tm{};
-  gmtime_r(&t, &tm);
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
-  std::ostringstream oss;
-  oss << buf << '.' << std::setfill('0') << std::setw(3) << ms.count() << 'Z';
-  return oss.str();
-}
 
 // ---------------------------------------------------------------------------
 // Minimal JSON string-value extractor for reading back log records.
@@ -127,11 +81,13 @@ void CameraChangeLog::record(const std::string& camera_id,
                               const std::string& new_value) {
   std::string line;
   line += '{';
-  line += json_escape("ts")        + ':' + json_escape(utc_now_iso8601()) + ',';
-  line += json_escape("camera_id") + ':' + json_escape(camera_id)        + ',';
-  line += json_escape("col")       + ':' + json_escape(column)           + ',';
-  line += json_escape("old")       + ':' + json_escape(old_value)        + ',';
-  line += json_escape("new")       + ':' + json_escape(new_value);
+  using onvif::util::json_str;
+  line += json_str("ts") + ':' + json_str(onvif::util::utc_now_iso8601())
+       + ',';
+  line += json_str("camera_id") + ':' + json_str(camera_id) + ',';
+  line += json_str("col")       + ':' + json_str(column)    + ',';
+  line += json_str("old")       + ':' + json_str(old_value) + ',';
+  line += json_str("new")       + ':' + json_str(new_value);
   line += "}\n";
 
   std::lock_guard<std::mutex> lk(mu_);

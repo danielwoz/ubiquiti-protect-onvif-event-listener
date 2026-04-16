@@ -35,7 +35,7 @@
 #include <string>
 #include <vector>
 
-#include "../object_detect.hpp"
+#include "object_detect.hpp"
 
 namespace {
 

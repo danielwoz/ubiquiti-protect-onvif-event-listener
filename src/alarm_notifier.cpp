@@ -15,20 +15,22 @@
 #include "alarm_notifier.hpp"
 
 #include <curl/curl.h>
+#include <sys/stat.h>
+
 #include <libpq-fe.h>
 
 #include <chrono>
 #include <cinttypes>
-#include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <mutex>
-#include <random>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/log/log.h"
+#include "util.hpp"
 
 namespace onvif {
 
@@ -164,36 +166,6 @@ static std::set<std::string> parse_sources(const std::string& arr) {
     pos = p;
   }
   return devs;
-}
-
-// Generate a 24-char lowercase hex ID (12 random bytes).
-static std::string generate_24hex_id() {
-  static std::random_device rd;
-  thread_local std::mt19937_64 gen(rd());
-  std::uniform_int_distribution<uint64_t> dis;
-  uint64_t a = dis(gen);
-  uint64_t b = dis(gen);
-  char buf[25];
-  std::snprintf(buf, sizeof(buf), "%016" PRIx64 "%08" PRIx64,
-                static_cast<uint64_t>(a),
-                static_cast<uint64_t>(b & 0xFFFFFFFFull));
-  return std::string(buf, 24);
-}
-
-// Escape a string for use inside a JSON string value.
-static std::string json_escape(const std::string& s) {
-  std::string out;
-  out.reserve(s.size());
-  for (char c : s) {
-    if (c == '"') {
-      out += "\\\"";
-    } else if (c == '\\') {
-      out += "\\\\";
-    } else {
-      out += c;
-    }
-  }
-  return out;
 }
 
 }  // namespace
@@ -406,7 +378,7 @@ void AlarmNotifier::record_history(const AutomationEntry& automation,
     return;
   }
 
-  const std::string id = generate_24hex_id();
+  const std::string id = onvif::util::generate_24hex_id();
   char ts_buf[24];
   std::snprintf(ts_buf, sizeof(ts_buf), "%" PRIu64, ts_ms);
 
@@ -415,21 +387,22 @@ void AlarmNotifier::record_history(const AutomationEntry& automation,
   //   "zones":{"line":[],"zone":[1],"loiter":[]},
   //   "device":"MAC","eventId":"uuid","timestamp":ms},
   //  "detectionEventId":"uuid"}
+  using onvif::util::json_str;
   std::string data;
   data.reserve(384);
-  data += "{\"name\":\"";
-  data += json_escape(automation.name);
-  data += "\",\"status\":\"ok\",\"trigger\":{\"key\":\"";
-  data += json_escape(obj_type);
-  data += "\",\"zones\":{\"line\":[],\"zone\":[1],\"loiter\":[]},\"device\":\"";
-  data += json_escape(camera_mac);
-  data += "\",\"eventId\":\"";
-  data += json_escape(event_id);
-  data += "\",\"timestamp\":";
+  data += "{\"name\":";
+  data += json_str(automation.name);
+  data += ",\"status\":\"ok\",\"trigger\":{\"key\":";
+  data += json_str(obj_type);
+  data += ",\"zones\":{\"line\":[],\"zone\":[1],\"loiter\":[]},\"device\":";
+  data += json_str(camera_mac);
+  data += ",\"eventId\":";
+  data += json_str(event_id);
+  data += ",\"timestamp\":";
   data += ts_buf;
-  data += "},\"detectionEventId\":\"";
-  data += json_escape(event_id);
-  data += "\"}";
+  data += "},\"detectionEventId\":";
+  data += json_str(event_id);
+  data += "}";
 
   const char* params[4] = {id.c_str(), automation.id.c_str(),
                            ts_buf, data.c_str()};
@@ -551,6 +524,73 @@ void AlarmNotifier::notify(const std::string& obj_type,
       last_fired_[automation.id] = ts_ms;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// discover_protect_user_id()
+//
+// Reads the cached user ID from `/root/.config/onvif-recorder-api-key`.  If the
+// cache is missing, queries the unifi-core PostgreSQL database on port 5432 for
+// the first row of `user_settings.user_id` and writes the result back to the
+// cache for subsequent runs.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr const char kApiKeyPath[] = "/root/.config/onvif-recorder-api-key";
+}  // namespace
+
+std::string discover_protect_user_id() {
+  // 1. Try reading cached value.
+  {
+    std::ifstream f(kApiKeyPath);
+    std::string line;
+    if (f.is_open() && std::getline(f, line) && line.size() >= 32) {
+      while (!line.empty() && (line.back() == '\n' || line.back() == '\r' ||
+                               line.back() == ' '))
+        line.pop_back();
+      if (!line.empty()) {
+        LOG(INFO) << "[alarm] loaded user ID from " << kApiKeyPath;
+        return line;
+      }
+    }
+  }
+
+  // 2. Query unifi-core DB (port 5432) for the owner's user ID.
+  PGconn* conn = PQconnectdb(
+      "host=/run/postgresql port=5432 dbname=unifi-core user=postgres");
+  if (PQstatus(conn) != CONNECTION_OK) {
+    LOG(ERROR) << "[alarm] cannot discover user ID: unifi-core DB: "
+               << PQerrorMessage(conn);
+    PQfinish(conn);
+    return {};
+  }
+
+  PGresult* res = PQexec(conn,
+      "SELECT user_id FROM user_settings LIMIT 1");
+  std::string user_id;
+  if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+    user_id = PQgetvalue(res, 0, 0);
+    while (!user_id.empty() && user_id.back() == ' ') user_id.pop_back();
+  }
+  PQclear(res);
+  PQfinish(conn);
+
+  if (user_id.empty()) {
+    LOG(ERROR) << "[alarm] no user_id found in unifi-core user_settings";
+    return {};
+  }
+
+  // 3. Cache to disk for future runs.
+  {
+    (void)mkdir("/root/.config", 0755);
+    std::ofstream f(kApiKeyPath);
+    if (f.is_open()) {
+      f << user_id << '\n';
+      LOG(INFO) << "[alarm] saved user ID to " << kApiKeyPath;
+    } else {
+      LOG(ERROR) << "[alarm] could not write " << kApiKeyPath;
+    }
+  }
+  return user_id;
 }
 
 }  // namespace onvif

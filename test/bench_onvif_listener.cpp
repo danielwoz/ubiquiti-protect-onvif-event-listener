@@ -36,7 +36,7 @@
 #include <string>
 #include <thread>
 
-#include "../onvif_listener.hpp"
+#include "onvif_listener.hpp"
 #include "camera_emulators.hpp"
 
 namespace {

@@ -41,6 +41,23 @@ struct FirstPartyCamera {
   std::string mac;
 };
 
+namespace internal {
+
+/// Build a libpq conninfo string from a DbConfig.  Exposed for testing.
+std::string build_connstr(const DbConfig& db);
+
+/// Extract a string value for @p key from a flat JSONB object @p json.
+/// Handles string, numeric, boolean and null values; returns empty string on
+/// null or missing key.  Supports basic backslash escapes.  Exposed for
+/// testing.
+std::string json_get(const std::string& json, const std::string& key);
+
+/// Build a PostgreSQL array literal from @p ids, e.g. {"id1","id2"}.
+/// Exposed for testing.
+std::string pg_array(const std::vector<std::string>& ids);
+
+}  // namespace internal
+
 /// Connect to the UniFi Protect database and return a CameraConfig for every
 /// adopted third-party (ONVIF) camera.
 ///

@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-#include "../onvif_listener.hpp"
+#include "onvif_listener.hpp"
 #include "camera_emulators.hpp"
 
 // ============================================================

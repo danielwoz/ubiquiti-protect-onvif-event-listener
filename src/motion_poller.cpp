@@ -17,15 +17,11 @@
 #include <libpq-fe.h>
 
 #include <chrono>
-#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
-#include <iomanip>
 #include <map>
 #include <memory>
-#include <random>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -35,74 +31,64 @@
 #include "jpeg_crop.hpp"
 #include "object_detect.hpp"
 #include "ubv_thumbnail.hpp"
+#include "util.hpp"
 
 namespace onvif {
 
 // ---------------------------------------------------------------------------
-// Helpers (file-local, mirrors detection_recorder.cpp)
+// Helpers (exposed via namespace motion_poller_internal for testing)
 // ---------------------------------------------------------------------------
 
-static uint64_t now_ms() {
-  return static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::system_clock::now().time_since_epoch()).count());
-}
+namespace motion_poller_internal {
 
-static std::string utc_now_iso8601() {
-  auto now = std::chrono::system_clock::now();
-  std::time_t t = std::chrono::system_clock::to_time_t(now);
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()) % 1000;
-  std::tm tm{};
-  gmtime_r(&t, &tm);
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
-  std::ostringstream oss;
-  oss << buf << '.' << std::setfill('0') << std::setw(3) << ms.count() << 'Z';
-  return oss.str();
-}
-
-static std::string generate_uuid() {
-  static std::random_device rd;
-  thread_local std::mt19937_64 gen(rd());
-  std::uniform_int_distribution<uint64_t> dis;
-
-  uint64_t hi = dis(gen);
-  uint64_t lo = dis(gen);
-
-  hi = (hi & 0xFFFFFFFFFFFF0FFFull) | 0x0000000000004000ull;
-  lo = (lo & 0x3FFFFFFFFFFFFFFFull) | 0x8000000000000000ull;
-
-  char buf[37];
-  std::snprintf(buf, sizeof(buf),
-    "%08x-%04x-%04x-%04x-%012" PRIx64,
-    static_cast<unsigned>(hi >> 32),
-    static_cast<unsigned>((hi >> 16) & 0xFFFF),
-    static_cast<unsigned>(hi & 0xFFFF),
-    static_cast<unsigned>((lo >> 48) & 0xFFFF),
-    static_cast<uint64_t>(lo & 0x0000FFFFFFFFFFFFull));
-  return buf;
-}
-
-static std::string generate_24hex_id() {
-  static std::random_device rd2;
-  thread_local std::mt19937_64 gen(rd2());
-  std::uniform_int_distribution<uint64_t> dis;
-  uint64_t a = dis(gen);
-  uint64_t b = dis(gen);
-  char buf[25];
-  std::snprintf(buf, sizeof(buf), "%016" PRIx64 "%08" PRIx64,
-                static_cast<uint64_t>(a),
-                static_cast<uint64_t>(b & 0xFFFFFFFFull));
-  return buf;
-}
-
-static std::string smart_detect_types_json(const std::string& det_type) {
+std::string smart_detect_types_json(const std::string& det_type) {
   if (det_type == "vehicle") return "[\"vehicle\"]";
   if (det_type == "animal")  return "[\"animal\"]";
   if (det_type == "package") return "[\"package\"]";
   return "[\"person\"]";
 }
+
+std::string build_sdr_payload(uint64_t ts_ms, const std::string& obj_type) {
+  const std::string ts = std::to_string(ts_ms);
+  return
+      std::string("{")
+      + "\"attributesForTracks\":null,"
+      + "\"clockStream\":" + ts + ","
+      + "\"clockStreamRate\":1000,"
+      + "\"clockWall\":" + ts + ","
+      + "\"descriptors\":[{"
+      + "\"attributes\":null,"
+      + "\"confidence\":75,"
+      + "\"coord\":[-1.0,-1.0,-1.0,-1.0],"
+      + "\"coord3d\":[-1.0,-1.0],"
+      + "\"depth\":null,"
+      + "\"duration\":0,"
+      + "\"firstShownTimeMs\":" + ts + ","
+      + "\"id\":\"1\","
+      + "\"idleSinceTimeMs\":" + ts + ","
+      + "\"licensePlate\":null,"
+      + "\"lines\":[],"
+      + "\"loiterZones\":[],"
+      + "\"matchedId\":null,"
+      + "\"name\":\"\","
+      + "\"objectType\":\"" + obj_type + "\","
+      + "\"speed\":null,"
+      + "\"stationary\":false,"
+      + "\"timestamp\":" + ts + ","
+      + "\"zones\":[]"
+      + "}],"
+      + "\"edgeType\":\"none\","
+      + "\"linesStatus\":null,"
+      + "\"loiterZonesStatus\":null,"
+      + "\"smartDetectSnapshotFullFoV\":\"\","
+      + "\"smartDetectSnapshots\":null,"
+      + "\"tamperStatus\":null,"
+      + "\"trackerIdAttrMap\":null,"
+      + "\"zonesStatus\":{}"
+      + "}";
+}
+
+}  // namespace motion_poller_internal
 
 // Build a PostgreSQL text-array literal: {"id1","id2","id3"}
 static std::string pg_array(const std::vector<std::string>& ids) {
@@ -149,48 +135,6 @@ struct MotionPoller::Impl {
     else
       LOG(ERROR) << "[motion_poller] reconnect failed: "
                  << PQerrorMessage(conn);
-  }
-
-  // Build the smartDetectRaws payload JSON (mirrors detection_recorder.cpp).
-  static std::string build_sdr_payload(uint64_t ts_ms,
-                                        const std::string& obj_type) {
-    const std::string ts = std::to_string(ts_ms);
-    return
-        std::string("{")
-        + "\"attributesForTracks\":null,"
-        + "\"clockStream\":" + ts + ","
-        + "\"clockStreamRate\":1000,"
-        + "\"clockWall\":" + ts + ","
-        + "\"descriptors\":[{"
-        + "\"attributes\":null,"
-        + "\"confidence\":75,"
-        + "\"coord\":[-1.0,-1.0,-1.0,-1.0],"
-        + "\"coord3d\":[-1.0,-1.0],"
-        + "\"depth\":null,"
-        + "\"duration\":0,"
-        + "\"firstShownTimeMs\":" + ts + ","
-        + "\"id\":\"1\","
-        + "\"idleSinceTimeMs\":" + ts + ","
-        + "\"licensePlate\":null,"
-        + "\"lines\":[],"
-        + "\"loiterZones\":[],"
-        + "\"matchedId\":null,"
-        + "\"name\":\"\","
-        + "\"objectType\":\"" + obj_type + "\","
-        + "\"speed\":null,"
-        + "\"stationary\":false,"
-        + "\"timestamp\":" + ts + ","
-        + "\"zones\":[]"
-        + "}],"
-        + "\"edgeType\":\"none\","
-        + "\"linesStatus\":null,"
-        + "\"loiterZonesStatus\":null,"
-        + "\"smartDetectSnapshotFullFoV\":\"\","
-        + "\"smartDetectSnapshots\":null,"
-        + "\"tamperStatus\":null,"
-        + "\"trackerIdAttrMap\":null,"
-        + "\"zonesStatus\":{}"
-        + "}";
   }
 };
 
@@ -258,7 +202,7 @@ void MotionPoller::stop() {
 // ---------------------------------------------------------------------------
 
 void MotionPoller::init_high_water_marks() {
-  const uint64_t default_hwm = now_ms() - 3600000ULL;  // 1 hour ago
+  const uint64_t default_hwm = util::now_ms() - 3600000ULL;  // 1 hour ago
 
   for (const auto& cam_id : impl_->camera_ids) {
     impl_->maybe_reconnect();
@@ -303,7 +247,7 @@ void MotionPoller::poll_loop() {
     uint64_t min_hwm = UINT64_MAX;
     for (const auto& [id, h] : impl_->hwm)
       if (h < min_hwm) min_hwm = h;
-    if (min_hwm == UINT64_MAX) min_hwm = now_ms() - 3600000ULL;
+    if (min_hwm == UINT64_MAX) min_hwm = util::now_ms() - 3600000ULL;
 
     const std::string hwm_str = std::to_string(min_hwm);
     const char* params[] = { cam_arr.c_str(), hwm_str.c_str() };
@@ -384,12 +328,13 @@ void MotionPoller::poll_loop() {
 
         const std::string obj_type =
             object_detect::detection_type(det->class_id);
-        const std::string sdt_json = smart_detect_types_json(obj_type);
-        const std::string new_event_id = generate_uuid();
-        const std::string sdo_id       = generate_uuid();
-        const std::string sdr_id       = generate_uuid();
-        const std::string new_thumb_id = generate_24hex_id();
-        const std::string now_str      = utc_now_iso8601();
+        const std::string sdt_json =
+            motion_poller_internal::smart_detect_types_json(obj_type);
+        const std::string new_event_id = util::generate_uuid();
+        const std::string sdo_id       = util::generate_uuid();
+        const std::string sdr_id       = util::generate_uuid();
+        const std::string new_thumb_id = util::generate_24hex_id();
+        const std::string now_str      = util::utc_now_iso8601();
         const std::string start_str    = std::to_string(start_ms);
         const std::string end_str      = std::to_string(end_ms);
         const std::string ts_str       = std::to_string(start_ms);
@@ -446,7 +391,7 @@ void MotionPoller::poll_loop() {
         // INSERT smartDetectRaws.
         {
           const std::string payload =
-              Impl::build_sdr_payload(start_ms, obj_type);
+              motion_poller_internal::build_sdr_payload(start_ms, obj_type);
           const char* rp[] = {
             sdr_id.c_str(), cam_id.c_str(), payload.c_str(),
             ts_str.c_str(), now_str.c_str(), now_str.c_str()

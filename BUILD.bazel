@@ -31,12 +31,46 @@ _NCNN_DEPS = select({
 
 _NCNN_DEFS = ["WITH_NCNN"]
 
+# All source files live under src/.  Each cc_library below uses
+# `strip_include_prefix = "src"` so consumers (including tests) can
+# `#include "foo.hpp"` without the `src/` prefix.
+
+exports_files(
+    ["src/protect_ui_patch.cpp", "src/protect_ui_patch.hpp"],
+    visibility = ["//test:__pkg__"],
+)
+
+cc_library(
+    name = "util",
+    srcs = ["src/util.cpp"],
+    hdrs = ["src/util.hpp"],
+    strip_include_prefix = "src",
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "onvif_listener",
-    srcs = ["onvif_listener.cpp"],
-    hdrs = ["onvif_listener.hpp"],
+    srcs = ["src/onvif_listener.cpp"],
+    hdrs = ["src/onvif_listener.hpp"],
+    strip_include_prefix = "src",
     deps = _CURL + _XML2 + _SSL + [
         ":jpeg_crop",
+        ":util",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "event_recorder",
+    srcs = ["src/event_recorder.cpp"],
+    hdrs = ["src/event_recorder.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        ":onvif_listener",
+        ":util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
@@ -46,8 +80,9 @@ cc_library(
 
 cc_library(
     name = "ubv_thumbnail",
-    srcs = ["ubv_thumbnail.cpp"],
-    hdrs = ["ubv_thumbnail.hpp"],
+    srcs = ["src/ubv_thumbnail.cpp"],
+    hdrs = ["src/ubv_thumbnail.hpp"],
+    strip_include_prefix = "src",
     deps = [
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
@@ -57,30 +92,35 @@ cc_library(
 
 cc_library(
     name = "jpeg_crop",
-    srcs = ["jpeg_crop.cpp"],
-    hdrs = ["jpeg_crop.hpp"],
+    srcs = ["src/jpeg_crop.cpp"],
+    hdrs = ["src/jpeg_crop.hpp"],
+    strip_include_prefix = "src",
     deps = _JPEG,
     visibility = ["//visibility:public"],
 )
 
 cc_library(
     name = "object_detect",
-    srcs = ["object_detect.cpp"],
-    hdrs = ["object_detect.hpp"],
+    srcs = ["src/object_detect.cpp"],
+    hdrs = ["src/object_detect.hpp"],
+    strip_include_prefix = "src",
     defines = _NCNN_DEFS,
     deps = [
         ":jpeg_crop",
+        "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
-    ] + _JPEG + _NCNN_DEPS,
+    ] + _CURL + _JPEG + _NCNN_DEPS,
     visibility = ["//visibility:public"],
 )
 
 cc_library(
     name = "alarm_notifier",
-    srcs = ["alarm_notifier.cpp"],
-    hdrs = ["alarm_notifier.hpp"],
+    srcs = ["src/alarm_notifier.cpp"],
+    hdrs = ["src/alarm_notifier.hpp"],
+    strip_include_prefix = "src",
     deps = [
+        ":util",
         "@com_google_absl//absl/log:log",
     ] + _CURL + _PQ,
     visibility = ["//visibility:public"],
@@ -88,14 +128,16 @@ cc_library(
 
 cc_library(
     name = "detection_recorder",
-    srcs = ["detection_recorder.cpp"],
-    hdrs = ["detection_recorder.hpp"],
+    srcs = ["src/detection_recorder.cpp"],
+    hdrs = ["src/detection_recorder.hpp"],
+    strip_include_prefix = "src",
     deps = [
         ":alarm_notifier",
         ":jpeg_crop",
         ":object_detect",
         ":onvif_listener",
         ":ubv_thumbnail",
+        ":util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
@@ -105,9 +147,11 @@ cc_library(
 
 cc_library(
     name = "camera_change_log",
-    srcs = ["camera_change_log.cpp"],
-    hdrs = ["camera_change_log.hpp"],
+    srcs = ["src/camera_change_log.cpp"],
+    hdrs = ["src/camera_change_log.hpp"],
+    strip_include_prefix = "src",
     deps = [
+        ":util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:statusor",
     ],
@@ -116,8 +160,9 @@ cc_library(
 
 cc_library(
     name = "unifi_camera_config",
-    srcs = ["unifi_camera_config.cpp"],
-    hdrs = ["unifi_camera_config.hpp"],
+    srcs = ["src/unifi_camera_config.cpp"],
+    hdrs = ["src/unifi_camera_config.hpp"],
+    strip_include_prefix = "src",
     deps = [
         ":camera_change_log",
         ":onvif_listener",
@@ -130,8 +175,9 @@ cc_library(
 
 cc_library(
     name = "protect_ui_patch",
-    srcs = ["protect_ui_patch.cpp"],
-    hdrs = ["protect_ui_patch.hpp"],
+    srcs = ["src/protect_ui_patch.cpp"],
+    hdrs = ["src/protect_ui_patch.hpp"],
+    strip_include_prefix = "src",
     deps = [
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
@@ -141,13 +187,15 @@ cc_library(
 
 cc_library(
     name = "motion_poller",
-    srcs = ["motion_poller.cpp"],
-    hdrs = ["motion_poller.hpp"],
+    srcs = ["src/motion_poller.cpp"],
+    hdrs = ["src/motion_poller.hpp"],
+    strip_include_prefix = "src",
     deps = [
         ":alarm_notifier",
         ":jpeg_crop",
         ":object_detect",
         ":ubv_thumbnail",
+        ":util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:statusor",
     ] + _JPEG + _PQ,
@@ -156,23 +204,25 @@ cc_library(
 
 cc_binary(
     name = "onvif_recorder",
-    srcs = ["main.cpp"],
+    srcs = ["src/main.cpp"],
     linkstatic = True,
     deps = [
         ":alarm_notifier",
         ":camera_change_log",
         ":detection_recorder",
+        ":event_recorder",
         ":motion_poller",
         ":object_detect",
         ":onvif_listener",
         ":protect_ui_patch",
         ":unifi_camera_config",
+        ":util",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
         "@com_google_absl//absl/log:globals",
         "@com_google_absl//absl/log:initialize",
         "@com_google_absl//absl/log:log",
-    ] + _CURL + _PQ,
+    ],
 )
 
 sh_binary(
@@ -222,7 +272,7 @@ sh_binary(
 
 cc_binary(
     name = "ubv_extract",
-    srcs = ["ubv_extract.cpp"],
+    srcs = ["src/ubv_extract.cpp"],
     deps = [
         ":ubv_thumbnail",
         "@com_google_absl//absl/flags:flag",

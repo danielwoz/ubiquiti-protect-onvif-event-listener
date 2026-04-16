@@ -97,6 +97,15 @@ class ObjectDetector {
   static absl::StatusOr<std::unique_ptr<ObjectDetector>> Load(
       const std::string& param_path, const std::string& bin_path);
 
+  /// Ensure NanoDet-M model files exist in @p model_dir, downloading them
+  /// from the nihui/ncnn-assets GitHub repository if needed. Creates
+  /// @p model_dir (mode 0755) if it does not exist. Returns true if both
+  /// nanodet_m.param and nanodet_m.bin are present after the call.
+  ///
+  /// Requires libcurl at link time; downloads over HTTPS with redirect
+  /// following and a 60-second per-file timeout.
+  static bool EnsureModels(const std::string& model_dir);
+
   ~ObjectDetector();
 
   ObjectDetector(const ObjectDetector&)            = delete;

@@ -48,6 +48,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "util.hpp"
 
 namespace onvif {
 
@@ -103,49 +104,6 @@ std::string utc_now_iso8601() {
   return buf;
 }
 
-std::string utc_now_iso8601_ms() {
-  auto now = std::chrono::system_clock::now();
-  std::time_t t = std::chrono::system_clock::to_time_t(now);
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()) % 1000;
-  std::tm tm{};
-  gmtime_r(&t, &tm);
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
-  std::ostringstream oss;
-  oss << buf << '.' << std::setfill('0') << std::setw(3) << ms.count() << 'Z';
-  return oss.str();
-}
-
-// -------------------------------------------------------
-// JSON string escaping (used by RawRecorder)
-// -------------------------------------------------------
-std::string json_str(const std::string& s) {
-  std::string out;
-  out.reserve(s.size() + 4);
-  out += '"';
-  for (unsigned char c : s) {
-    if (c == '"') {
-      out += "\\\"";
-    } else if (c == '\\') {
-      out += "\\\\";
-    } else if (c == '\n') {
-      out += "\\n";
-    } else if (c == '\r') {
-      out += "\\r";
-    } else if (c == '\t') {
-      out += "\\t";
-    } else if (c < 0x20) {
-      char buf[8];
-      std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-      out += buf;
-    } else {
-      out += static_cast<char>(c);
-    }
-  }
-  out += '"';
-  return out;
-}
 
 // -------------------------------------------------------
 // RawRecorder -- thread-safe JSON Lines sink for raw HTTP exchanges
@@ -169,13 +127,14 @@ class RawRecorder {
               const std::string& response) {
     std::string line;
     line += '{';
-    line += json_str("timestamp")       + ':' + json_str(utc_now_iso8601_ms()) + ',';
-    line += json_str("camera_ip")       + ':' + json_str(camera_ip)            + ',';
-    line += json_str("url")             + ':' + json_str(url)                  + ',';
-    line += json_str("soap_action")     + ':' + json_str(soap_action)          + ',';
-    line += json_str("request")         + ':' + json_str(request)              + ',';
-    line += json_str("response_status") + ':' + std::to_string(response_status)+ ',';
-    line += json_str("response")        + ':' + json_str(response);
+    line += util::json_str("timestamp") + ':'
+         + util::json_str(util::utc_now_iso8601_ms()) + ',';
+    line += util::json_str("camera_ip")       + ':' + util::json_str(camera_ip)            + ',';
+    line += util::json_str("url")             + ':' + util::json_str(url)                  + ',';
+    line += util::json_str("soap_action")     + ':' + util::json_str(soap_action)          + ',';
+    line += util::json_str("request")         + ':' + util::json_str(request)              + ',';
+    line += util::json_str("response_status") + ':' + std::to_string(response_status)+ ',';
+    line += util::json_str("response")        + ':' + util::json_str(response);
     line += "}\n";
 
     std::lock_guard<std::mutex> lk(mu_);

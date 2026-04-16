@@ -35,7 +35,7 @@
 #include <utility>
 #include <vector>
 
-#include "../ubv_thumbnail.hpp"
+#include "ubv_thumbnail.hpp"
 
 static std::vector<uint8_t> read_file(const std::string& path) {
   std::ifstream f(path, std::ios::binary | std::ios::ate);

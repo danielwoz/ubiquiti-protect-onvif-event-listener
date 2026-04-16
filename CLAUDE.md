@@ -81,20 +81,25 @@ Key rules in practice:
 ## Project structure
 
 ```
-onvif_listener.hpp/.cpp       — WS-PullPoint ONVIF subscription library
-                                  Parses tt:BoundingBox from ONVIF analytics events
-detection_recorder.hpp/.cpp   — Detection → PostgreSQL recorder
-                                  Crops thumbnails: ONVIF bbox → ML detect → smart crop
-motion_poller.hpp/.cpp        — First-party camera motion → smart detect poller
-                                  Polls events table, runs NanoDet-M on Protect thumbnails
-camera_change_log.hpp/.cpp    — Cameras-table change log and rollback support
-protect_ui_patch.hpp/.cpp     — Live-patch Protect UI alarm picker for third-party cameras
-ubv_thumbnail.hpp/.cpp        — UBV container encode/decode (thumbnail storage)
-jpeg_crop.hpp/.cpp            — JPEG decode/crop/re-encode via libjpeg
-object_detect.hpp/.cpp        — NanoDet-M on-device object detection via NCNN
-                                  Built with WITH_NCNN on both x86 and ARM64 (NEON SIMD)
-unifi_camera_config.hpp/.cpp  — Load camera credentials from UniFi Protect DB
-main.cpp                      — Binary entry point
+src/
+  onvif_listener.hpp/.cpp       — WS-PullPoint ONVIF subscription library
+                                    Parses tt:BoundingBox from ONVIF analytics events
+  detection_recorder.hpp/.cpp   — Detection → PostgreSQL recorder
+                                    Crops thumbnails: ONVIF bbox → ML detect → smart crop
+  motion_poller.hpp/.cpp        — First-party camera motion → smart detect poller
+                                    Polls events table, runs NanoDet-M on Protect thumbnails
+  alarm_notifier.hpp/.cpp       — Protect API alarm notifier (triggers automations on smart detect)
+  camera_change_log.hpp/.cpp    — Cameras-table change log and rollback support
+  protect_ui_patch.hpp/.cpp     — Live-patch Protect UI alarm picker for third-party cameras
+  ubv_thumbnail.hpp/.cpp        — UBV container encode/decode (thumbnail storage)
+  jpeg_crop.hpp/.cpp            — JPEG decode/crop/re-encode via libjpeg
+  object_detect.hpp/.cpp        — NanoDet-M on-device object detection via NCNN
+                                    Built with WITH_NCNN on both x86 and ARM64 (NEON SIMD)
+  unifi_camera_config.hpp/.cpp  — Load camera credentials from UniFi Protect DB
+  event_recorder.hpp/.cpp       — Thread-safe JSON Lines writer for parsed ONVIF events
+  util.hpp/.cpp                 — Shared UUID, timestamp, JSON string helpers
+  main.cpp                      — Binary entry point
+  ubv_extract.cpp               — Standalone UBV thumbnail extraction tool
 
 .githooks/
   pre-push                    — shared pre-push hook (lint + x86 tests + Docker ARM64 build)
@@ -110,6 +115,10 @@ test/
   test_onvif_listener.cpp         — Listener integration test
   test_detection_recorder.cpp     — Detection recorder e2e test
   test_ubv_thumbnail.cpp          — UBV round-trip test
+  test_camera_change_log.cpp     — Change log unit tests
+  test_protect_ui_patch.cpp       — UI patch apply/revert tests
+  test_unifi_camera_config.cpp   — DB connection string / JSON / PG array helper tests
+  test_motion_poller.cpp          — Smart detect type / SDR payload helper tests
   bench_onvif_listener.cpp        — ONVIF parsing throughput benchmark
   bench_jpeg_crop.cpp             — JPEG crop throughput benchmark
   bench_object_detect.cpp         — NanoDet-M inference latency benchmark
@@ -162,7 +171,7 @@ Run these before every `git push` to keep the repo green:
 
 ```bash
 # 1. Lint all source files (must be zero errors)
-python3 -m cpplint *.cpp *.hpp test/*.cpp test/*.hpp
+python3 -m cpplint src/*.cpp src/*.hpp test/*.cpp test/*.hpp
 
 # 2. All tests pass (Bazel-cached; fast on repeat runs)
 scripts/bz test --config=x86 //test:all

@@ -69,10 +69,10 @@
 #include <utility>
 #include <vector>
 
-#include "../alarm_notifier.hpp"
-#include "../detection_recorder.hpp"
-#include "../onvif_listener.hpp"
-#include "../ubv_thumbnail.hpp"
+#include "alarm_notifier.hpp"
+#include "detection_recorder.hpp"
+#include "onvif_listener.hpp"
+#include "ubv_thumbnail.hpp"
 #include "camera_emulators.hpp"
 #include "onvif_camera_emulator.hpp"
 
@@ -443,10 +443,16 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
     std::string      object_id;  // empty = NULL
     std::vector<int> lids;
   };
+  struct ThumbRow {
+    std::string id;
+    std::string event_id;
+    std::string camera_ip;
+  };
 
   std::vector<EventRow>   events;
   std::vector<SdoRow>     sdos;
   std::vector<SdrRow>     sdrs;
+  std::vector<ThumbRow>   thumbs;
   std::map<std::string, int> labels;      // name -> simulated lid
   std::vector<DetLabelRow>   det_labels;
 
@@ -483,12 +489,14 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
       }
   }
 
-  void write_thumbnail(const std::string& /*thumb_id*/,
-                       const std::string& /*event_id*/,
-                       const std::string& /*camera_ip*/,
+  void write_thumbnail(const std::string& thumb_id,
+                       const std::string& event_id,
+                       const std::string& camera_ip,
                        uint64_t           /*ts_ms*/,
                        const std::string& /*now_str*/,
-                       const std::vector<unsigned char>& /*jpeg*/) override {}
+                       const std::vector<unsigned char>& /*jpeg*/) override {
+    thumbs.push_back({thumb_id, event_id, camera_ip});
+  }
 
   void insert_smart_detect_raw(const std::string& id,
                                const std::string& camera_ip,
@@ -556,6 +564,92 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
         break;
       }
     }
+  }
+
+  // --- Orphan-purge helpers ------------------------------------------------
+  //
+  // Each method removes rows from the corresponding table whose parent event
+  // (by id, or by timestamp range for smartDetectRaws) does not exist.
+
+  int purge_orphaned_smart_detect_raws() override {
+    const size_t before = sdrs.size();
+    sdrs.erase(std::remove_if(sdrs.begin(), sdrs.end(),
+                              [this](const SdrRow& r) {
+      for (const auto& e : events) {
+        if (e.camera_ip != r.camera_ip) continue;
+        if (r.ts_ms >= e.start_ms && (!e.ended || r.ts_ms <= e.end_ms))
+          return false;
+      }
+      return true;
+    }), sdrs.end());
+    return static_cast<int>(before - sdrs.size());
+  }
+
+  int purge_orphaned_thumbnails() override {
+    const size_t before = thumbs.size();
+    thumbs.erase(std::remove_if(thumbs.begin(), thumbs.end(),
+                                [this](const ThumbRow& t) {
+      for (const auto& e : events)
+        if (e.id == t.event_id) return false;
+      return true;
+    }), thumbs.end());
+    return static_cast<int>(before - thumbs.size());
+  }
+
+  int purge_orphaned_smart_detect_objects() override {
+    const size_t before = sdos.size();
+    sdos.erase(std::remove_if(sdos.begin(), sdos.end(),
+                              [this](const SdoRow& s) {
+      for (const auto& e : events)
+        if (e.id == s.event_id) return false;
+      return true;
+    }), sdos.end());
+    return static_cast<int>(before - sdos.size());
+  }
+
+  int purge_orphaned_detection_labels() override {
+    const size_t before = det_labels.size();
+    det_labels.erase(std::remove_if(det_labels.begin(), det_labels.end(),
+                                    [this](const DetLabelRow& d) {
+      for (const auto& e : events)
+        if (e.id == d.event_id) return false;
+      return true;
+    }), det_labels.end());
+    return static_cast<int>(before - det_labels.size());
+  }
+
+  int purge_all_orphaned_rows() override {
+    return purge_orphaned_smart_detect_raws()
+         + purge_orphaned_thumbnails()
+         + purge_orphaned_smart_detect_objects()
+         + purge_orphaned_detection_labels();
+  }
+
+  int purge_stale_open_events(uint64_t older_than_ms) override {
+    const uint64_t now = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    const uint64_t cutoff = (now > older_than_ms) ? now - older_than_ms : 0;
+    int deleted = 0;
+    for (auto it = events.begin(); it != events.end(); ) {
+      if (!it->ended && it->start_ms < cutoff) {
+        const std::string gone_id = it->id;
+        sdos.erase(std::remove_if(sdos.begin(), sdos.end(),
+            [&](const SdoRow& s) { return s.event_id == gone_id; }),
+            sdos.end());
+        thumbs.erase(std::remove_if(thumbs.begin(), thumbs.end(),
+            [&](const ThumbRow& t) { return t.event_id == gone_id; }),
+            thumbs.end());
+        det_labels.erase(std::remove_if(det_labels.begin(), det_labels.end(),
+            [&](const DetLabelRow& d) { return d.event_id == gone_id; }),
+            det_labels.end());
+        it = events.erase(it);
+        ++deleted;
+      } else {
+        ++it;
+      }
+    }
+    return deleted;
   }
 };
 
@@ -2086,6 +2180,135 @@ static void test_rate_limit() {
 }
 
 // ============================================================
+// Purge-orphaned-rows: sweep dependent tables after coalesce/rollback.
+//
+// Pre-populates a MockBackend with:
+//   - 2 valid events (E1, E2) and matching thumb/sdo/sdr/detLabel rows
+//   - 1 orphaned row in each dependent table referencing a non-existent event
+// Calls purge_orphaned_rows() and verifies exactly 4 rows were removed
+// (one per table) and that the valid rows survive.
+// ============================================================
+static void test_purge_orphaned_rows() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("test_purge_orphaned_rows: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+
+  // Two valid events.
+  const uint64_t T = 100000ULL;
+  bptr->events.push_back({"E1", "192.168.1.200", "[\"person\"]", "",
+                           T, true, T + 10000});
+  bptr->events.push_back({"E2", "192.168.1.200", "[\"person\"]", "",
+                           T + 20000, true, T + 30000});
+
+  // Valid dependent rows.
+  bptr->sdos.push_back({"sdo-1", "E1", "192.168.1.200", "person"});
+  bptr->thumbs.push_back({"thumb-1", "E1", "192.168.1.200"});
+  bptr->sdrs.push_back({"sdr-1", "192.168.1.200", "person", T + 5000});
+  bptr->det_labels.push_back({"E1", "", {1}});
+
+  // Orphaned dependent rows (parent event does not exist).
+  bptr->sdos.push_back({"sdo-orphan", "GONE", "192.168.1.200", "person"});
+  bptr->thumbs.push_back({"thumb-orphan", "GONE", "192.168.1.200"});
+  // Orphaned sdr: timestamp outside any event window for this camera.
+  bptr->sdrs.push_back({"sdr-orphan", "192.168.1.200", "person", T + 50000});
+  bptr->det_labels.push_back({"GONE", "", {1}});
+
+  const int deleted = recorder.purge_orphaned_rows();
+  CHECK(deleted == 4,
+        "purge_orphaned_rows: expected 4 deleted, got "
+        + std::to_string(deleted));
+  CHECK(bptr->sdos.size()       == 1, "sdos should have 1 row after purge");
+  CHECK(bptr->thumbs.size()     == 1, "thumbs should have 1 row after purge");
+  CHECK(bptr->sdrs.size()       == 1, "sdrs should have 1 row after purge");
+  CHECK(bptr->det_labels.size() == 1,
+        "det_labels should have 1 row after purge");
+
+  // Second call with no orphans left is a no-op.
+  const int deleted2 = recorder.purge_orphaned_rows();
+  CHECK(deleted2 == 0,
+        "purge_orphaned_rows: second run should delete 0, got "
+        + std::to_string(deleted2));
+}
+
+// ============================================================
+// Purge stale open events: events with end IS NULL older than N ms.
+//
+// Pre-populates two open events (one with start_ms far in the past, one
+// recent) plus one already-ended event.  Calls purge_stale_open_events()
+// with a 5-second threshold and verifies only the stale one is deleted,
+// along with its dependent thumb/sdo rows.
+// ============================================================
+static void test_purge_stale_open_events() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("test_purge_stale_open_events: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+
+  const uint64_t now = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count());
+
+  // Stale open event: start 1 hour ago, never ended.
+  bptr->events.push_back({"STALE", "192.168.1.200", "[\"person\"]", "",
+                           now - 3600000ULL, /*ended=*/false, 0});
+  // Recent open event: start 1 s ago, never ended — should survive.
+  bptr->events.push_back({"FRESH", "192.168.1.200", "[\"person\"]", "",
+                           now - 1000ULL, /*ended=*/false, 0});
+  // Properly-ended event — should survive regardless of age.
+  bptr->events.push_back({"DONE", "192.168.1.200", "[\"person\"]", "",
+                           now - 7200000ULL, /*ended=*/true,
+                           now - 7100000ULL});
+
+  // Dependents attached to STALE: must be purged alongside it.
+  bptr->thumbs.push_back({"thumb-stale", "STALE", "192.168.1.200"});
+  bptr->sdos.push_back({"sdo-stale", "STALE", "192.168.1.200", "person"});
+  bptr->det_labels.push_back({"STALE", "", {1}});
+  // Dependent on FRESH: must survive.
+  bptr->thumbs.push_back({"thumb-fresh", "FRESH", "192.168.1.200"});
+
+  const int deleted = recorder.purge_stale_open_events(5000);  // 5 s threshold
+  CHECK(deleted == 1,
+        "purge_stale_open_events: expected 1 deleted, got "
+        + std::to_string(deleted));
+  CHECK(bptr->events.size() == 2,
+        "purge_stale_open_events: 2 events should remain, got "
+        + std::to_string(bptr->events.size()));
+  // Verify the surviving events are FRESH and DONE.
+  bool has_fresh = false, has_done = false, has_stale = false;
+  for (const auto& e : bptr->events) {
+    if (e.id == "FRESH") has_fresh = true;
+    if (e.id == "DONE")  has_done  = true;
+    if (e.id == "STALE") has_stale = true;
+  }
+  CHECK(has_fresh && has_done && !has_stale,
+        "purge_stale_open_events: FRESH and DONE should survive, STALE should be gone");
+
+  // STALE's dependents are gone; FRESH's survives.
+  CHECK(bptr->thumbs.size() == 1,
+        "purge_stale_open_events: 1 thumbnail should remain, got "
+        + std::to_string(bptr->thumbs.size()));
+  CHECK(bptr->thumbs.empty() || bptr->thumbs[0].event_id == "FRESH",
+        "purge_stale_open_events: surviving thumbnail should reference FRESH");
+  CHECK(bptr->sdos.empty(),
+        "purge_stale_open_events: sdo-stale should be purged");
+  CHECK(bptr->det_labels.empty(),
+        "purge_stale_open_events: det_label for STALE should be purged");
+}
+
+// ============================================================
 // main
 // ============================================================
 int main() {
@@ -2128,6 +2351,8 @@ int main() {
   run_test("coalesce_window",            [] { test_coalesce_window(); });
   run_test("coalesce_history",           [] { test_coalesce_history(); });
   run_test("rate_limit",                 [] { test_rate_limit(); });
+  run_test("purge_orphaned_rows",        [] { test_purge_orphaned_rows(); });
+  run_test("purge_stale_open_events",    [] { test_purge_stale_open_events(); });
 
   onvif::global_cleanup();
 

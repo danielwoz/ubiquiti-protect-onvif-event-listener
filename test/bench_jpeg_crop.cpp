@@ -33,7 +33,7 @@
 #include <string>
 #include <vector>
 
-#include "../jpeg_crop.hpp"
+#include "jpeg_crop.hpp"
 
 namespace {
 

@@ -23,20 +23,19 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
 #include <map>
 #include <memory>
 #include <optional>
-#include <random>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "util.hpp"
 #include "absl/status/statusor.h"
 #include "alarm_notifier.hpp"
 #include "jpeg_crop.hpp"
@@ -129,71 +128,9 @@ std::optional<Detection> classify(const OnvifEvent& ev,
 }  // anonymous namespace
 
 // ============================================================
-// Timestamp and ID helpers (file-local)
+// Detection type helpers (file-local)
 // ============================================================
 namespace {
-
-// Current time as milliseconds since Unix epoch.
-static uint64_t now_ms() {
-  return static_cast<uint64_t>(
-    std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::system_clock::now().time_since_epoch()).count());
-}
-
-// Current time as ISO-8601 UTC string: "YYYY-MM-DDTHH:MM:SS.mmmZ"
-static std::string utc_now_iso8601() {
-  auto   now = std::chrono::system_clock::now();
-  auto   t   = std::chrono::system_clock::to_time_t(now);
-  auto   ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
-                   now.time_since_epoch()) % 1000;
-  struct tm tm{};
-  gmtime_r(&t, &tm);
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
-  char out[48];
-  std::snprintf(out, sizeof(out), "%s.%03dZ", buf, static_cast<int>(ms.count()));
-  return out;
-}
-
-// Generate a UUID v4 string.
-static std::string generate_uuid() {
-  static std::random_device rd;
-  thread_local std::mt19937_64 gen(rd());
-  std::uniform_int_distribution<uint64_t> dis;
-
-  uint64_t hi = dis(gen);
-  uint64_t lo = dis(gen);
-
-  hi = (hi & 0xFFFFFFFFFFFF0FFFull) | 0x0000000000004000ull;
-  lo = (lo & 0x3FFFFFFFFFFFFFFFull) | 0x8000000000000000ull;
-
-  char buf[37];
-  std::snprintf(buf, sizeof(buf),
-    "%08x-%04x-%04x-%04x-%012" PRIx64,
-    static_cast<unsigned>(hi >> 32),
-    static_cast<unsigned>((hi >> 16) & 0xFFFF),
-    static_cast<unsigned>(hi & 0xFFFF),
-    static_cast<unsigned>((lo >> 48) & 0xFFFF),
-    static_cast<uint64_t>(lo & 0x0000FFFFFFFFFFFFull));
-  return buf;
-}
-
-// Generate a 24-char lowercase hex ID (12 random bytes).
-// Protect routes thumbnailIds with length == 24 to its local DB (thumbnails
-// table) rather than to the msp media server, so this format lets Protect
-// serve thumbnails we insert directly.
-static std::string generate_24hex_id() {
-  static std::random_device rd2;
-  thread_local std::mt19937_64 gen(rd2());
-  std::uniform_int_distribution<uint64_t> dis;
-  uint64_t a = dis(gen);
-  uint64_t b = dis(gen);
-  char buf[25];
-  std::snprintf(buf, sizeof(buf), "%016" PRIx64 "%08" PRIx64,
-                static_cast<uint64_t>(a),
-                static_cast<uint64_t>(b & 0xFFFFFFFFull));
-  return buf;
-}
 
 // Map our internal detection type to the Ubiquiti smartDetect object type.
 static const char* sdo_type(const std::string& det_type) {
@@ -362,7 +299,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
                                 uint64_t           /*ts_ms*/) override {
     // 24-char hex IDs are routed by Protect to its thumbnails DB table
     // (not to msp TCP), letting us insert JPEG data directly.
-    return generate_24hex_id();
+    return util::generate_24hex_id();
   }
 
   bool needs_snapshot() const override { return true; }
@@ -570,7 +507,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     if (it != label_cache_.end()) return it->second;
 
     maybe_reconnect();
-    const std::string label_id = generate_uuid();
+    const std::string label_id = util::generate_uuid();
     const char* params[] = {
       label_id.c_str(), name.c_str(), now_str.c_str()
     };
@@ -615,7 +552,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     }
     arr += '}';
 
-    const std::string dl_id = generate_uuid();
+    const std::string dl_id = util::generate_uuid();
     // Pass empty string for NULL object_id; NULLIF converts it to SQL NULL.
     const char* params[] = {
       dl_id.c_str(), event_id.c_str(), object_id.c_str(),
@@ -631,7 +568,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   std::vector<IDbBackend::EventSummary> query_recent_events(int days) override {
     maybe_reconnect();
     const uint64_t since_ms =
-        now_ms() - static_cast<uint64_t>(days) * 86400000ULL;
+        util::now_ms() - static_cast<uint64_t>(days) * 86400000ULL;
     const std::string since_str = std::to_string(since_ms);
     const char* params[] = { since_str.c_str() };
     PGresult* res = PQexecParams(conn_,
@@ -1094,7 +1031,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           // Case 2: event ended recently — re-open it.
           auto lei = last_event_.find(key);
           if (lei != last_event_.end() && lei->second.real_end_ms > 0) {
-            const uint64_t cur = now_ms();
+            const uint64_t cur = util::now_ms();
             if (cur >= lei->second.real_end_ms &&
                 cur - lei->second.real_end_ms <= coalesce_window_ms_) {
               coalesced_event_id = lei->second.event_id;
@@ -1108,7 +1045,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       // Rate limiting: only for new events, not coalesced detections.
       if (coalesced_event_id.empty() && max_events_per_hour_ > 0) {
         auto& times = recent_event_times_[ev.camera_ip];
-        const uint64_t cutoff = now_ms() - 3600000;
+        const uint64_t cutoff = util::now_ms() - 3600000;
         while (!times.empty() && times.front() < cutoff) times.pop_front();
         if (times.size() >= static_cast<std::size_t>(max_events_per_hour_)) {
           LOG(WARNING) << '[' << ev.camera_ip << "] rate limit ("
@@ -1135,13 +1072,13 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     }
 
     // 2. Compute timestamps and IDs (no lock -- needs ip_to_mac_ which is read-only).
-    const uint64_t    ts_ms      = now_ms() - pre_ms;  // padded start
-    const std::string now_str    = utc_now_iso8601();
+    const uint64_t    ts_ms      = util::now_ms() - pre_ms;  // padded start
+    const std::string now_str    = util::utc_now_iso8601();
     // Use the existing event ID when coalescing; generate a fresh one otherwise.
-    const std::string event_id   = coalesced_event_id.empty() ? generate_uuid()
+    const std::string event_id   = coalesced_event_id.empty() ? util::generate_uuid()
                                                               : coalesced_event_id;
-    const std::string sdo_id     = generate_uuid();
-    const std::string sdr_id     = generate_uuid();
+    const std::string sdo_id     = util::generate_uuid();
+    const std::string sdr_id     = util::generate_uuid();
     const std::string thumb_id   = db_->make_thumbnail_id(ev.camera_ip, ts_ms);
     std::string sdt_json   = smart_detect_types_json(det->type);
     std::string obj_type   = sdo_type(det->type);
@@ -1198,7 +1135,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         db_->insert_event(event_id, ts_ms, ev.camera_ip, sdt_json, thumb_id, now_str);
         open_[key] = event_id;
         if (max_events_per_hour_ > 0)
-          recent_event_times_[ev.camera_ip].push_back(now_ms());
+          recent_event_times_[ev.camera_ip].push_back(util::now_ms());
       }
 
       // Always insert SDO + smartDetectRaw for every detection occurrence,
@@ -1274,9 +1211,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     auto it = open_.find(key);
     if (it == open_.end()) return;
 
-    const uint64_t    wall_now = now_ms();
+    const uint64_t    wall_now = util::now_ms();
     const uint64_t    end_ms   = wall_now + post_buffer_ms_;  // padded end
-    const std::string now_str  = utc_now_iso8601();
+    const std::string now_str  = util::utc_now_iso8601();
     const std::string ended_id = it->second;
 
     db_->update_event_end(ended_id, end_ms, now_str);
@@ -1322,7 +1259,7 @@ int DetectionRecorder::coalesce_history(int days) {
           (c.start_ms - b.end_ms <= coalesce_ms);
       if (within) {
         const uint64_t    new_end  = std::max(b.end_ms, c.end_ms);
-        const std::string now_str  = utc_now_iso8601();
+        const std::string now_str  = util::utc_now_iso8601();
         db_->coalesce_events(b.id, new_end, c.id, now_str);
         events[base].end_ms = new_end;
         ++merged;

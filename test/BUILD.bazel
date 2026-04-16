@@ -192,6 +192,57 @@ cc_test(
     ],
 )
 
+cc_library(
+    name = "protect_ui_patch_internal",
+    textual_hdrs = [
+        "//:src/protect_ui_patch.cpp",
+    ],
+    hdrs = ["//:src/protect_ui_patch.hpp"],
+    deps = [
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:status",
+    ],
+)
+
+cc_test(
+    name = "test_protect_ui_patch",
+    srcs = ["test_protect_ui_patch.cpp"],
+    deps = [
+        ":protect_ui_patch_internal",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:status",
+    ],
+)
+
+cc_test(
+    name = "test_camera_change_log",
+    srcs = ["test_camera_change_log.cpp"],
+    deps = [
+        "//:camera_change_log",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_test(
+    name = "test_unifi_camera_config",
+    srcs = ["test_unifi_camera_config.cpp"],
+    deps = [
+        "//:unifi_camera_config",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_test(
+    name = "test_motion_poller",
+    srcs = ["test_motion_poller.cpp"],
+    linkstatic = True,
+    deps = [
+        "//:motion_poller",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
 filegroup(
     name = "bench_onvif_raw_log",
     srcs = ["testdata/bench_onvif.jsonl"],

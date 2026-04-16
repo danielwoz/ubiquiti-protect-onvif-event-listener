@@ -24,6 +24,19 @@
 
 namespace onvif {
 
+/// Read the cached Protect API user ID from the config file, or discover it
+/// from the unifi-core PostgreSQL database and save it.
+///
+/// The cached value is stored at `/root/.config/onvif-recorder-api-key` (one
+/// user_id string per line).  When absent, discover_protect_user_id() connects
+/// to `host=/run/postgresql port=5432 dbname=unifi-core user=postgres` and
+/// reads `SELECT user_id FROM user_settings LIMIT 1`, then writes the result
+/// to the cache file for subsequent runs.
+///
+/// Returns the empty string on failure (no cache file, DB unreachable, or no
+/// rows in user_settings).
+std::string discover_protect_user_id();
+
 /**
  * AlarmNotifier
  *

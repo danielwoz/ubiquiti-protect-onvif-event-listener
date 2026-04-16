@@ -16,6 +16,8 @@
 
 #include <stddef.h>  // size_t for jpeglib
 #include <stdio.h>   // FILE for jpeglib
+#include <sys/stat.h>
+#include <curl/curl.h>
 #include <jpeglib.h>
 
 #ifdef WITH_NCNN
@@ -23,12 +25,15 @@
 #endif  // WITH_NCNN
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "jpeg_crop.hpp"
@@ -360,6 +365,73 @@ std::optional<Detection> ObjectDetector::detect(
   if (bb.w <= 0.0f || bb.h <= 0.0f) return std::nullopt;
   return Detection{bb, best->cls};
 #endif  // WITH_NCNN
+}
+
+// ---------------------------------------------------------------------------
+// NanoDet-M model auto-download
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// NOLINTNEXTLINE(whitespace/line_length)
+constexpr const char kModelUrlBase[] = "https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/";
+
+size_t file_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+  auto* f = static_cast<std::FILE*>(userdata);
+  return std::fwrite(ptr, size, nmemb, f);
+}
+
+bool download_file(const std::string& url, const std::string& path) {
+  std::FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) return false;
+
+  CURL* curl = curl_easy_init();
+  if (!curl) {
+    std::fclose(f);
+    return false;
+  }
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, file_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);  // NOLINT(runtime/int)
+  CURLcode rc = curl_easy_perform(curl);
+  long http_code = 0;  // NOLINT(runtime/int)
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  curl_easy_cleanup(curl);
+  std::fclose(f);
+
+  if (rc != CURLE_OK || http_code != 200) {
+    std::remove(path.c_str());
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+bool ObjectDetector::EnsureModels(const std::string& model_dir) {
+  (void)mkdir(model_dir.c_str(), 0755);
+  const std::string param = model_dir + "/nanodet_m.param";
+  const std::string bin   = model_dir + "/nanodet_m.bin";
+
+  const bool need_param = !std::ifstream(param).good();
+  const bool need_bin   = !std::ifstream(bin).good();
+  if (!need_param && !need_bin) return true;
+
+  LOG(INFO) << "[detect] downloading NanoDet-M models to " << model_dir;
+  if (need_param &&
+      !download_file(std::string(kModelUrlBase) + "nanodet_m.param", param)) {
+    LOG(ERROR) << "[detect] failed to download nanodet_m.param";
+    return false;
+  }
+  if (need_bin &&
+      !download_file(std::string(kModelUrlBase) + "nanodet_m.bin", bin)) {
+    LOG(ERROR) << "[detect] failed to download nanodet_m.bin";
+    return false;
+  }
+  LOG(INFO) << "[detect] model download complete";
+  return true;
 }
 
 }  // namespace object_detect

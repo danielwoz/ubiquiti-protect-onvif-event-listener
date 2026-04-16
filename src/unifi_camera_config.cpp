@@ -30,10 +30,12 @@
 namespace unifi {
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers (exposed via namespace unifi::internal for testing)
 // ---------------------------------------------------------------------------
 
-static std::string build_connstr(const DbConfig& db) {
+namespace internal {
+
+std::string build_connstr(const DbConfig& db) {
   std::string s =
     "host="    + db.host +
     " port="   + std::to_string(db.port) +
@@ -44,11 +46,13 @@ static std::string build_connstr(const DbConfig& db) {
   return s;
 }
 
+}  // namespace internal
+
 // RAII wrapper for PGconn to avoid repetitive cleanup code.
 struct PgConn {
   PGconn* conn{nullptr};
   explicit PgConn(const DbConfig& db) {
-    conn = PQconnectdb(build_connstr(db).c_str());
+    conn = PQconnectdb(internal::build_connstr(db).c_str());
   }
   ~PgConn() { if (conn) PQfinish(conn); }
   PgConn(const PgConn&)            = delete;
@@ -56,6 +60,8 @@ struct PgConn {
   bool ok() const { return PQstatus(conn) == CONNECTION_OK; }
   std::string error() const { return PQerrorMessage(conn); }
 };
+
+namespace internal {
 
 // ---------------------------------------------------------------------------
 // Minimal flat-JSON string-value extractor.
@@ -65,7 +71,7 @@ struct PgConn {
 // values.  Returns an empty string when the key is absent or its value is
 // null.
 // ---------------------------------------------------------------------------
-static std::string json_get(const std::string& json, const std::string& key) {
+std::string json_get(const std::string& json, const std::string& key) {
   std::string needle = "\"" + key + "\":";
   auto pos = json.find(needle);
   if (pos == std::string::npos) return {};
@@ -112,7 +118,7 @@ static std::string json_get(const std::string& json, const std::string& key) {
 // Build a PostgreSQL array literal from a vector of strings:
 //   {"id1","id2","id3"}
 // ---------------------------------------------------------------------------
-static std::string pg_array(const std::vector<std::string>& ids) {
+std::string pg_array(const std::vector<std::string>& ids) {
   std::string out = "{";
   for (size_t i = 0; i < ids.size(); ++i) {
     if (i > 0) out += ',';
@@ -121,6 +127,8 @@ static std::string pg_array(const std::vector<std::string>& ids) {
   out += '}';
   return out;
 }
+
+}  // namespace internal
 
 // ---------------------------------------------------------------------------
 // load_cameras (third-party)
@@ -156,10 +164,10 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     if (!id_c || !host_c || !info_c || PQgetisnull(res, i, 2)) continue;
 
     std::string info(info_c);
-    std::string username     = json_get(info, "username");
-    std::string password     = json_get(info, "password");
-    std::string snapshot_url = json_get(info, "snapshotUrl");
-    std::string port         = json_get(info, "port");
+    std::string username     = internal::json_get(info, "username");
+    std::string password     = internal::json_get(info, "password");
+    std::string snapshot_url = internal::json_get(info, "snapshotUrl");
+    std::string port         = internal::json_get(info, "port");
     if (username.empty() || password.empty()) continue;
 
     std::string ip = host_c;
@@ -203,7 +211,7 @@ absl::StatusOr<std::vector<FirstPartyCamera>> load_first_party_cameras(
     return absl::InternalError(
         "unifi::load_first_party_cameras: " + pg.error());
 
-  std::string arr = pg_array(camera_ids);
+  std::string arr = internal::pg_array(camera_ids);
   const char* sql =
     "SELECT id, name, mac "
     "FROM cameras "
@@ -499,7 +507,7 @@ static absl::Status ensure_zones_impl(
   }
 
   // Batch update (no-log path): single UPDATE for all provided camera IDs.
-  std::string arr = pg_array(ids);
+  std::string arr = internal::pg_array(ids);
   const char* sql =
     "UPDATE cameras "
     "SET \"smartDetectZones\" = $1::json, "

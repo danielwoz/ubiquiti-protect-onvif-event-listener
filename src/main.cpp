@@ -22,21 +22,11 @@
  *   - polls motion events from first-party cameras and runs NanoDet-M detection
  */
 
-#include <curl/curl.h>
-#include <libpq-fe.h>
 #include <sys/stat.h>
 
 #include <csignal>
-
-#include <chrono>
-#include <cstdio>
-#include <ctime>
-#include <fstream>
-#include <iomanip>
 #include <map>
 #include <memory>
-#include <mutex>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -51,11 +41,13 @@
 #include "alarm_notifier.hpp"
 #include "camera_change_log.hpp"
 #include "detection_recorder.hpp"
+#include "event_recorder.hpp"
 #include "motion_poller.hpp"
 #include "object_detect.hpp"
 #include "onvif_listener.hpp"
 #include "protect_ui_patch.hpp"
 #include "unifi_camera_config.hpp"
+#include "util.hpp"
 
 // ============================================================
 // Command-line flags
@@ -153,103 +145,6 @@ ABSL_FLAG(bool, patch_alarm_picker, true,
     "is backed up to swai.js.bak before each patch.");
 
 // ============================================================
-// JSON helpers (used only by EventRecorder)
-// ============================================================
-static std::string utc_now_iso8601_ms() {
-  auto now = std::chrono::system_clock::now();
-  std::time_t t = std::chrono::system_clock::to_time_t(now);
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now.time_since_epoch()) % 1000;
-  std::tm tm{};
-  gmtime_r(&t, &tm);
-  char buf[32];
-  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
-  std::ostringstream oss;
-  oss << buf << '.' << std::setfill('0') << std::setw(3) << ms.count() << 'Z';
-  return oss.str();
-}
-
-static std::string json_str(const std::string& s) {
-  std::string out;
-  out.reserve(s.size() + 4);
-  out += '"';
-  for (unsigned char c : s) {
-    if (c == '"') {
-      out += "\\\"";
-    } else if (c == '\\') {
-      out += "\\\\";
-    } else if (c == '\n') {
-      out += "\\n";
-    } else if (c == '\r') {
-      out += "\\r";
-    } else if (c == '\t') {
-      out += "\\t";
-    } else if (c < 0x20) {
-      char buf[8];
-      std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-      out += buf;
-    } else {
-      out += static_cast<char>(c);
-    }
-  }
-  out += '"';
-  return out;
-}
-
-static std::string json_obj(const std::map<std::string, std::string>& m) {
-  std::string out = "{";
-  bool first = true;
-  for (auto& [k, v] : m) {
-    if (!first) out += ',';
-    out += json_str(k) + ':' + json_str(v);
-    first = false;
-  }
-  out += '}';
-  return out;
-}
-
-// ============================================================
-// Thread-safe JSON Lines recorder
-// ============================================================
-class EventRecorder {
- public:
-  static absl::StatusOr<std::unique_ptr<EventRecorder>> Create(
-      const std::string& path) {
-    auto r = std::unique_ptr<EventRecorder>(new EventRecorder(path));
-    if (!r->file_.is_open())
-      return absl::InternalError("Cannot open: " + path);
-    LOG(INFO) << "[recorder] event log -> " << path;
-    return r;
-  }
-
-  void write(const onvif::OnvifEvent& ev) {
-    std::string line;
-    line += '{';
-    line += json_str("recorded_at") + ':' + json_str(utc_now_iso8601_ms()) + ',';
-    line += json_str("camera_ip")   + ':' + json_str(ev.camera_ip)   + ',';
-    line += json_str("camera_user") + ':' + json_str(ev.camera_user) + ',';
-    line += json_str("event_time")  + ':' + json_str(ev.event_time)  + ',';
-    line += json_str("topic")       + ':' + json_str(ev.topic)       + ',';
-    line += json_str("property_op") + ':' + json_str(ev.property_op) + ',';
-    line += json_str("source")      + ':' + json_obj(ev.source)      + ',';
-    line += json_str("data")        + ':' + json_obj(ev.data);
-    line += "}\n";
-
-    std::lock_guard<std::mutex> lk(mu_);
-    file_ << line;
-    file_.flush();
-  }
-
- private:
-  explicit EventRecorder(const std::string& path) {
-    file_.open(path, std::ios::app);
-  }
-
-  std::ofstream file_;
-  std::mutex    mu_;
-};
-
-// ============================================================
 // Signal handling
 // ============================================================
 static onvif::OnvifListener* g_listener = nullptr;
@@ -277,138 +172,6 @@ static std::vector<std::string> parse_csv(const std::string& s) {
     pos = comma + 1;
   }
   return result;
-}
-
-// ============================================================
-// Auto-discover the Protect API user ID
-// ============================================================
-static const char kApiKeyPath[] = "/root/.config/onvif-recorder-api-key";
-
-// Download a file from a URL to a local path.  Returns true on success.
-static size_t file_write_cb(char* ptr, size_t size, size_t nmemb,
-                            void* userdata) {
-  auto* f = static_cast<std::FILE*>(userdata);
-  return std::fwrite(ptr, size, nmemb, f);
-}
-
-static bool download_file(const std::string& url,
-                          const std::string& path) {
-  std::FILE* f = std::fopen(path.c_str(), "wb");
-  if (!f) return false;
-
-  CURL* curl = curl_easy_init();
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, file_write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
-  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);  // NOLINT(runtime/int)
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);  // NOLINT(runtime/int)
-  CURLcode rc = curl_easy_perform(curl);
-  long http_code = 0;  // NOLINT(runtime/int)
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-  curl_easy_cleanup(curl);
-  std::fclose(f);
-
-  if (rc != CURLE_OK || http_code != 200) {
-    std::remove(path.c_str());
-    return false;
-  }
-  return true;
-}
-
-static const char* const kParamUrl =
-    "https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/"
-    "nanodet_m.param";
-static const char* const kBinUrl =
-    "https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/"
-    "nanodet_m.bin";
-
-// Ensure NanoDet-M model files exist in model_dir, downloading if needed.
-// Creates the directory if it does not exist.  Returns true if both files
-// are present after the call.
-static bool ensure_models(const std::string& model_dir) {
-  (void)mkdir(model_dir.c_str(), 0755);
-  std::string param = model_dir + "/nanodet_m.param";
-  std::string bin   = model_dir + "/nanodet_m.bin";
-
-  bool need_param = !std::ifstream(param).good();
-  bool need_bin   = !std::ifstream(bin).good();
-  if (!need_param && !need_bin) return true;
-
-  LOG(INFO) << "[detect] downloading NanoDet-M models to " << model_dir;
-  if (need_param) {
-    if (!download_file(kParamUrl, param)) {
-      LOG(ERROR) << "[detect] failed to download nanodet_m.param";
-      return false;
-    }
-  }
-  if (need_bin) {
-    if (!download_file(kBinUrl, bin)) {
-      LOG(ERROR) << "[detect] failed to download nanodet_m.bin";
-      return false;
-    }
-  }
-  LOG(INFO) << "[detect] model download complete";
-  return true;
-}
-
-// Read the cached user ID from the config file, or discover it from the
-// unifi-core database and save it.  Returns empty string on failure.
-static std::string discover_protect_user_id() {
-  // 1. Try reading cached value.
-  {
-    std::ifstream f(kApiKeyPath);
-    std::string line;
-    if (f.is_open() && std::getline(f, line) && line.size() >= 32) {
-      // Trim whitespace.
-      while (!line.empty() && (line.back() == '\n' || line.back() == '\r' ||
-                               line.back() == ' '))
-        line.pop_back();
-      if (!line.empty()) {
-        LOG(INFO) << "[alarm] loaded user ID from " << kApiKeyPath;
-        return line;
-      }
-    }
-  }
-
-  // 2. Query unifi-core DB (port 5432) for the owner's user ID.
-  PGconn* conn = PQconnectdb(
-      "host=/run/postgresql port=5432 dbname=unifi-core user=postgres");
-  if (PQstatus(conn) != CONNECTION_OK) {
-    LOG(ERROR) << "[alarm] cannot discover user ID: unifi-core DB: "
-               << PQerrorMessage(conn);
-    PQfinish(conn);
-    return {};
-  }
-
-  PGresult* res = PQexec(conn,
-      "SELECT user_id FROM user_settings LIMIT 1");
-  std::string user_id;
-  if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-    user_id = PQgetvalue(res, 0, 0);
-    // Trim.
-    while (!user_id.empty() && user_id.back() == ' ') user_id.pop_back();
-  }
-  PQclear(res);
-  PQfinish(conn);
-
-  if (user_id.empty()) {
-    LOG(ERROR) << "[alarm] no user_id found in unifi-core user_settings";
-    return {};
-  }
-
-  // 3. Cache to disk for future runs.
-  {
-    // Ensure parent directory exists.
-    (void)mkdir("/root/.config", 0755);
-    std::ofstream f(kApiKeyPath);
-    if (f.is_open()) {
-      f << user_id << '\n';
-      LOG(INFO) << "[alarm] saved user ID to " << kApiKeyPath;
-    } else {
-      LOG(ERROR) << "[alarm] could not write " << kApiKeyPath;
-    }
-  }
-  return user_id;
 }
 
 // ============================================================
@@ -524,10 +287,10 @@ int main(int argc, char* argv[]) {
   }
 
   // EventRecorder (optional)
-  std::unique_ptr<EventRecorder> event_rec_storage;
-  EventRecorder* event_rec = nullptr;
+  std::unique_ptr<onvif::EventRecorder> event_rec_storage;
+  onvif::EventRecorder* event_rec = nullptr;
   if (!event_log.empty()) {
-    auto er_or = EventRecorder::Create(event_log);
+    auto er_or = onvif::EventRecorder::Create(event_log);
     if (!er_or.ok()) {
       LOG(ERROR) << "Fatal: " << er_or.status().message();
       onvif::global_cleanup();
@@ -573,7 +336,7 @@ int main(int argc, char* argv[]) {
   const bool        detect          = absl::GetFlag(FLAGS_detect);
   const bool        detect_override = absl::GetFlag(FLAGS_detect_override);
   if ((detect || detect_override) && !model_dir.empty()) {
-    if (!ensure_models(model_dir)) {
+    if (!object_detect::ObjectDetector::EnsureModels(model_dir)) {
       LOG(WARNING) << "[detect] model files missing and download failed";
     }
     auto det = object_detect::ObjectDetector::Load(
@@ -710,7 +473,7 @@ int main(int argc, char* argv[]) {
   // Auto-discover user ID if not explicitly set via flag.
   std::string protect_user_id = absl::GetFlag(FLAGS_protect_user_id);
   if (protect_user_id.empty())
-    protect_user_id = discover_protect_user_id();
+    protect_user_id = onvif::discover_protect_user_id();
 
   std::unique_ptr<onvif::AlarmNotifier> alarm_notifier;
   if (!protect_user_id.empty()) {

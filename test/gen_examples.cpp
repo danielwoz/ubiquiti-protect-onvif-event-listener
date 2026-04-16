@@ -42,8 +42,8 @@
 
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
-#include "../jpeg_crop.hpp"
-#include "../object_detect.hpp"
+#include "jpeg_crop.hpp"
+#include "object_detect.hpp"
 
 ABSL_FLAG(std::string, model_dir, "",
     "Directory containing nanodet_m.param and nanodet_m.bin; "

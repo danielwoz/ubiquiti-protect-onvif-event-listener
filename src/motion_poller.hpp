@@ -28,6 +28,20 @@ namespace object_detect { class ObjectDetector; }
 
 namespace onvif {
 
+namespace motion_poller_internal {
+
+/// Map a detection class label ("person", "vehicle", "animal", "package",
+/// other) to the JSON array written into events.smartDetectTypes.
+/// Anything not in the explicit set falls back to ["person"].  Exposed for
+/// testing.
+std::string smart_detect_types_json(const std::string& det_type);
+
+/// Build the smartDetectRaws.payload JSON for a single detection at
+/// @p ts_ms with object class @p obj_type.  Exposed for testing.
+std::string build_sdr_payload(uint64_t ts_ms, const std::string& obj_type);
+
+}  // namespace motion_poller_internal
+
 class AlarmNotifier;
 
 /// Polls the UniFi Protect `events` table for `motion` events from first-party
