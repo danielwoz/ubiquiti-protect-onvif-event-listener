@@ -43,4 +43,16 @@ absl::Status patch_alarm_picker();
 /// Returns OK with the number of files restored.
 absl::Status revert_alarm_picker();
 
+/// Inject an nginx `location /onvif/events/log` block into the UniFi OS
+/// site-local-ip.conf (HTTPS server) that proxies authenticated requests
+/// to the in-process log server on localhost:@p port.
+///
+/// The block is bracketed by marker comments so it can be cleanly removed.
+/// Reloads nginx after a successful patch.
+/// No-op if the block is already present.
+absl::Status patch_nginx_log_proxy(uint16_t port);
+
+/// Remove the injected nginx location block and reload nginx.
+absl::Status revert_nginx_log_proxy();
+
 }  // namespace protect_ui

@@ -244,6 +244,7 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--coalesce_history` | `true` | On startup, scan the last `--coalesce_history_days` days of events and merge consecutive detections from the same third-party camera within `--coalesce_window_sec`. Only third-party (ONVIF) cameras are affected. |
 | `--coalesce_history_days` | `30` | Number of days to look back when `--coalesce_history` is set. |
 | `--first_party_cameras` | _(empty)_ | Comma-separated camera IDs of first-party cameras to enable smart detection flags for in the cameras table. |
+| `--first_party_camera_models` | _(empty)_ | Comma-separated model substrings to match first-party cameras (e.g. `G3 Instant,G4 Bullet`). Case-insensitive. Merged with `--first_party_cameras`. |
 | `--poll_interval_sec` | `10` | Seconds between motion-event poll cycles for first-party cameras. |
 | `--change_log` | _(empty)_ | Path for cameras-table change log (JSON Lines). Records old/new values for rollback. |
 | `--rollback` | _(empty)_ | Undo cameras-table changes and exit. Values: `third_party`, `first_party`, `all`. |

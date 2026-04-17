@@ -98,6 +98,10 @@ std::string generate_24hex_id() {
   return std::string(buf, 24);
 }
 
+std::string make_msr_thumbnail_id(const std::string& mac, uint64_t ts_ms) {
+  return mac + "-" + std::to_string(ts_ms);
+}
+
 std::string json_str(const std::string& s) {
   std::string out;
   out.reserve(s.size() + 4);

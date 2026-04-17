@@ -38,6 +38,11 @@ std::string generate_uuid();
 // table) rather than to the msp media server.
 std::string generate_24hex_id();
 
+// Generate an MSR-format thumbnail ID: "{MAC}-{timestamp_ms}".
+// These IDs (length != 24) are routed by Protect to the msp media server
+// which looks them up in UBV files on disk.
+std::string make_msr_thumbnail_id(const std::string& mac, uint64_t ts_ms);
+
 // JSON-escape a string and wrap it in double quotes.
 // Handles \", \\, \n, \r, \t, and control chars < 0x20.
 std::string json_str(const std::string& s);

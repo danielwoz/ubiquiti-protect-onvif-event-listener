@@ -23,10 +23,15 @@
  */
 
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
 
+#include <cstdio>
 #include <csignal>
+#include <fstream>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -38,10 +43,13 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/log/log_sink_registry.h"
 #include "alarm_notifier.hpp"
 #include "camera_change_log.hpp"
 #include "detection_recorder.hpp"
 #include "event_recorder.hpp"
+#include "log_ring.hpp"
+#include "log_server.hpp"
 #include "motion_poller.hpp"
 #include "object_detect.hpp"
 #include "onvif_listener.hpp"
@@ -135,6 +143,11 @@ ABSL_FLAG(std::string, first_party_cameras, "",
     "Comma-separated camera IDs of first-party cameras to enable smart "
     "detection flags for in the cameras table. Enables the Protect UI "
     "smart detection panel for those cameras.");
+ABSL_FLAG(std::string, first_party_camera_models, "",
+    "Comma-separated model substrings to match first-party cameras. "
+    "For example, 'G3 Instant,G4 Bullet' matches cameras whose type "
+    "contains either substring (case-insensitive). Matched cameras are "
+    "merged with any explicit --first_party_cameras IDs.");
 ABSL_FLAG(int32_t, poll_interval_sec, 10,
     "Seconds between motion-event poll cycles for first-party cameras. "
     "Only active when first-party cameras are discovered.");
@@ -143,6 +156,9 @@ ABSL_FLAG(bool, patch_alarm_picker, true,
     "in the alarm creation picker. The patch is idempotent and re-applied "
     "on every startup so it survives firmware updates. The original file "
     "is backed up to swai.js.bak before each patch.");
+ABSL_FLAG(uint16_t, log_port, 7890,
+    "TCP port for the in-memory log viewer (loopback only). "
+    "Served via nginx at /onvif/events/log with Protect auth.");
 
 // ============================================================
 // Signal handling
@@ -175,18 +191,94 @@ static std::vector<std::string> parse_csv(const std::string& s) {
 }
 
 // ============================================================
+// System information (logged at startup into the ring buffer)
+// ============================================================
+
+// Read the installed version of a dpkg package.  Returns empty on failure.
+static std::string dpkg_version(const char* pkg) {
+  std::string cmd = "dpkg-query -W -f '${Version}' ";
+  cmd += pkg;
+  cmd += " 2>/dev/null";
+  std::FILE* p = popen(cmd.c_str(), "r");  // NOLINT(runtime/int)
+  if (!p) return {};
+  char buf[128] = {};
+  char* ok = std::fgets(buf, sizeof(buf), p);
+  pclose(p);  // NOLINT(runtime/int)
+  if (!ok) return {};
+  // Strip trailing whitespace / newline.
+  std::string v(buf);
+  while (!v.empty() && (v.back() == '\n' || v.back() == ' '))
+    v.pop_back();
+  return v;
+}
+
+// Read a single-line /proc or /sys file.  Returns empty on failure.
+static std::string read_proc_line(const char* path) {
+  std::ifstream f(path);
+  if (!f) return {};
+  std::string line;
+  std::getline(f, line);
+  // Trim trailing NULs (common in device-tree files).
+  while (!line.empty() && line.back() == '\0') line.pop_back();
+  return line;
+}
+
+static void log_system_info() {
+  // Kernel and architecture.
+  struct utsname u{};
+  if (uname(&u) == 0) {
+    LOG(INFO) << "Kernel      : " << u.release
+              << " (" << u.machine << ")";
+  }
+
+  // CPU cores.
+  struct sysinfo si{};
+  if (sysinfo(&si) == 0) {
+    long pages = sysconf(_SC_PHYS_PAGES);  // NOLINT(runtime/int)
+    long psize = sysconf(_SC_PAGE_SIZE);   // NOLINT(runtime/int)
+    uint64_t ram_mb = 0;
+    if (pages > 0 && psize > 0)
+      ram_mb = static_cast<uint64_t>(pages) *
+               static_cast<uint64_t>(psize) / (1024 * 1024);
+    LOG(INFO) << "Hardware    : " << get_nprocs() << " CPU cores, "
+              << ram_mb << " MiB RAM";
+  }
+
+  // SoC model from device-tree (e.g. "Annapurna Labs Alpine V2 UBNT").
+  std::string soc =
+      read_proc_line("/sys/firmware/devicetree/base/model");
+  if (!soc.empty())
+    LOG(INFO) << "SoC         : " << soc;
+
+  // Key Ubiquiti package versions.
+  static const char* kPackages[] = {
+      "unifi-core", "unifi-protect", "uos",
+      "unifi-native", nullptr};
+  for (const char** p = kPackages; *p; ++p) {
+    std::string ver = dpkg_version(*p);
+    if (!ver.empty())
+      LOG(INFO) << "Package     : " << *p << " " << ver;
+  }
+}
+
+// ============================================================
 // Entry point
 // ============================================================
 int main(int argc, char* argv[]) {
   absl::ParseCommandLine(argc, argv);
   absl::InitializeLog();
 
+  // Always capture INFO+ messages for the in-memory ring buffer.
+  // The stderr threshold controls what the user sees in the terminal.
+  absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfo);
+
+  static onvif::LogRing log_ring;
+  absl::AddLogSink(&log_ring);
+
   const bool verbose = absl::GetFlag(FLAGS_verbose);
   if (verbose) {
-    absl::SetMinLogLevel(absl::LogSeverityAtLeast::kInfo);
     absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
   } else {
-    absl::SetMinLogLevel(absl::LogSeverityAtLeast::kError);
     absl::SetStderrThreshold(absl::LogSeverityAtLeast::kError);
   }
 
@@ -207,12 +299,15 @@ int main(int argc, char* argv[]) {
   const std::string change_log  = absl::GetFlag(FLAGS_change_log);
   const std::string rollback    = absl::GetFlag(FLAGS_rollback);
   const std::string fp_cam_str  = absl::GetFlag(FLAGS_first_party_cameras);
+  const std::string fp_model_str =
+      absl::GetFlag(FLAGS_first_party_camera_models);
   const uint32_t pre_buf_sec    =
       static_cast<uint32_t>(absl::GetFlag(FLAGS_pre_buffer_sec));
   const uint32_t post_buf_sec   =
       static_cast<uint32_t>(absl::GetFlag(FLAGS_post_buffer_sec));
 
   LOG(INFO) << "ONVIF Event Recorder starting";
+  log_system_info();
   LOG(INFO) << "DB conn     : " << db_conn;
   LOG(INFO) << "DB host     : " << (db_host.empty() ? "(default)" : db_host);
   LOG(INFO) << "Pre-buffer  : " << pre_buf_sec << " s";
@@ -257,6 +352,11 @@ int main(int argc, char* argv[]) {
     if (!ui_s.ok())
       LOG(WARNING) << "[rollback] " << ui_s.message();
 
+    // Revert nginx log proxy block.
+    auto ng_s = protect_ui::revert_nginx_log_proxy();
+    if (!ng_s.ok())
+      LOG(WARNING) << "[rollback] " << ng_s.message();
+
     return 0;
   }
 
@@ -270,6 +370,18 @@ int main(int argc, char* argv[]) {
     } else {
       LOG(WARNING) << "[ui_patch] " << s.message();
     }
+  }
+
+  // Start the in-memory log viewer (loopback HTTP, proxied by nginx).
+  onvif::LogServer log_server;
+  const uint16_t log_port = absl::GetFlag(FLAGS_log_port);
+  if (log_server.start(&log_ring, log_port)) {
+    LOG(INFO) << "[log_server] listening on 127.0.0.1:" << log_port;
+    auto ng = protect_ui::patch_nginx_log_proxy(log_port);
+    if (!ng.ok())
+      LOG(WARNING) << "[log_server] nginx patch: " << ng.message();
+  } else {
+    LOG(WARNING) << "[log_server] failed to start on port " << log_port;
   }
 
   // Open the change log if configured.
@@ -365,6 +477,20 @@ int main(int argc, char* argv[]) {
   if (!thumbs_dir.empty())
     det_rec.set_ubv_dir(thumbs_dir);
 
+  // Detect native thumbnail ID format (MSR "{MAC}-{ts}" vs 24-char hex).
+  bool use_msr_thumb_ids = false;
+  {
+    auto msr_or = unifi::detect_native_msr_thumbnail_format(cam_db);
+    if (msr_or.ok()) {
+      use_msr_thumb_ids = *msr_or;
+    } else {
+      LOG(WARNING) << "Could not detect native thumbnail format: "
+                   << msr_or.status().message()
+                   << "; defaulting to 24-char DB IDs";
+    }
+    det_rec.set_use_msr_thumbnail_ids(use_msr_thumb_ids);
+  }
+
   // ----------------------------------------------------------------
   // Load third-party cameras from the UniFi Protect database.
   // ----------------------------------------------------------------
@@ -404,14 +530,59 @@ int main(int argc, char* argv[]) {
   }
 
   // ----------------------------------------------------------------
-  // First-party camera flag modification (opt-in via --first_party_cameras).
+  // First-party camera flag modification
+  //   (opt-in via --first_party_cameras and/or --first_party_camera_models).
   // ----------------------------------------------------------------
-  if (!fp_camera_ids.empty()) {
-    auto fp_or = unifi::load_first_party_cameras(fp_camera_ids, cam_db);
-    if (!fp_or.ok()) {
-      LOG(ERROR) << "Warning: " << fp_or.status().message();
-    } else {
-      auto& fp_cams = *fp_or;
+  {
+    // Collect cameras from explicit IDs.
+    std::vector<unifi::FirstPartyCamera> fp_cams;
+    if (!fp_camera_ids.empty()) {
+      auto fp_or = unifi::load_first_party_cameras(fp_camera_ids, cam_db);
+      if (!fp_or.ok()) {
+        LOG(ERROR) << "Warning: " << fp_or.status().message();
+      } else {
+        fp_cams = std::move(*fp_or);
+
+        // Warn about any IDs that were not found in the DB.
+        std::set<std::string> found;
+        for (const auto& c : fp_cams) found.insert(c.id);
+        for (const auto& id : fp_camera_ids) {
+          if (found.find(id) == found.end()) {
+            LOG(ERROR) << "[first_party] camera ID " << id
+                       << " from --first_party_cameras was NOT found in the "
+                       << "cameras table (not adopted or does not exist)";
+          }
+        }
+      }
+    }
+
+    // Collect cameras from model substring matches.
+    const auto fp_model_subs = parse_csv(fp_model_str);
+    if (!fp_model_subs.empty()) {
+      auto fp_model_or =
+          unifi::load_first_party_cameras_by_model(fp_model_subs, cam_db);
+      if (!fp_model_or.ok()) {
+        LOG(ERROR) << "Warning: " << fp_model_or.status().message();
+      } else {
+        const auto& model_cams = *fp_model_or;
+        LOG(INFO) << "[first_party] --first_party_camera_models matched "
+                  << model_cams.size() << " camera(s)";
+        for (const auto& c : model_cams)
+          LOG(INFO) << "[first_party]   " << c.id << " (" << c.name << ")";
+
+        // Merge, deduplicating by ID.
+        std::set<std::string> existing;
+        for (const auto& c : fp_cams) existing.insert(c.id);
+        for (const auto& c : model_cams) {
+          if (existing.find(c.id) == existing.end()) {
+            fp_cams.push_back(c);
+            existing.insert(c.id);
+          }
+        }
+      }
+    }
+
+    if (!fp_cams.empty()) {
       LOG(INFO) << "[first_party] " << fp_cams.size()
                 << " camera(s) matched for flag modification";
       for (const auto& c : fp_cams)
@@ -459,6 +630,7 @@ int main(int argc, char* argv[]) {
             absl::GetFlag(FLAGS_poll_interval_sec));
         motion_poller->set_coalesce_window(
             static_cast<uint32_t>(absl::GetFlag(FLAGS_coalesce_window_sec)));
+        motion_poller->set_use_msr_thumbnail_ids(use_msr_thumb_ids);
       } else {
         LOG(ERROR) << "[motion_poller] " << mp_or.status().message();
       }

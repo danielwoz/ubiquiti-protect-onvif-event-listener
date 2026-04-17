@@ -114,6 +114,7 @@ struct MotionPoller::Impl {
   std::string ubv_dir;
   int poll_interval_sec{10};
   uint32_t coalesce_window_sec{30};
+  bool use_msr_thumb_ids{false};
 
   // UBV path cache: MAC -> (date string, file path).
   std::map<std::string, std::pair<std::string, std::string>> ubv_cache;
@@ -184,6 +185,10 @@ void MotionPoller::set_poll_interval(int sec) {
 
 void MotionPoller::set_coalesce_window(uint32_t sec) {
   impl_->coalesce_window_sec = sec;
+}
+
+void MotionPoller::set_use_msr_thumbnail_ids(bool use_msr) {
+  impl_->use_msr_thumb_ids = use_msr;
 }
 
 void MotionPoller::start() {
@@ -278,6 +283,9 @@ void MotionPoller::poll_loop() {
 
     {
       const int nrows = PQntuples(res);
+      if (nrows > 0)
+        LOG(INFO) << "[motion_poller] poll returned " << nrows
+                  << " motion event(s) to process";
       for (int i = 0; i < nrows && running_.load(); ++i) {
         const std::string ev_id      = PQgetvalue(res, i, 0);
         const uint64_t    start_ms   =
@@ -289,8 +297,16 @@ void MotionPoller::poll_loop() {
 
         // Skip if already processed (per-camera hwm check).
         auto hwm_it = impl_->hwm.find(cam_id);
-        if (hwm_it != impl_->hwm.end() && start_ms <= hwm_it->second)
+        if (hwm_it != impl_->hwm.end() && start_ms <= hwm_it->second) {
+          LOG(INFO) << "[motion_poller] skip event " << ev_id
+                    << " (camera " << cam_id
+                    << "): already processed (hwm=" << hwm_it->second << ")";
           continue;
+        }
+
+        LOG(INFO) << "[motion_poller] processing motion event " << ev_id
+                  << " camera=" << cam_id << " thumb=" << thumb_id
+                  << " start=" << start_ms << " end=" << end_ms;
 
         // Fetch the thumbnail JPEG from the thumbnails table.
         impl_->maybe_reconnect();
@@ -302,6 +318,10 @@ void MotionPoller::poll_loop() {
         if (PQresultStatus(thumb_res) != PGRES_TUPLES_OK ||
             PQntuples(thumb_res) == 0 ||
             PQgetisnull(thumb_res, 0, 0)) {
+          LOG(INFO) << "[motion_poller] skip event " << ev_id
+                    << ": thumbnail " << thumb_id << " not found in DB"
+                    << " (query status="
+                    << PQresStatus(PQresultStatus(thumb_res)) << ")";
           PQclear(thumb_res);
           // Update hwm even on skip so we don't retry endlessly.
           impl_->hwm[cam_id] = start_ms;
@@ -314,14 +334,31 @@ void MotionPoller::poll_loop() {
         PQclear(thumb_res);
 
         if (jpeg.empty()) {
+          LOG(INFO) << "[motion_poller] skip event " << ev_id
+                    << ": thumbnail " << thumb_id
+                    << " exists but has zero bytes";
           impl_->hwm[cam_id] = start_ms;
           continue;
         }
 
+        LOG(INFO) << "[motion_poller] event " << ev_id
+                  << ": fetched thumbnail " << thumb_id
+                  << " (" << jpeg.size() << " bytes), running NanoDet-M";
+
         // Run NanoDet-M on the thumbnail.
         auto det = impl_->detector->detect(jpeg);
-        if (!det.has_value() || !object_detect::is_security_relevant(
-                                    det->class_id)) {
+        if (!det.has_value()) {
+          LOG(INFO) << "[motion_poller] skip event " << ev_id
+                    << ": NanoDet-M returned no detection"
+                    << " (no object above confidence threshold)";
+          impl_->hwm[cam_id] = start_ms;
+          continue;
+        }
+        if (!object_detect::is_security_relevant(det->class_id)) {
+          LOG(INFO) << "[motion_poller] skip event " << ev_id
+                    << ": NanoDet-M detected class_id=" << det->class_id
+                    << " which is not security-relevant"
+                    << " (person/vehicle/animal)";
           impl_->hwm[cam_id] = start_ms;
           continue;
         }
@@ -333,7 +370,17 @@ void MotionPoller::poll_loop() {
         const std::string new_event_id = util::generate_uuid();
         const std::string sdo_id       = util::generate_uuid();
         const std::string sdr_id       = util::generate_uuid();
-        const std::string new_thumb_id = util::generate_24hex_id();
+        // Resolve MAC for MSR-format thumbnail IDs and UBV writing.
+        std::string cam_mac;
+        {
+          auto mac_it = impl_->id_to_mac.find(cam_id);
+          if (mac_it != impl_->id_to_mac.end())
+            cam_mac = mac_it->second;
+        }
+        const std::string new_thumb_id =
+            (impl_->use_msr_thumb_ids && !cam_mac.empty())
+                ? util::make_msr_thumbnail_id(cam_mac, start_ms)
+                : util::generate_24hex_id();
         const std::string now_str      = util::utc_now_iso8601();
         const std::string start_str    = std::to_string(start_ms);
         const std::string end_str      = std::to_string(end_ms);
@@ -432,10 +479,9 @@ void MotionPoller::poll_loop() {
         }
 
         // Write UBV thumbnail file (native Protect path).
-        if (!impl_->ubv_dir.empty()) {
-          auto mac_it2 = impl_->id_to_mac.find(cam_id);
-          if (mac_it2 != impl_->id_to_mac.end()) {
-            const std::string& mac = mac_it2->second;
+        if (!impl_->ubv_dir.empty() && !cam_mac.empty()) {
+          {
+            const std::string& mac = cam_mac;
             std::time_t tsec = static_cast<std::time_t>(start_ms / 1000);
             std::tm ttm{};
             gmtime_r(&tsec, &ttm);
@@ -455,12 +501,9 @@ void MotionPoller::poll_loop() {
         }
 
         // Fire alarm notification.
-        if (impl_->alarm_notifier) {
-          auto mac_it = impl_->id_to_mac.find(cam_id);
-          if (mac_it != impl_->id_to_mac.end()) {
-            impl_->alarm_notifier->notify(obj_type, mac_it->second,
-                                          new_event_id, start_ms);
-          }
+        if (impl_->alarm_notifier && !cam_mac.empty()) {
+          impl_->alarm_notifier->notify(obj_type, cam_mac,
+                                        new_event_id, start_ms);
         }
 
         LOG(INFO) << "[motion_poller] " << obj_type << " detected in "

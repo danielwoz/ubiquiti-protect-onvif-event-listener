@@ -85,6 +85,10 @@ class MotionPoller {
   /// near a motion event, the motion event is skipped.  Default: 30.
   void set_coalesce_window(uint32_t sec);
 
+  /// When enabled, thumbnail IDs use the MSR "{MAC}-{timestamp_ms}" format
+  /// matching native Protect.  Must be called before start().
+  void set_use_msr_thumbnail_ids(bool use_msr);
+
   /// Launch the background poll thread.  Non-blocking.
   void start();
 

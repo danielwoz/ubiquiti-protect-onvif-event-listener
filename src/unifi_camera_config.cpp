@@ -16,6 +16,7 @@
 
 #include <libpq-fe.h>
 
+#include <cstring>
 #include <map>
 #include <set>
 #include <string>
@@ -268,6 +269,66 @@ load_all_nonsmartdetect_first_party(const DbConfig& db) {
     PQclear(res);
     return absl::InternalError(
         "unifi::load_all_nonsmartdetect_first_party query: " + err);
+  }
+
+  std::vector<FirstPartyCamera> cameras;
+  int nrows = PQntuples(res);
+  for (int i = 0; i < nrows; ++i) {
+    FirstPartyCamera c;
+    c.id   = PQgetvalue(res, i, 0);
+    c.name = PQgetisnull(res, i, 1) ? "" : PQgetvalue(res, i, 1);
+    c.mac  = PQgetisnull(res, i, 2) ? "" : PQgetvalue(res, i, 2);
+    cameras.push_back(std::move(c));
+  }
+
+  PQclear(res);
+  return cameras;
+}
+
+// ---------------------------------------------------------------------------
+// load_first_party_cameras_by_model
+// ---------------------------------------------------------------------------
+
+absl::StatusOr<std::vector<FirstPartyCamera>>
+load_first_party_cameras_by_model(
+    const std::vector<std::string>& model_substrings,
+    const DbConfig& db) {
+  if (model_substrings.empty()) return std::vector<FirstPartyCamera>{};
+
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError(
+        "unifi::load_first_party_cameras_by_model: " + pg.error());
+
+  // Build a WHERE clause with OR'd ILIKE conditions on the type column.
+  // E.g.: (type ILIKE '%G3 Instant%' OR type ILIKE '%G4 Bullet%')
+  std::string where = "(";
+  for (size_t i = 0; i < model_substrings.size(); ++i) {
+    if (i > 0) where += " OR ";
+    // Escape single quotes in the substring.
+    std::string escaped;
+    for (char ch : model_substrings[i]) {
+      if (ch == '\'') escaped += "''";
+      else
+        escaped += ch;
+    }
+    where += "type ILIKE '%" + escaped + "%'";
+  }
+  where += ')';
+
+  std::string sql =
+    "SELECT id, name, mac, type "
+    "FROM cameras "
+    "WHERE \"isThirdPartyCamera\" = false "
+    "  AND \"isAdopted\" = true "
+    "  AND " + where;
+
+  PGresult* res = PQexec(pg.conn, sql.c_str());
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    return absl::InternalError(
+        "unifi::load_first_party_cameras_by_model query: " + err);
   }
 
   std::vector<FirstPartyCamera> cameras;
@@ -797,6 +858,52 @@ absl::StatusOr<int> rollback_camera_changes(
   }
 
   return updated;
+}
+
+// ---------------------------------------------------------------------------
+// detect_native_msr_thumbnail_format
+// ---------------------------------------------------------------------------
+
+absl::StatusOr<bool> detect_native_msr_thumbnail_format(const DbConfig& db) {
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError(
+        "detect_native_msr_thumbnail_format: " + pg.error());
+
+  // Find the most recent thumbnailId from a first-party camera event.
+  const char* sql =
+    "SELECT e.\"thumbnailId\" "
+    "FROM events e "
+    "JOIN cameras c ON e.\"cameraId\" = c.id "
+    "WHERE c.\"isThirdPartyCamera\" = false "
+    "  AND c.\"isAdopted\" = true "
+    "  AND e.\"thumbnailId\" IS NOT NULL "
+    "ORDER BY e.start DESC "
+    "LIMIT 1";
+
+  PGresult* res = PQexec(pg.conn, sql);
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    return absl::InternalError(
+        "detect_native_msr_thumbnail_format query: " + err);
+  }
+
+  bool use_msr = false;
+  if (PQntuples(res) > 0 && !PQgetisnull(res, 0, 0)) {
+    const char* tid = PQgetvalue(res, 0, 0);
+    int len = static_cast<int>(std::strlen(tid));
+    use_msr = (len != 24);
+    LOG(INFO) << "[startup] native thumbnailId sample: " << tid
+              << " (len=" << len << ") => "
+              << (use_msr ? "MSR format" : "DB format");
+  } else {
+    LOG(INFO) << "[startup] no native camera events found; "
+              << "defaulting to 24-char DB thumbnail IDs";
+  }
+
+  PQclear(res);
+  return use_msr;
 }
 
 }  // namespace unifi

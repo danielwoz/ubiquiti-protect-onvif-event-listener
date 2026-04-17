@@ -17,6 +17,7 @@
 #include <dirent.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -323,6 +324,131 @@ absl::Status revert_alarm_picker() {
   } else {
     LOG(INFO) << "[ui_patch] no backup files found -- nothing to revert";
   }
+
+  return absl::OkStatus();
+}
+
+// ---------------------------------------------------------------
+// Nginx log proxy patch
+// ---------------------------------------------------------------
+// NOLINTNEXTLINE(whitespace/indent_namespace)
+static const char kNginxConf[] =
+    "/data/unifi-core/config/http/site-local-ip.conf";  // NOLINT
+
+// NOLINTNEXTLINE(whitespace/indent_namespace)
+static const char kMarkerBegin[] =
+    "    # --- onvif-recorder log viewer "  // NOLINT
+    "(managed by onvif_recorder) ---\n";  // NOLINT
+// NOLINTNEXTLINE(whitespace/indent_namespace)
+static const char kMarkerEnd[] =
+    "    # --- end onvif-recorder log viewer ---\n";  // NOLINT
+
+// Build the nginx location block with the given port.
+static std::string build_nginx_block(uint16_t port) {
+  std::string block;
+  block += kMarkerBegin;
+  block += "    location /onvif/events/log {\n";
+  block += "        include "
+           "/usr/share/unifi-core/http/auth.conf;\n";
+  block += "        include "
+           "/usr/share/unifi-core/http/proxy.conf;\n";
+  block += "        proxy_pass http://127.0.0.1:";
+  block += std::to_string(port);
+  block += "/;\n";
+  block += "    }\n";
+  block += kMarkerEnd;
+  return block;
+}
+
+// Remove any existing marker block from the content string.
+static bool strip_marker_block(std::string* content) {
+  size_t begin = content->find(kMarkerBegin);
+  if (begin == std::string::npos) return false;
+  size_t end = content->find(kMarkerEnd, begin);
+  if (end == std::string::npos) return false;
+  content->erase(begin, end + std::strlen(kMarkerEnd) - begin);
+  return true;
+}
+
+absl::Status patch_nginx_log_proxy(uint16_t port) {
+  std::string content = read_file(kNginxConf);
+  if (content.empty()) {
+    return absl::NotFoundError(
+        "nginx config not found "
+        "-- not running on a Dream Router/NVR?");
+  }
+
+  // Always strip any existing block first (may be in the wrong
+  // server block from a prior version), then re-insert.
+  strip_marker_block(&content);
+
+  // Insert into the first server block (port 443, HTTPS).
+  // The file has multiple server{} blocks; we need the one
+  // with "listen 443".  Find it, then find its closing '}'.
+  size_t s443 = content.find("listen 443");
+  if (s443 == std::string::npos) {
+    return absl::InternalError(
+        "cannot find 'listen 443' in nginx config");
+  }
+  // Find the closing '}' for this server block.  Since the
+  // 443 block uses include directives (no nested braces in
+  // the config file itself), the first '}' after "listen 443"
+  // closes it.
+  size_t brace = content.find('}', s443);
+  if (brace == std::string::npos) {
+    return absl::InternalError(
+        "cannot find closing brace for 443 server");
+  }
+
+  std::string block = build_nginx_block(port);
+  content.insert(brace, block);
+
+  // If the file already has exactly this content, skip the write.
+  {
+    std::string on_disk = read_file(kNginxConf);
+    if (on_disk == content) {
+      LOG(INFO) << "[nginx] log proxy block already present";
+      return absl::OkStatus();
+    }
+  }
+
+  if (!write_file(kNginxConf, content)) {
+    return absl::InternalError("failed to write nginx config");
+  }
+
+  LOG(INFO) << "[nginx] injected log proxy block (port "
+            << port << ")";
+
+  // Reload nginx to pick up the change.
+  int rc = std::system("nginx -s reload 2>/dev/null");  // NOLINT
+  if (rc != 0)
+    LOG(WARNING) << "[nginx] reload returned " << rc;
+
+  return absl::OkStatus();
+}
+
+absl::Status revert_nginx_log_proxy() {
+  std::string content = read_file(kNginxConf);
+  if (content.empty()) {
+    LOG(INFO) << "[nginx] config not found -- nothing to revert";
+    return absl::OkStatus();
+  }
+
+  if (!strip_marker_block(&content)) {
+    LOG(INFO) << "[nginx] no log proxy block found "
+              << "-- nothing to revert";
+    return absl::OkStatus();
+  }
+
+  if (!write_file(kNginxConf, content)) {
+    return absl::InternalError("failed to write nginx config");
+  }
+
+  LOG(INFO) << "[nginx] removed log proxy block";
+
+  int rc = std::system("nginx -s reload 2>/dev/null");  // NOLINT
+  if (rc != 0)
+    LOG(WARNING) << "[nginx] reload returned " << rc;
 
   return absl::OkStatus();
 }

@@ -224,6 +224,12 @@ class DetectionRecorder {
   /// bounding box provided by the camera. Has no effect if no detector is set.
   void set_detect_override(bool override);
 
+  /// When enabled, thumbnail IDs use the MSR "{MAC}-{timestamp_ms}" format
+  /// (length != 24) matching the native Protect convention, instead of the
+  /// default 24-char hex format.  Both formats are always written to the DB
+  /// thumbnails table and UBV files.  Must be called before run().
+  void set_use_msr_thumbnail_ids(bool use_msr);
+
   // Defined in detection_recorder.cpp -- public so concrete backends in the
   // .cpp translation unit can inherit from it without friendship.
   struct IDbBackend {
@@ -236,6 +242,9 @@ class DetectionRecorder {
     virtual void register_camera(const std::string& ip,
                                  const std::string& id,
                                  const std::string& mac) = 0;
+
+    /// Enable MSR-format thumbnail IDs ("{MAC}-{ts_ms}", length != 24).
+    virtual void set_use_msr_thumbnail_ids(bool /*use_msr*/) {}
 
     /// Compute the thumbnailId string for an event.
     virtual std::string make_thumbnail_id(const std::string& camera_ip,
@@ -406,6 +415,9 @@ class DetectionRecorder {
 
   // When true the detector is preferred over ONVIF-provided bounding boxes.
   bool detect_override_{false};
+
+  // When true, thumbnail IDs use the MSR "{MAC}-{ts_ms}" format (len != 24).
+  bool use_msr_thumb_ids_{false};
 
   // Optional alarm notifier. Set before run(); non-owning raw pointer.
   AlarmNotifier* alarm_notifier_{nullptr};

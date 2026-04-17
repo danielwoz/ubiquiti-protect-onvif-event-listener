@@ -188,8 +188,13 @@ static std::vector<unsigned char> fetch_snapshot(const std::string& url,
   if (rc == CURLE_OK) {
     long http_code = 0;  // NOLINT(runtime/int)
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    if (http_code != 200) buf.clear();
+    if (http_code != 200) {
+      LOG(WARNING) << "[snapshot] HTTP " << http_code << " from " << url;
+      buf.clear();
+    }
   } else {
+    LOG(WARNING) << "[snapshot] curl error: " << curl_easy_strerror(rc)
+                 << " for " << url;
     buf.clear();
   }
 
@@ -244,6 +249,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   // before the listener starts, then read-only.
   std::map<std::string, std::string> ip_to_id_;
   std::map<std::string, std::string> ip_to_mac_;
+  bool use_msr_thumb_ids_{false};
 
   // Cache of label name -> serial lid value from the `labels` table.
   // Populated lazily by upsert_label(); avoids redundant DB queries.
@@ -295,10 +301,17 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     if (!mac.empty()) ip_to_mac_[ip] = mac;
   }
 
-  std::string make_thumbnail_id(const std::string& /*camera_ip*/,
-                                uint64_t           /*ts_ms*/) override {
-    // 24-char hex IDs are routed by Protect to its thumbnails DB table
-    // (not to msp TCP), letting us insert JPEG data directly.
+  void set_use_msr_thumbnail_ids(bool use_msr) override {
+    use_msr_thumb_ids_ = use_msr;
+  }
+
+  std::string make_thumbnail_id(const std::string& camera_ip,
+                                uint64_t           ts_ms) override {
+    if (use_msr_thumb_ids_) {
+      auto it = ip_to_mac_.find(camera_ip);
+      if (it != ip_to_mac_.end() && !it->second.empty())
+        return util::make_msr_thumbnail_id(it->second, ts_ms);
+    }
     return util::generate_24hex_id();
   }
 
@@ -936,6 +949,12 @@ void DetectionRecorder::set_detect_override(bool override) {
   detect_override_ = override;
 }
 
+void DetectionRecorder::set_use_msr_thumbnail_ids(bool use_msr) {
+  std::lock_guard<std::mutex> lk(mu_);
+  use_msr_thumb_ids_ = use_msr;
+  if (db_) db_->set_use_msr_thumbnail_ids(use_msr);
+}
+
 void DetectionRecorder::set_buffer(uint32_t pre_sec, uint32_t post_sec) {
   std::lock_guard<std::mutex> lk(mu_);
   pre_buffer_ms_  = static_cast<uint64_t>(pre_sec)  * 1000;
@@ -1087,7 +1106,17 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // 3. Fetch snapshot if the backend needs it.
     std::vector<unsigned char> snapshot;
     if (db_->needs_snapshot() && !snap_url.empty()) {
+      LOG(INFO) << '[' << ev.camera_ip << "] fetching snapshot from "
+                << snap_url;
       snapshot = fetch_snapshot(snap_url, snap_user, snap_pass);
+      if (snapshot.empty()) {
+        LOG(WARNING) << '[' << ev.camera_ip << "] snapshot fetch failed or "
+                     << "returned empty from " << snap_url
+                     << " (thumbnail will be missing)";
+      } else {
+        LOG(INFO) << '[' << ev.camera_ip << "] snapshot fetched: "
+                  << snapshot.size() << " bytes";
+      }
       // Crop snapshot.
       //   default (no detector):  ONVIF bbox → crop; no bbox → full image
       //   --detect:               ONVIF bbox → crop; no bbox → NanoDet-M → smart-crop
@@ -1095,6 +1124,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       if (!snapshot.empty()) {
         int img_w = 0, img_h = 0;
         if (jpeg_read_dimensions(snapshot, &img_w, &img_h)) {
+          LOG(INFO) << '[' << ev.camera_ip << "] snapshot dimensions: "
+                    << img_w << "x" << img_h;
           const jpeg_crop::BoundingBox* onvif_bbox =
               (ev.bbox && !det_override) ? &*ev.bbox : nullptr;
           std::optional<object_detect::Detection> det_result;
@@ -1102,6 +1133,17 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
             det_result = det_ptr->detect(snapshot);
           const jpeg_crop::BoundingBox* det_bbox =
               det_result ? &det_result->bbox : nullptr;
+          if (onvif_bbox) {
+            LOG(INFO) << '[' << ev.camera_ip << "] using ONVIF bbox for crop";
+          } else if (det_result) {
+            LOG(INFO) << '[' << ev.camera_ip << "] NanoDet-M detected class_id="
+                      << det_result->class_id << " ("
+                      << object_detect::detection_type(det_result->class_id)
+                      << ")";
+          } else if (det_ptr) {
+            LOG(INFO) << '[' << ev.camera_ip
+                      << "] NanoDet-M returned no detection, using smart-crop";
+          }
           // If this was a generic motion event (no ONVIF class) and NCNN
           // identified a security-relevant object, use its class to set the
           // detection type (person / vehicle / animal) in all tables.
@@ -1122,8 +1164,15 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
             if (!cropped.empty())
               snapshot = std::move(cropped);
           }
+        } else {
+          LOG(WARNING) << '[' << ev.camera_ip << "] failed to read JPEG "
+                       << "dimensions from snapshot (" << snapshot.size()
+                       << " bytes) — storing uncropped";
         }
       }
+    } else if (db_->needs_snapshot() && snap_url.empty()) {
+      LOG(INFO) << '[' << ev.camera_ip << "] no snapshot URL configured "
+                << "— thumbnail will be missing";
     }
 
     // 4. INSERT into both tables, write thumbnail -- all under lock.

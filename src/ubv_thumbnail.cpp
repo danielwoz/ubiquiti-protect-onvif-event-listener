@@ -204,6 +204,33 @@ absl::StatusOr<Frame> decode_one(const std::string& path, uint64_t timestamp_ms)
 }
 
 // ---------------------------------------------------------------------------
+// Metadata helpers
+// ---------------------------------------------------------------------------
+
+// Build the 8-byte META record payload: {seconds_be32, nanoseconds_be32}.
+// This is the frame timestamp in struct-timespec format, matching the native
+// Protect UBV convention.
+static void build_meta_payload(uint8_t out[8], uint64_t timestamp_ms) {
+  uint32_t sec  = static_cast<uint32_t>(timestamp_ms / 1000);
+  uint32_t nsec = static_cast<uint32_t>((timestamp_ms % 1000) * 1000000);
+  put_be32(out,     sec);
+  put_be32(out + 4, nsec);
+}
+
+// Build the 32-byte FILE_HEADER payload.  Bytes 4-7 hold the write cursor
+// (total bytes written after the file-header record).  All other bytes are
+// zero, matching native Protect UBV files.
+static void build_file_hdr_payload(uint8_t out[32], uint32_t data_size) {
+  std::memset(out, 0, 32);
+  put_be32(out + 4, data_size);
+}
+
+// Size of a serialised record: 20-byte header + payload + 4-byte trailer.
+static uint32_t record_size(uint32_t payload_len) {
+  return RECORD_HEADER_SIZE + payload_len + 4;
+}
+
+// ---------------------------------------------------------------------------
 // encode -- write frames into a new UBV file
 // ---------------------------------------------------------------------------
 absl::Status encode(const std::string& path, const std::vector<Frame>& frames) {
@@ -216,16 +243,25 @@ absl::Status encode(const std::string& path, const std::vector<Frame>& frames) {
 
   const uint64_t first_ts = frames.front().timestamp_ms;
 
-  // File-header record: fixed 32-byte zeroed payload.
-  static const uint8_t file_hdr_payload[32]{};
+  // Compute total data size after the file-header record.
+  uint32_t data_size = 0;
+  for (const auto& f : frames) {
+    data_size += record_size(8);  // META record (8-byte payload)
+    data_size += record_size(static_cast<uint32_t>(f.jpeg.size()));
+  }
+
+  // File-header record with write-cursor in payload bytes 4-7.
+  uint8_t file_hdr_payload[32];
+  build_file_hdr_payload(file_hdr_payload, data_size);
   write_record(out, TYPE_FILE_HEADER, CODEC_META, first_ts,
                file_hdr_payload, sizeof(file_hdr_payload));
 
   // One [meta + JPEG] pair per frame.
-  static const uint8_t meta_payload[8]{};
   for (const auto& f : frames) {
+    uint8_t meta[8];
+    build_meta_payload(meta, f.timestamp_ms);
     write_record(out, TYPE_META, CODEC_META, f.timestamp_ms,
-                 meta_payload, sizeof(meta_payload));
+                 meta, sizeof(meta));
     write_record(out, TYPE_JPEG, CODEC_JPEG, f.timestamp_ms,
                  f.jpeg.data(), static_cast<uint32_t>(f.jpeg.size()));
   }
@@ -236,19 +272,40 @@ absl::Status encode(const std::string& path, const std::vector<Frame>& frames) {
 }
 
 // ---------------------------------------------------------------------------
+// Update the file-header write-cursor in-place (payload bytes 4-7).
+// ---------------------------------------------------------------------------
+static void update_file_hdr_cursor(const std::string& path,
+                                   uint32_t new_data_size) {
+  // The write-cursor lives at offset 24 in the file:
+  //   20 (record header) + 4 (first u32 of payload, always zero) = 24.
+  std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+  if (!f.is_open()) return;
+  uint8_t buf[4];
+  put_be32(buf, new_data_size);
+  f.seekp(24, std::ios::beg);
+  f.write(reinterpret_cast<const char*>(buf), 4);
+}
+
+// ---------------------------------------------------------------------------
 // append -- add one frame to an existing UBV file (create if new)
 // ---------------------------------------------------------------------------
 absl::Status append(const std::string& path, const Frame& frame) {
   // Determine whether the file already exists and has content.
   bool is_new = true;
+  std::streamoff existing_size = 0;
   {
     std::ifstream probe(path, std::ios::binary | std::ios::ate);
-    if (probe.is_open() && probe.tellg() > 0)
+    if (probe.is_open() && probe.tellg() > 0) {
       is_new = false;
+      existing_size = probe.tellg();
+    }
   }
 
-  static const uint8_t file_hdr_payload[32]{};
-  static const uint8_t meta_payload[8]{};
+  const uint32_t jpeg_len = static_cast<uint32_t>(frame.jpeg.size());
+  const uint32_t pair_size = record_size(8) + record_size(jpeg_len);
+
+  uint8_t meta[8];
+  build_meta_payload(meta, frame.timestamp_ms);
 
   if (is_new) {
     // Create file and write the file-header record first.
@@ -256,12 +313,14 @@ absl::Status append(const std::string& path, const Frame& frame) {
     if (!out.is_open())
       return absl::InternalError("ubv::append: cannot create " + path);
 
+    uint8_t file_hdr_payload[32];
+    build_file_hdr_payload(file_hdr_payload, pair_size);
     write_record(out, TYPE_FILE_HEADER, CODEC_META, frame.timestamp_ms,
                  file_hdr_payload, sizeof(file_hdr_payload));
     write_record(out, TYPE_META, CODEC_META, frame.timestamp_ms,
-                 meta_payload, sizeof(meta_payload));
+                 meta, sizeof(meta));
     write_record(out, TYPE_JPEG, CODEC_JPEG, frame.timestamp_ms,
-                 frame.jpeg.data(), static_cast<uint32_t>(frame.jpeg.size()));
+                 frame.jpeg.data(), jpeg_len);
 
     if (!out.flush())
       return absl::InternalError("ubv::append: write error on " + path);
@@ -272,12 +331,18 @@ absl::Status append(const std::string& path, const Frame& frame) {
       return absl::InternalError("ubv::append: cannot open for append " + path);
 
     write_record(out, TYPE_META, CODEC_META, frame.timestamp_ms,
-                 meta_payload, sizeof(meta_payload));
+                 meta, sizeof(meta));
     write_record(out, TYPE_JPEG, CODEC_JPEG, frame.timestamp_ms,
-                 frame.jpeg.data(), static_cast<uint32_t>(frame.jpeg.size()));
+                 frame.jpeg.data(), jpeg_len);
 
     if (!out.flush())
       return absl::InternalError("ubv::append: write error on " + path);
+
+    // Update the file-header write-cursor to reflect all data after the
+    // file-header record.  File-header record = 56 bytes.
+    const uint32_t new_cursor =
+        static_cast<uint32_t>(existing_size - record_size(32)) + pair_size;
+    update_file_hdr_cursor(path, new_cursor);
   }
   return absl::OkStatus();
 }

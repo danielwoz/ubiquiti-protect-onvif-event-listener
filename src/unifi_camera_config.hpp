@@ -82,6 +82,15 @@ absl::StatusOr<std::vector<FirstPartyCamera>> load_first_party_cameras(
 absl::StatusOr<std::vector<FirstPartyCamera>>  // NOLINT(whitespace/indent_namespace)
 load_all_nonsmartdetect_first_party(const DbConfig& db = {});
 
+/// Search for adopted first-party cameras whose `type` column contains any
+/// of the given @p model_substrings (case-insensitive ILIKE match).
+/// For example, passing {"G3 Instant"} matches cameras with type
+/// "UVC G3 Instant".  Returns a vector of matching cameras.
+absl::StatusOr<std::vector<FirstPartyCamera>>
+load_first_party_cameras_by_model(
+    const std::vector<std::string>& model_substrings,
+    const DbConfig& db = {});
+
 /// For each camera in `ids`, ensure that smart detection is enabled in the
 /// Protect database.  Specifically, for any camera whose
 /// `featureFlags.smartDetectTypes` or `smartDetectSettings.objectTypes` is
@@ -136,6 +145,16 @@ absl::Status ensure_smart_detect_zones(
 /// Returns error Status on connection or query failure.
 absl::Status set_rtsp_audio(bool enable, const DbConfig& db = {},
                              CameraChangeLog* log = nullptr);
+
+/// Detect the thumbnail ID format used by native first-party cameras.
+///
+/// Queries the most recent thumbnailId from events belonging to adopted
+/// first-party cameras.  If the ID has length != 24 (e.g. "MAC-timestamp"
+/// MSR format) returns true — callers should generate IDs in the same format.
+/// Returns false when no native events are found or all use the 24-char DB
+/// format.
+absl::StatusOr<bool> detect_native_msr_thumbnail_format(
+    const DbConfig& db = {});
 
 /// Undo cameras-table changes and return.
 ///

@@ -49,6 +49,29 @@ cc_library(
 )
 
 cc_library(
+    name = "log_ring",
+    srcs = ["src/log_ring.cpp"],
+    hdrs = ["src/log_ring.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        "@com_google_absl//absl/log:log_sink",
+        "@com_google_absl//absl/strings:strings",
+        "@com_google_absl//absl/time:time",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "log_server",
+    srcs = ["src/log_server.cpp"],
+    hdrs = ["src/log_server.hpp"],
+    strip_include_prefix = "src",
+    deps = _MHD + [
+        ":log_ring",
+    ],
+)
+
+cc_library(
     name = "onvif_listener",
     srcs = ["src/onvif_listener.cpp"],
     hdrs = ["src/onvif_listener.hpp"],
@@ -211,6 +234,8 @@ cc_binary(
         ":camera_change_log",
         ":detection_recorder",
         ":event_recorder",
+        ":log_ring",
+        ":log_server",
         ":motion_poller",
         ":object_detect",
         ":onvif_listener",
@@ -222,6 +247,8 @@ cc_binary(
         "@com_google_absl//absl/log:globals",
         "@com_google_absl//absl/log:initialize",
         "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/log:log_sink",
+        "@com_google_absl//absl/log:log_sink_registry",
     ],
 )
 
