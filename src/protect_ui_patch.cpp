@@ -42,12 +42,17 @@ struct Patch {
 
 // --- Frontend patches (swai*.js, vantage*.js) ---
 
-// 1. Camera picker filter: always pass third-party cameras. (43 bytes)
-static const Patch kUiPatch1 = {
+// 1a. Camera picker filter (pre-7.0.57): always pass third-party cameras.
+static const Patch kUiPatch1a = {
 "!e.isThirdPartyCamera||e.isPairedWithAiPort",
 "!0/*sThirdPartyCamera||isPairedWithAiPort*/", 43};
 
-// 2. Automation camera list negated filter. (43 bytes)
+// 1b. Camera picker filter (7.0.57+): new exclusion filter. (40 bytes)
+static const Patch kUiPatch1b = {
+"!e.isThirdPartyCamera&&!v.includes(e.id)",
+"!0/*hirdPartyCamera&&!v.includes(e.id)*/", 40};
+
+// 2. Automation camera list negated filter (pre-7.0.57). (43 bytes)
 static const Patch kUiPatch2 = {
 "e.isThirdPartyCamera&&!e.isPairedWithAiPort",
 "!1/*ThirdPartyCamera&&!isPairedWithAiPort*/", 43};
@@ -57,8 +62,9 @@ static const Patch kUiPatch3 = {
 "return!this.isThirdPartyCamera||this.isPairedWithAiPort",
 "return!0/*isThirdPartyCamera||this.isPairedWithAiPort*/", 55};
 
-static const Patch kUiPatches[] = {kUiPatch1, kUiPatch2, kUiPatch3};
-static constexpr size_t kUiPatchCount = 3;
+static const Patch kUiPatches[] = {
+    kUiPatch1a, kUiPatch1b, kUiPatch2, kUiPatch3};
+static constexpr size_t kUiPatchCount = 4;
 
 // --- Backend patches (service.js) ---
 
