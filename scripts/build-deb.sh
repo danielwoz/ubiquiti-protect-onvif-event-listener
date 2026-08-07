@@ -96,6 +96,7 @@ mkdir -p "$STAGE/usr/libexec/onvif-recorder"
 mkdir -p "$STAGE/usr/share/doc/onvif-recorder"
 mkdir -p "$STAGE/usr/share/onvif-recorder/models"
 mkdir -p "$STAGE/lib/systemd/system"
+mkdir -p "$STAGE/usr/share/keyrings"
 mkdir -p "$STAGE/etc/default"
 mkdir -p "$STAGE/etc/onvif-recorder"
 
@@ -129,6 +130,47 @@ install -m 0644 debian/onvif-recorder-channel.service      "$STAGE/lib/systemd/s
 install -m 0644 debian/onvif-recorder-channel.timer        "$STAGE/lib/systemd/system/onvif-recorder-channel.timer"
 install -m 0644 debian/onvif-recorder-autoupdate.service   "$STAGE/lib/systemd/system/onvif-recorder-autoupdate.service"
 install -m 0644 debian/onvif-recorder-autoupdate.timer     "$STAGE/lib/systemd/system/onvif-recorder-autoupdate.timer"
+
+# APT signing keyring.
+#
+# The package writes /etc/apt/sources.list.d/onvif-recorder.list with a
+# `signed-by=` pointing at this path, but until now the keyring itself was
+# only ever installed by the curl bootstrap (gh-pages/install.sh).  That
+# split is a trap: /etc survives a UniFi OS update but /usr is replaced
+# wholesale, so the source list outlives the keyring and every subsequent
+# `apt-get update` on the box fails with NO_PUBKEY — including the one
+# `uos runnable install` runs, which blocks Protect updates entirely.
+# Recovering with `dpkg -i` could never fix it, because nothing in the
+# package owned the key.  Shipping it here makes dpkg the owner, so any
+# install or upgrade restores it.
+#
+# Deliberately NOT a conffile: we want every upgrade to refresh it.
+KEYRING_ASC="debian/onvif-recorder-archive-keyring.asc"
+KEYRING_OUT="$STAGE/usr/share/keyrings/onvif-recorder-archive-keyring.gpg"
+KEYRING_FPR="A6942147E241DE2A864BCE6B5D0BA3CBC12AD2A2"
+
+if [ ! -f "$KEYRING_ASC" ]; then
+    echo "ERROR: signing key not found at $KEYRING_ASC" >&2
+    exit 1
+fi
+if ! command -v gpg >/dev/null 2>&1; then
+    echo "ERROR: gpg is required to dearmor $KEYRING_ASC (install gnupg)." >&2
+    exit 1
+fi
+
+# Verify we're shipping the key we think we are before baking it into a
+# package that grants apt trust.
+ACTUAL_FPR=$(gpg --show-keys --with-colons "$KEYRING_ASC" \
+    | awk -F: '/^fpr:/{print $10; exit}')
+if [ "$ACTUAL_FPR" != "$KEYRING_FPR" ]; then
+    echo "ERROR: signing key fingerprint mismatch." >&2
+    echo "  expected: $KEYRING_FPR" >&2
+    echo "  actual:   ${ACTUAL_FPR:-<none>}" >&2
+    exit 1
+fi
+
+gpg --dearmor < "$KEYRING_ASC" > "$KEYRING_OUT"
+chmod 0644 "$KEYRING_OUT"
 
 # Default (EnvironmentFile) — conffile
 install -m 0644 debian/default/onvif-recorder "$STAGE/etc/default/onvif-recorder"

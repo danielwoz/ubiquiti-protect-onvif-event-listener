@@ -8,6 +8,12 @@ case "$1" in
     remove)
         # Compat symlink — may have been created by postinst.
         rm -f /usr/bin/onvif_recorder
+        # The keyring is dpkg-owned now, so dpkg deletes it on remove.  The
+        # source list lives in /etc and was only cleaned up on purge, which
+        # would leave a `signed-by=` pointing at a file that no longer
+        # exists — breaking `apt-get update` system-wide for anyone who
+        # merely removed the package.  Drop it here too.
+        rm -f /etc/apt/sources.list.d/onvif-recorder.list
         systemctl daemon-reload 2>/dev/null || true
         ;;
     purge)
