@@ -1389,6 +1389,11 @@ void DetectionRecorder::set_detect_override(bool override) {
   detect_override_ = override;
 }
 
+void DetectionRecorder::set_drop_unclassified_motion(bool drop) {
+  absl::MutexLock lk(&mu_);
+  drop_unclassified_motion_ = drop;
+}
+
 void DetectionRecorder::set_use_msr_thumbnail_ids(bool use_msr) {
   absl::MutexLock lk(&mu_);
   use_msr_thumb_ids_ = use_msr;
@@ -1513,6 +1518,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     uint64_t pre_ms;
     const object_detect::ObjectDetector* det_ptr;
     bool det_override;
+    bool drop_unclassified;
     AlarmNotifier* alarm_notif;
     MsrClient* msr;
     bool msr_drop_on_failure;
@@ -1605,6 +1611,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       pre_ms       = pre_buffer_ms_;
       det_ptr      = detector_;
       det_override = detect_override_;
+      drop_unclassified = drop_unclassified_motion_;
       alarm_notif  = alarm_notifier_;
       msr          = msr_client_;
       msr_drop_on_failure = msr_drop_on_failure_;
@@ -1719,6 +1726,31 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
                 object_detect::detection_type(det_result->class_id);
             obj_type = inferred;
             sdt_json = smart_detect_types_json(inferred);
+          }
+          // Drop unclassified generic motion when --drop_unclassified_motion
+          // is set: a pixel-change motion event with no per-camera override
+          // and no NanoDet-M detection would otherwise be recorded as the
+          // default_object_type (person), which floods the timeline with
+          // false positives on AI cameras that already emit proper
+          // Person/Vehicle/Pet events.  Discard it instead.  Only new events
+          // are dropped; a coalescing merge into an existing real event is
+          // left untouched.
+          //
+          // Matched on topic rather than det->from_fallback: a
+          // LineDetector/Crossed event that arrives without ClassTypes is
+          // also from_fallback, but it is a real rule-engine detection the
+          // camera deliberately reported, not pixel noise, so it stays.
+          const bool generic_motion =
+              ev.topic == "tns1:RuleEngine/CellMotionDetector/Motion" ||
+              ev.topic == "tns1:RuleEngine/tt:CellMotionDetector"     ||
+              ev.topic == "tns1:VideoSource/MotionAlarm";
+          if (drop_unclassified && generic_motion && det->from_fallback &&
+              cam_override_type.empty() && !det_result &&
+              coalesced_event_id.empty()) {
+            LOG(INFO) << '[' << ev.camera_ip
+                      << "] dropping unclassified motion event "
+                         "(--drop_unclassified_motion, no NanoDet-M detection)";
+            return;
           }
           // Only crop when we have a basis: an ONVIF bbox, or a loaded
           // detector (which may yield a result or fall back to smart-crop).

@@ -127,6 +127,13 @@ ABSL_FLAG(bool, detect, true,
 ABSL_FLAG(bool, detect_override, false,
     "Run NanoDet-M on every thumbnail regardless of whether the camera "
     "provides an ONVIF bounding box. Implies --detect.");
+ABSL_FLAG(bool, drop_unclassified_motion, false,
+    "Drop generic motion events (CellMotionDetector, VideoSource/MotionAlarm) "
+    "that carry no ONVIF object class and that NanoDet-M cannot classify, "
+    "instead of recording them as --default_object_type. Real camera AI "
+    "events (Person/Vehicle/Pet) and --camera_object_types overrides are "
+    "unaffected. Useful with Reolink/other AI cameras that also emit noisy "
+    "basic-motion events. Default false.");
 ABSL_FLAG(std::string, event_log, "",
     "Path for the parsed-event JSON Lines log file. "
     "Each line is one ONVIF event with topic, source, data, and timestamp. "
@@ -799,6 +806,8 @@ int main(int argc, char* argv[]) {
 
   // Object type configuration.
   det_rec.set_default_object_type(absl::GetFlag(FLAGS_default_object_type));
+  det_rec.set_drop_unclassified_motion(
+      absl::GetFlag(FLAGS_drop_unclassified_motion));
 
   // Helper to walk a comma-separated `ip=value` list and call a per-pair
   // callback.  Used by --camera_object_types / --camera_coalesce_window_sec

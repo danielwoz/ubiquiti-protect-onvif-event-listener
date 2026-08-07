@@ -67,6 +67,13 @@ const std::vector<Entry>& Schema() {
      "Default object type for events that arrive without a class "
      "(e.g. 'motion', 'person', 'vehicle').",
      "Detection"},
+    {"drop_unclassified_motion", Type::Bool,
+     "Drop generic motion events with no ONVIF class that NanoDet-M cannot "
+     "classify, instead of recording them as default_object_type.  Camera AI "
+     "events (Person/Vehicle/Pet) and per-camera overrides are unaffected.  "
+     "Cuts false-positive clutter from AI cameras (e.g. Reolink) that also "
+     "emit noisy basic-motion events.",
+     "Detection"},
     {"camera_object_types", Type::String,
      "Per-camera type overrides as comma-separated ip=type pairs, e.g. "
      "192.168.1.108=person,192.168.1.109=vehicle.",

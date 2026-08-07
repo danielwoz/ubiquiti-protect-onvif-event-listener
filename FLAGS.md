@@ -53,6 +53,7 @@ regardless of what the camera reports.
 |------|---------|-------------|
 | `--default_object_type` | `person` | Object type written for generic motion events that carry no object class. Valid values: `person`, `vehicle`, `animal`, `package`. |
 | `--camera_object_types` | _(disabled)_ | Comma-separated `ip=type` overrides applied to all events from each named camera, e.g. `192.168.1.108=animal,192.168.1.109=package`. |
+| `--drop_unclassified_motion` | `false` | Drop generic motion events (CellMotionDetector / MotionAlarm) that carry no ONVIF object class and that NanoDet-M cannot classify, instead of recording them as `--default_object_type`. Real camera AI events (Person / Vehicle / Pet) and `--camera_object_types` overrides are unaffected. Cuts false-positive clutter from AI cameras (e.g. Reolink) that also emit noisy basic-motion events. |
 
 **Example — wildlife camera on `.108` and package camera on `.109`:**
 ```bash
