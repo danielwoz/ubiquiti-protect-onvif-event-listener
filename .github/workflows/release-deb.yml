@@ -27,11 +27,12 @@ jobs:
       # available as prebuilt arm64 sysroot packages.  curl / libxml2
       # / openssl / libjpeg-turbo come from @arm64_sysroot, but
       # zstd and gperftools (tcmalloc) are always built from source.
-      - name: Init required submodules
-        run: |
-          git submodule update --init --depth 1 \
-              third_party/zstd \
-              third_party/gperftools
+      # The arm64 build itself only needs zstd + gperftools (curl, libxml2,
+      # openssl and libjpeg-turbo come from @arm64_sysroot), but the x86
+      # test gate below builds all of them from source via
+      # new_local_repository, so every submodule has to be present.
+      - name: Init submodules
+        run: git submodule update --init --depth 1
 
       - name: Install system deps
         run: |

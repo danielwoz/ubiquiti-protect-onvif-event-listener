@@ -36,14 +36,15 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # zstd and gperftools are always built from source; the rest of the
-      # x86 third-party tree (openssl, curl, libxml2, libpq, libmicrohttpd,
-      # libjpeg-turbo, ncnn) is fetched by Bazel, not apt.
-      - name: Init required submodules
-        run: |
-          git submodule update --init --depth 1 \
-              third_party/zstd \
-              third_party/gperftools
+      # ALL submodules, unlike release-deb.yml which needs only zstd +
+      # gperftools.  openssl_src / curl_src / libxml2_src / libjpeg_turbo /
+      # zstd_src / gperftools_src are new_local_repository targets pointing
+      # straight at these directories, and the x86 config builds every one
+      # from source -- only the arm64 config substitutes @arm64_sysroot for
+      # curl/xml2/openssl/jpeg.  Miss one and Bazel sees an empty tree:
+      # "Configure: No such file or directory", exit 127.
+      - name: Init submodules
+        run: git submodule update --init --depth 1
 
       # Matches release-deb.yml's list minus the arm64/packaging-only bits
       # (qemu, binutils-aarch64, reprepro, lintian, dpkg-dev, fakeroot).
