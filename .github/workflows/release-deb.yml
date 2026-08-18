@@ -43,6 +43,9 @@ jobs:
             autoconf automake libtool pkg-config m4
           pip3 install --break-system-packages cpplint
 
+      - name: cpplint
+        run: python3 -m cpplint src/*.cpp src/*.hpp test/*.cpp test/*.hpp
+
       - name: Install Bazel
         run: |
           sudo curl -fsSL -o /usr/local/bin/bazel \
@@ -55,6 +58,14 @@ jobs:
             https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.param
           curl -fL -o nanodet_m.bin \
             https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.bin
+
+      # Release gate.  Nothing is built, uploaded or published to the apt
+      # repo unless the suite is green first -- a tag must not be able to
+      # ship code that fails its own tests.  Runs on x86 because that is
+      # where the tests execute; the arm64 binary below is the same sources.
+      - name: Test before releasing
+        run: |
+          scripts/bz test --config=x86 --test_output=errors //test:all
 
       - name: Compute version
         id: ver

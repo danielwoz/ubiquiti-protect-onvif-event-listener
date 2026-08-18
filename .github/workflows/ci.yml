@@ -1,0 +1,88 @@
+name: CI
+
+# Runs on every push to main and every pull request, including from forks.
+#
+# Until this existed the only thing standing between a broken commit and the
+# repo was .githooks/pre-push, which protects exactly one machine: it has to
+# be installed per clone (bazel run //:install_hooks) and it cannot run for a
+# merge made through the GitHub UI.  Contributor PRs were never built at all.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to the same branch supersedes the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fast feedback: no toolchain, no Bazel, ~15 s.
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install cpplint
+        run: pip3 install --break-system-packages cpplint
+
+      - name: cpplint
+        run: python3 -m cpplint src/*.cpp src/*.hpp test/*.cpp test/*.hpp
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # zstd and gperftools are always built from source; the rest of the
+      # x86 third-party tree (openssl, curl, libxml2, libpq, libmicrohttpd,
+      # libjpeg-turbo, ncnn) is fetched by Bazel, not apt.
+      - name: Init required submodules
+        run: |
+          git submodule update --init --depth 1 \
+              third_party/zstd \
+              third_party/gperftools
+
+      # Matches release-deb.yml's list minus the arm64/packaging-only bits
+      # (qemu, binutils-aarch64, reprepro, lintian, dpkg-dev, fakeroot).
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake ninja-build perl lld nasm \
+            python3-pip curl git xz-utils \
+            autoconf automake libtool pkg-config m4
+
+      - name: Install Bazel
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/bazel \
+            https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazel
+
+      # Building openssl/curl/libxml2/libpq/ncnn from source is the bulk of
+      # the wall clock here, and none of it changes between runs.  Keyed on
+      # the files that actually determine those outputs.
+      - name: Restore Bazel disk cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bazel-disk
+          key: bazel-disk-${{ runner.os }}-${{ hashFiles('WORKSPACE', '.bazelversion', 'BUILD.bazel', 'third_party/**') }}
+          restore-keys: |
+            bazel-disk-${{ runner.os }}-
+
+      - name: Test
+        run: |
+          scripts/bz test --config=x86 \
+            --disk_cache=$HOME/.bazel-disk \
+            --test_output=errors \
+            //test:all
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bazel-test-logs
+          path: ~/.cache/bazel/x86/execroot/_main/bazel-out/*/testlogs/**
+          if-no-files-found: ignore

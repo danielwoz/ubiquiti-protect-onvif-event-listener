@@ -1,0 +1,54 @@
+name: Windows installer CI
+
+# The installer was the least-covered thing in the repo: release-windows.yml
+# only fires on a v* tag, and windows-build-test.yml is manual-only, so a PR
+# touching it reported "no checks".  That is how the SSH.NET security bump
+# (#48) arrived with nothing to validate it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'windows-installer/**'
+      - '.github/workflows/windows-ci.yml'
+  pull_request:
+    paths:
+      - 'windows-installer/**'
+      - '.github/workflows/windows-ci.yml'
+
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore windows-installer/OnvifRecorderInstaller.sln
+
+      - name: Build
+        run: dotnet build windows-installer/OnvifRecorderInstaller.sln -c Release --no-restore
+
+      - name: Test
+        run: >
+          dotnet test
+          windows-installer/OnvifRecorderInstaller.Tests/OnvifRecorderInstaller.Tests.csproj
+          -c Release --no-build --verbosity normal
+
+      # Proves the single-file self-contained publish still works -- that is
+      # the shape actually shipped, and it can fail where a plain build passes
+      # (trimming, native assets, new transitive deps).
+      - name: Publish self-contained single-file exe
+        run: >
+          dotnet publish
+          windows-installer/OnvifRecorderInstaller/OnvifRecorderInstaller.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true -o publish-out
