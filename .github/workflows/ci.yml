@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install cpplint
         run: pip3 install --break-system-packages cpplint
@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # ALL submodules, unlike release-deb.yml which needs only zstd +
       # gperftools.  openssl_src / curl_src / libxml2_src / libjpeg_turbo /
