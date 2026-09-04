@@ -96,6 +96,17 @@ case "$1" in
             # running, no-op if it was stopped.
             systemctl try-restart onvif-recorder.service || true
         fi
+
+        # Deploy/refresh the persistent recovery layer on /data so the
+        # package can reinstall itself after a firmware upgrade wipes
+        # /usr.  Until now only the curl bootstrap did this, so apt-only
+        # installs had no recovery and lost the package on every UniFi OS
+        # update (issue #51).  Best-effort: a failure here must never
+        # fail the install.
+        if [ -x /usr/share/onvif-recorder/recovery-layer.sh ]; then
+            /usr/share/onvif-recorder/recovery-layer.sh || \
+                echo "warning: recovery layer deployment failed (non-fatal)" >&2
+        fi
         ;;
     triggered)
         # Activated whenever another package modifies one of the paths

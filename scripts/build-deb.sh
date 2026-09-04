@@ -145,6 +145,18 @@ install -m 0644 debian/onvif-recorder-autoupdate.timer     "$STAGE/lib/systemd/s
 # install or upgrade restores it.
 #
 # Deliberately NOT a conffile: we want every upgrade to refresh it.
+# Recovery layer.
+#
+# Firmware upgrades wipe /usr and /lib, so the package cannot protect itself.
+# recovery-layer.sh writes a bootstrap onto /data + /etc/cron.d (both of which
+# survive) and postinst runs it on every install.  Previously only the curl
+# bootstrap deployed this, so anyone who installed straight from apt had no
+# recovery at all and lost the package on every UniFi OS update (issue #51).
+# install.sh is shipped alongside it because boot-restore re-runs it to
+# reinstall after a wipe, when there is no network-independent alternative.
+install -m 0755 debian/recovery-layer.sh "$STAGE/usr/share/onvif-recorder/recovery-layer.sh"
+install -m 0755 gh-pages/install.sh      "$STAGE/usr/share/onvif-recorder/install.sh"
+
 KEYRING_ASC="debian/onvif-recorder-archive-keyring.asc"
 KEYRING_OUT="$STAGE/usr/share/keyrings/onvif-recorder-archive-keyring.gpg"
 KEYRING_FPR="A6942147E241DE2A864BCE6B5D0BA3CBC12AD2A2"
