@@ -1594,6 +1594,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     bool        snap_via_protect = false;
     std::string hook_url;
     int         hook_timeout_ms = 0;
+    // Last thumbnail id MSR stored for this camera and when; lets a merged
+    // detection reuse its event's thumbnail when the hook is on.
+    std::string last_msr_id;
+    uint64_t    last_msr_age_ms = 0;
     std::string protect_url_copy;
     onvif::ProtectUserIdProvider* protect_user_id_provider_copy = nullptr;
     {
@@ -1702,6 +1706,14 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           }
         }
       }
+      if (!hook_url.empty() && !cam_mac.empty()) {
+        auto bit = msr_burst_cache_.find(cam_mac);
+        if (bit != msr_burst_cache_.end()) {
+          last_msr_id = bit->second.id;
+          last_msr_age_ms = util::now_ms() > bit->second.ts_ms
+                                ? util::now_ms() - bit->second.ts_ms : 0;
+        }
+      }
     }
 
     // 2. Compute timestamps and IDs (no lock -- needs ip_to_mac_ which is read-only).
@@ -1732,6 +1744,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     std::vector<unsigned char> snapshot;
     // Uncropped copy for the thumbnail hook (only kept when it is on).
     std::vector<unsigned char> full_frame;
+    bool hook_supplied = false;
     // Did NanoDet-M actually produce a class for this event?  Tracked out
     // here because the --drop_unclassified_motion decision must not depend
     // on whether a snapshot happened to arrive (see below).
@@ -1861,7 +1874,20 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         LOG(INFO) << '[' << ev.camera_ip << "] thumbnail hook returned "
                   << hooked.size() << " bytes in " << ms << " ms";
         snapshot = std::move(hooked);
+        hook_supplied = true;
       }
+    }
+    // With the hook on, a detection merged into an existing event does not
+    // forward its own full frame: MSR rejects many full-size third-party
+    // frames, and a run of rejections suspends MSR forwarding (and can trip
+    // the wedge healer), which then drops the hook's thumbnails for the next
+    // events too.  The merge reuses the thumbnail its event already stored.
+    if (!hook_url.empty() && !hook_supplied && !coalesced_event_id.empty() &&
+        !snapshot.empty()) {
+      constexpr uint64_t kReuseWindowMs = 120000;
+      if (!last_msr_id.empty() && last_msr_age_ms <= kReuseWindowMs)
+        thumb_id = last_msr_id;
+      snapshot.clear();
     }
 
     // 3b. Forward the cropped JPEG to MSR when configured.  MSR persists it as
