@@ -230,3 +230,5 @@ ExecStart=/usr/bin/onvif-recorder \
 | `--state_dir` | `/var/lib/onvif-recorder` | Directory for persistent runtime state (cached user IDs, etc). |
 | `--channel_file` | `/etc/onvif-recorder/channel` | Path to the apt channel file (`stable` / `rc` / `early-access`). |
 | `--msr_url` | `http://127.0.0.1:7700` | URL of the local MSR gRPC service that stores thumbnails as native UBV.  Empty disables MSR forwarding. |
+| `--thumbnail_hook_url` | _(empty = off)_ | URL to `POST` each recorded detection's full-frame JPEG to, once per new event (after `--drop_unclassified_motion`). Headers: `X-Camera-Ip`, `X-Camera-Mac`, `X-Object-Type`, `X-Event-Id`, `X-Event-Ts-Ms`. A `200` answer with a JPEG body becomes the event thumbnail; any other answer, an error or a timeout falls back to the built-in thumbnail. |
+| `--thumbnail_hook_timeout_sec` | `20` | Maximum seconds to wait for `--thumbnail_hook_url`. Only that camera's worker thread waits. |

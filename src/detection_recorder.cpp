@@ -427,6 +427,62 @@ static std::vector<unsigned char> fetch_snapshot(const std::string& url,
   return buf;
 }
 
+// POST @p jpeg to the external thumbnail hook and return the JPEG it
+// answers with, or empty on any failure (timeout, non-200, not a JPEG).
+// Context travels as X-* headers so the hook can tell cameras apart.
+static std::vector<unsigned char> call_thumbnail_hook(
+    const std::string& url, const std::vector<unsigned char>& jpeg,
+    const std::string& camera_ip, const std::string& camera_mac,
+    const std::string& object_type, const std::string& event_id,
+    uint64_t ts_ms, int timeout_ms) {
+  std::vector<unsigned char> out;
+  CURL* curl = curl_easy_init();
+  if (!curl) return out;
+  struct curl_slist* hdrs = nullptr;
+  const std::string h_ip   = "X-Camera-Ip: " + camera_ip;
+  const std::string h_mac  = "X-Camera-Mac: " + camera_mac;
+  const std::string h_type = "X-Object-Type: " + object_type;
+  const std::string h_ev   = "X-Event-Id: " + event_id;
+  const std::string h_ts   = "X-Event-Ts-Ms: " + std::to_string(ts_ms);
+  hdrs = curl_slist_append(hdrs, "Content-Type: image/jpeg");
+  hdrs = curl_slist_append(hdrs, "Expect:");
+  hdrs = curl_slist_append(hdrs, h_ip.c_str());
+  hdrs = curl_slist_append(hdrs, h_mac.c_str());
+  hdrs = curl_slist_append(hdrs, h_type.c_str());
+  hdrs = curl_slist_append(hdrs, h_ev.c_str());
+  hdrs = curl_slist_append(hdrs, h_ts.c_str());
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+  curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jpeg.data());
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
+                   static_cast<curl_off_t>(jpeg.size()));
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
+                   static_cast<long>(timeout_ms));  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+  const CURLcode rc = curl_easy_perform(curl);
+  long http_code = 0;  // NOLINT(runtime/int)
+  if (rc == CURLE_OK)
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  curl_slist_free_all(hdrs);
+  curl_easy_cleanup(curl);
+  if (rc != CURLE_OK) {
+    LOG(WARNING) << '[' << camera_ip << "] thumbnail hook error: "
+                 << curl_easy_strerror(rc);
+    return {};
+  }
+  if (http_code != 200 || out.size() < 4 || out[0] != 0xFF || out[1] != 0xD8) {
+    LOG(INFO) << '[' << camera_ip << "] thumbnail hook declined (HTTP "
+              << http_code << ", " << out.size() << " bytes); using the "
+              << "built-in thumbnail";
+    return {};
+  }
+  return out;
+}
+
 // JPEG error manager for header-only dimension reads.
 struct JpegDimErr {
   jpeg_error_mgr base;  // must be first
@@ -1536,6 +1592,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     std::string coalesced_event_id;
     // Snapshot-source routing captured under the lock (see below).
     bool        snap_via_protect = false;
+    std::string hook_url;
+    int         hook_timeout_ms = 0;
     std::string protect_url_copy;
     onvif::ProtectUserIdProvider* protect_user_id_provider_copy = nullptr;
     {
@@ -1626,6 +1684,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       msr_burst_window_ms = msr_burst_window_ms_;
       snap_via_protect =
           camera_snapshot_via_protect_.count(ev.camera_ip) > 0;
+      hook_url        = thumbnail_hook_url_;
+      hook_timeout_ms = thumbnail_hook_timeout_ms_;
       protect_url_copy = protect_url_;
       protect_user_id_provider_copy = protect_user_id_provider_;
       // Probe the burst cache while we still hold the lock.  We can't
@@ -1670,6 +1730,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     //     requests while RTSP is active (issue #34, field-observed).
     //     Falls back to the direct path if Protect can't serve it.
     std::vector<unsigned char> snapshot;
+    // Uncropped copy for the thumbnail hook (only kept when it is on).
+    std::vector<unsigned char> full_frame;
     // Did NanoDet-M actually produce a class for this event?  Tracked out
     // here because the --drop_unclassified_motion decision must not depend
     // on whether a snapshot happened to arrive (see below).
@@ -1701,6 +1763,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         LOG(INFO) << '[' << ev.camera_ip << "] snapshot fetched: "
                   << snapshot.size() << " bytes";
         stats_snapshots_.fetch_add(1);
+        if (!hook_url.empty() && coalesced_event_id.empty())
+          full_frame = snapshot;
       }
       // Crop snapshot.
       //   default (no detector):  ONVIF bbox → crop; no bbox → full image
@@ -1780,6 +1844,24 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
                 << "] dropping unclassified motion event "
                    "(--drop_unclassified_motion)";
       return;
+    }
+
+    // 3a. External thumbnail hook: hand the full frame to a better
+    // detector / cropper and use what it returns.  Only for detections
+    // that will be recorded, and only for the first detection of an
+    // event (coalesced merges keep the event's thumbnail).
+    if (!hook_url.empty() && !full_frame.empty()) {
+      const auto t0 = std::chrono::steady_clock::now();
+      auto hooked = call_thumbnail_hook(hook_url, full_frame, ev.camera_ip,
+                                        cam_mac, obj_type, event_id, ts_ms,
+                                        hook_timeout_ms);
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (!hooked.empty()) {
+        LOG(INFO) << '[' << ev.camera_ip << "] thumbnail hook returned "
+                  << hooked.size() << " bytes in " << ms << " ms";
+        snapshot = std::move(hooked);
+      }
     }
 
     // 3b. Forward the cropped JPEG to MSR when configured.  MSR persists it as
@@ -2173,6 +2255,13 @@ void DetectionRecorder::set_camera_snapshot_via_protect(
     const std::string& camera_ip) {
   absl::MutexLock lk(&mu_);
   camera_snapshot_via_protect_.insert(camera_ip);
+}
+
+void DetectionRecorder::set_thumbnail_hook(const std::string& url,
+                                           int timeout_ms) {
+  absl::MutexLock lk(&mu_);
+  thumbnail_hook_url_        = url;
+  thumbnail_hook_timeout_ms_ = timeout_ms > 0 ? timeout_ms : 20000;
 }
 
 }  // namespace onvif

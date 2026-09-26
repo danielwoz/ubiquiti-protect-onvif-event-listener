@@ -215,6 +215,7 @@ cc_test(
     env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},
     data = [
         "//test:tsan_suppressions",
+        "testdata/security_cam_vehicle.jpg",
         "testdata/snapshot_108.jpg",
         "testdata/snapshot_109.jpg",
     ],

@@ -314,6 +314,15 @@ class DetectionRecorder {
   /// additional HTTP session is opened against the camera.
   void set_camera_snapshot_via_protect(const std::string& camera_ip);
 
+  /// POST the full-frame snapshot of every detection that will be
+  /// recorded (after --drop_unclassified_motion) to @p url and, if it
+  /// answers 200 with a JPEG within @p timeout_ms, store that image as
+  /// the event thumbnail instead of the built-in crop.  Lets an external
+  /// service (e.g. a better person detector or an LLM) produce the
+  /// Protect preview.  Empty @p url disables the hook.  Any failure,
+  /// timeout or non-200 answer falls back to the normal thumbnail path.
+  void set_thumbnail_hook(const std::string& url, int timeout_ms);
+
   /// Test observability — number of times MSR was actually contacted
   /// vs. how many events triggered an MSR-eligible path.  Reset by the
   /// hourly aggregate emitter.
@@ -619,6 +628,10 @@ class DetectionRecorder {
   // /api/cameras/<id>/snapshot?ts=<ms> endpoint.  Useful for cameras with
   // strict concurrent-HTTP-session limits (Amcrest / Dahua firmwares).
   std::set<std::string> camera_snapshot_via_protect_;
+
+  // External thumbnail hook (set_thumbnail_hook()); empty = disabled.
+  std::string thumbnail_hook_url_;
+  int thumbnail_hook_timeout_ms_{20000};
 
   // Protect API base + X-UserId provider, plumbed via
   // set_protect_snapshot_source(); required whenever

@@ -160,6 +160,14 @@ const std::vector<Entry>& Schema() {
      "e.g. 192.168.1.107=/cgi-bin/snapshot.cgi.  Useful when the "
      "ONVIF-advertised snapshotUrl is wrong (common on Dahua, issue #32).",
      "Cameras"},
+    {"thumbnail_hook_url", Type::String,
+     "URL that receives each recorded detection's full-frame JPEG and "
+     "may answer with a better thumbnail (200 + JPEG).  Empty disables.",
+     "Cameras"},
+    {"thumbnail_hook_timeout_sec", Type::Int,
+     "Seconds to wait for thumbnail_hook_url before using the built-in "
+     "thumbnail.",
+     "Cameras"},
     {"camera_snapshot_via_protect", Type::String,
      "Comma-separated list of camera IPs whose thumbnails should be "
      "fetched via Protect's own snapshot API instead of a direct HTTP "
