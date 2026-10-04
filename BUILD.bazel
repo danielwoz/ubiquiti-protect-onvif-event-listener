@@ -157,7 +157,30 @@ cc_library(
     srcs = ["src/cpu_profiler.cpp"],
     hdrs = ["src/cpu_profiler.hpp"],
     strip_include_prefix = "src",
-    linkopts = ["-lrt"],  # timer_create / timer_settime / timer_delete
+    # timer_create / timer_settime / timer_delete.
+    #
+    # MUST be linked dynamically on arm64.  The cross-compile wrapper wraps
+    # every link arg in `-Wl,-Bstatic ... -Wl,-Bdynamic`, so a bare -lrt
+    # resolves to librt.a from the glibc-2.31 sysroot.  That archive
+    # references glibc internals -- __pthread_get_minstack, __pthread_unwind,
+    # __libc_fatal -- which bind to the GLIBC_PRIVATE version.  glibc 2.34
+    # merged librt/libpthread into libc and the stubs no longer export those,
+    # so the binary dies at exec on any newer OS with
+    #   libpthread.so.0: version `GLIBC_PRIVATE' not found
+    # (UniFi OS 6.x is Debian 13, glibc 2.41.)
+    #
+    # Flipping to -Bdynamic makes it a NEEDED librt.so.1 instead, with no
+    # private symbols dragged in.  librt.so.1 still ships as a compat stub on
+    # modern glibc, so the binary runs on both old and new.  The trailing
+    # -Bstatic restores the wrapper's default for anything linked after.
+    linkopts = select({
+        "@platforms//cpu:aarch64": [
+            "-Wl,-Bdynamic",
+            "-lrt",
+            "-Wl,-Bstatic",
+        ],
+        "//conditions:default": ["-lrt"],
+    }),
     deps = [
         "@com_google_absl//absl/log:log",
     ],
