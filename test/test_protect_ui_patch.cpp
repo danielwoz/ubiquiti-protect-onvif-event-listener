@@ -237,27 +237,37 @@ static void test_ambiguous_anchor_skipped() {
   std::remove((path + ".bak").c_str());
 }
 
-// Patches written for pre-7.0.57 bundles must not run on newer Protect,
-// where the same expression is the microphone capability check.
-static void test_version_gate() {
+// Patch 2 targets the automation camera-list filter.  Protect 7.2+ reuses
+// the bare expression for the microphone capability check, which must be
+// left alone; the filter itself is patched wherever it still exists.
+static void test_patch2_targets_automation_filter() {
   std::string dir = temp_dir();
-  std::string path = dir + "/test_gate.js";
+  std::string path = dir + "/test_patch2.js";
   std::remove(path.c_str());
 
-  std::string content = "eqy=e=>";
-  content += kUiPatch2.original;
-  content += "?!!e.thirdPartyCameraInfo?.enableRtspAudio:e.featureFlags.hasMic";
-  write_test_file(path, content);
+  const std::string mic =
+      "oxe=e=>e.isThirdPartyCamera&&!e.isPairedWithAiPort?"
+      "!!e.thirdPartyCameraInfo?.enableRtspAudio:e.featureFlags.hasMic,";
+  const std::string filter =
+      "LH=(e,t,n)=>!(t&&e.nvrMac!==n||e.isThirdPartyCamera&&"
+      "!e.isPairedWithAiPort),";
+  write_test_file(path, mic + filter);
 
   std::unordered_map<std::string, std::string> empty_md5;
-  const onvif::protect_version::Version v7370 = {7, 3, 70};
-  int n = apply_patches(path, kUiPatches, kUiPatchCount, empty_md5, &v7370);
-  check(n == 0, "gate: pre-7.0.57 patch not applied on 7.3.70");
-  check(read_test_file(path) == content, "gate: file unchanged on 7.3.70");
+  int n = apply_patches(path, kUiPatches, kUiPatchCount, empty_md5);
+  check(n == 1, "patch2: one replacement");
+  const std::string out = read_test_file(path);
+  check(out.find(mic) == 0, "patch2: microphone check untouched");
+  check(out.find("e.nvrMac!==n||!1/*ThirdPartyCamera&&!isPairedWithAiPort*/)")
+            != std::string::npos,
+        "patch2: automation filter patched");
 
-  const onvif::protect_version::Version v7050 = {7, 0, 50};
-  n = apply_patches(path, kUiPatches, kUiPatchCount, empty_md5, &v7050);
-  check(n == 1, "gate: pre-7.0.57 patch applied on 7.0.50");
+  // On a bundle with only the microphone check (Protect 7.3), nothing
+  // changes.
+  write_test_file(path, mic);
+  check(apply_patches(path, kUiPatches, kUiPatchCount, empty_md5) == 0,
+        "patch2: mic-only bundle left alone");
+  check(read_test_file(path) == mic, "patch2: mic-only file unchanged");
 
   std::remove(path.c_str());
   std::remove((path + ".bak").c_str());
@@ -494,7 +504,7 @@ int main() {
   test_missing_file();
   test_backend_patch();
   test_ambiguous_anchor_skipped();
-  test_version_gate();
+  test_patch2_targets_automation_filter();
   test_rebuild_from_pristine_bak();
   test_dpkg_backup_logic();
   test_partial_patch();

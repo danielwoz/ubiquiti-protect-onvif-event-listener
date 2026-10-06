@@ -20,7 +20,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -46,8 +45,10 @@ namespace protect_ui {
 // text between the single occurrence of `region_begin` and the next
 // `region_end` after it (or end of file).
 //
-// `below` optionally restricts the patch to Protect versions strictly
-// lower than the given one.
+// Patches are selected by matching code shape, not by Protect version:
+// the UI bundle version (swai-7.0.57.js) differs from the package version
+// (7.0.107), and a pattern can survive across many releases.  Checked
+// against Protect 6.2.88, 7.0.88, 7.0.107, 7.1.87, 7.2.105 and 7.3.70.
 // ---------------------------------------------------------------
 struct Patch {
   const char* original;
@@ -55,29 +56,30 @@ struct Patch {
   size_t len;
   const char* region_begin = nullptr;
   const char* region_end = nullptr;
-  onvif::protect_version::Version below = {0, 0, 0};
 };
 
 // --- Frontend patches (swai*.js, vantage*.js) ---
 
-// 1a. Camera picker filter (pre-7.0.57): always pass third-party cameras.
+// 1a. Camera picker filter (Protect 6.x - 7.0.x): always pass third-party
+// cameras.
 static const Patch kUiPatch1a = {
 "!e.isThirdPartyCamera||e.isPairedWithAiPort",
-"!0/*sThirdPartyCamera||isPairedWithAiPort*/", 43,
-nullptr, nullptr, {7, 0, 57}};
+"!0/*sThirdPartyCamera||isPairedWithAiPort*/", 43};
 
-// 1b. Camera picker filter (7.0.57+): new exclusion filter. (40 bytes)
+// 1b. Camera picker filter (UI bundle 7.0.57, shipped in Protect 7.0.107):
+// new exclusion filter. (40 bytes)
 static const Patch kUiPatch1b = {
 "!e.isThirdPartyCamera&&!v.includes(e.id)",
 "!0/*hirdPartyCamera&&!v.includes(e.id)*/", 40};
 
-// 2. Automation camera list negated filter (pre-7.0.57). (43 bytes)
-// Later bundles use the same expression for the microphone capability
-// check and the ONVIF profile settings form, so it must not run there.
+// 2. Automation camera list filter
+//    !(… e.nvrMac!==… || e.isThirdPartyCamera&&!e.isPairedWithAiPort)
+// (Protect 6.x - 7.2.x; gone in 7.3).  Anchored on the surrounding "||" and
+// ")" because later bundles use the bare expression for the microphone
+// capability check and the ONVIF profile settings form. (46 bytes)
 static const Patch kUiPatch2 = {
-"e.isThirdPartyCamera&&!e.isPairedWithAiPort",
-"!1/*ThirdPartyCamera&&!isPairedWithAiPort*/", 43,
-nullptr, nullptr, {7, 0, 57}};
+"||e.isThirdPartyCamera&&!e.isPairedWithAiPort)",
+"||!1/*ThirdPartyCamera&&!isPairedWithAiPort*/)", 46};
 
 // 3. hasFullFeatureSet getter: always true. (55 bytes)
 static const Patch kUiPatch3 = {
@@ -239,12 +241,7 @@ static bool resolve_region(const std::string& content, const Patch& p,
 enum class PatchState { kApply, kAlreadyApplied, kNotApplicable, kAmbiguous };
 
 static PatchState classify_patch(const std::string& content, const Patch& p,
-                                 const onvif::protect_version::Version* ver,
                                  size_t* pos) {
-  const onvif::protect_version::Version none = {0, 0, 0};
-  if (ver != nullptr && !(p.below == none) && !(*ver < p.below)) {
-    return PatchState::kNotApplicable;
-  }
   size_t begin = 0;
   size_t end = 0;
   if (!resolve_region(content, p, &begin, &end)) {
@@ -281,8 +278,7 @@ static bool file_md5_is(const std::string& path, const std::string& md5) {
 // ---------------------------------------------------------------
 static int apply_patches(
     const std::string& path, const Patch* patches, size_t count,
-    const std::unordered_map<std::string, std::string>& md5sums,
-    const onvif::protect_version::Version* ver = nullptr) {
+    const std::unordered_map<std::string, std::string>& md5sums) {
   const std::string live = read_file(path);
   if (live.empty()) return -1;
 
@@ -304,7 +300,7 @@ static int apply_patches(
   for (size_t i = 0; i < count; ++i) {
     const Patch& p = patches[i];
     size_t pos = 0;
-    switch (classify_patch(result, p, ver, &pos)) {
+    switch (classify_patch(result, p, &pos)) {
       case PatchState::kApply:
         result.replace(pos, p.len, p.replacement);
         ++applied;
@@ -357,7 +353,6 @@ absl::Status patch_alarm_picker() {
   // Log the detected Protect firmware so a journal capture from a user
   // running a brand-new firmware makes the version visible up-front.
   // Fast popen path; failure is silent (we still proceed with patching).
-  std::optional<onvif::protect_version::Version> detected;
   {
     std::string ver;
     FILE* p = popen("dpkg-query -W -f='${Version}' "
@@ -377,7 +372,6 @@ absl::Status patch_alarm_picker() {
       // Publish the version so live writers (detection_recorder,
       // motion_poller) can gate on it via IsAtLeast(7, 1, 0).
       if (auto v = onvif::protect_version::Parse(ver)) {
-        detected = v;
         onvif::protect_version::SetCurrent(*v);
         LOG(INFO) << "[ui_patch] protect_version published: "
                   << v->major << "." << v->minor << "." << v->patch;
@@ -394,8 +388,7 @@ absl::Status patch_alarm_picker() {
   // Patch all swai*.js and vantage*.js variants (versioned and unversioned).
   for (const char* prefix : {"swai", "vantage"}) {
     for (const auto& path : find_ui_files(kUiDir, prefix)) {
-      int n = apply_patches(path, kUiPatches, kUiPatchCount, md5sums,
-                            detected ? &*detected : nullptr);
+      int n = apply_patches(path, kUiPatches, kUiPatchCount, md5sums);
       if (n >= 0) {
         ++files_found;
         total += n;
@@ -406,7 +399,7 @@ absl::Status patch_alarm_picker() {
   // Patch service.js (backend scope filter).
   {
     int n = apply_patches(kServicePath, kBackendPatches, kBackendPatchCount,
-                          md5sums, detected ? &*detected : nullptr);
+                          md5sums);
     if (n >= 0) {
       ++files_found;
       total += n;
