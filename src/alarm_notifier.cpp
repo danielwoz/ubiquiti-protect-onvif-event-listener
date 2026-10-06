@@ -567,7 +567,14 @@ std::string AlarmNotifier::build_notify_payload(
   p +=   ",\"device\":";           p += json_str(camera_db_id);
   p +=   ",\"eventId\":";          p += json_str(event_id);
   p +=   ",\"timestamp\":";        p += ts_buf;
-  p +=   ",\"sourceEvent\":{\"cameraId\":"; p += json_str(camera_db_id); p += "}";
+  // sourceEvent lets Protect build the notification (and thumbnail) without
+  // looking the event up.  7.1/7.2 read `camera ?? cameraId`; 7.3 validates
+  // it against automationSourceEventSchema, which requires `type`.
+  p +=   ",\"sourceEvent\":{\"type\":\"smartDetectZone\"";
+  p +=     ",\"camera\":";        p += json_str(camera_db_id);
+  p +=     ",\"cameraId\":";      p += json_str(camera_db_id);
+  p +=     ",\"start\":";         p += ts_buf;
+  p +=     ",\"smartDetectTypes\":["; p += json_str(event_key); p += "]}";
   p += "},\"allEvents\":[{";
   p +=   "\"key\":";               p += json_str(event_key);
   p +=   ",\"device\":";           p += json_str(camera_db_id);

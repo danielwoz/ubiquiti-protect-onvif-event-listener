@@ -2829,6 +2829,13 @@ static void test_uos_notify_payload_and_retry() {
             "UOS: notify body must name the automation");
       CHECK(b.find("sourceEvent") != std::string::npos,
             "UOS: notify body must carry sourceEvent for thumbnail lookup");
+      // Protect 7.3 rejects a sourceEvent without `type`, and resolves
+      // the camera from `camera`.
+      CHECK(b.find("\"sourceEvent\":{\"type\":\"smartDetectZone\"") !=
+                std::string::npos,
+            "UOS: sourceEvent must carry type (required by Protect 7.3)");
+      CHECK(b.find("\"smartDetectTypes\":[\"person\"]") != std::string::npos,
+            "UOS: sourceEvent must carry the smart detect type");
       CHECK(b.find("test-user-id") != std::string::npos,
             "UOS: notify body must address a receiver");
     }
