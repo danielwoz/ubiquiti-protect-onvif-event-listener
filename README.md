@@ -154,11 +154,27 @@ systemctl stop onvif-recorder
 ```
 
 **Camera went offline and did not reconnect?** The recorder automatically retries.
-After 3 consecutive failures it pauses for up to 1 hour, then resumes. If a camera
-reboot takes longer than expected, restart the service:
+After a run of failures it backs off, starting at 30 s and doubling up to 5 minutes,
+and resets once a subscription succeeds. If a camera still does not come back,
+restart the service:
 ```bash
 systemctl restart onvif-recorder
 ```
+
+**How many ONVIF subscribers should a camera show?** Two is expected: Protect keeps
+its own event subscription per camera, and onvif-recorder holds the second. A third
+can appear briefly while either side re-subscribes, until the old one times out
+(about 60 s). Some cameras have too few subscription slots for both clients; they
+reject one with errors such as `ter:BlockedThreadUpperLimit`, and Protect then
+shows motion detection as misconfigured for that camera.
+
+**Duplicate motion and "person" events?** From Protect 7.2, Protect subscribes to a
+third-party camera's ONVIF motion itself and creates the basic motion events.
+onvif-recorder never writes plain motion events, but by default it records motion
+it cannot classify as a smart detection of `default_object_type` (person). On
+Protect 7.2+ set `drop_unclassified_motion` to true (admin page, Detection) and
+leave motion detection on in Protect. Cameras for which Protect shows motion
+detection as misconfigured get no basic motion events with that setting.
 
 ---
 
