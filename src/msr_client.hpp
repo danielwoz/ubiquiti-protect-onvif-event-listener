@@ -50,6 +50,26 @@ class MsrClient {
   std::string StoreSnapshot(const std::string& mac,
                             const void* jpeg, std::size_t jpeg_len);
 
+  // Why a StoreSnapshot call did or did not return an id.
+  enum class Outcome {
+    kOk,
+    kSkipped,    // bad arguments, or suspended and still cooling down
+    kTransport,  // curl / HTTP / framing failure
+    kGrpc,       // MSR answered with a non-zero grpc-status
+    kRejected,   // MSR answered OK but stored nothing for this camera
+                 // (e.g. it is not recording it); MSR itself is healthy
+  };
+
+  // As above, reporting the outcome.  kRejected does not count towards
+  // suspension: one camera MSR will not record must not pause forwarding
+  // for every other camera.
+  std::string StoreSnapshot(const std::string& mac,
+                            const void* jpeg, std::size_t jpeg_len,
+                            Outcome* outcome);
+
+  // Value a PerformFn returns to simulate kRejected.
+  static constexpr const char* kRejectedForTesting = "\x01rejected";
+
   // When true, only one StoreSnapshot call may execute at a time across
   // all threads; concurrent callers block on a mutex.  Default false
   // (backwards-compatible: every caller runs concurrently).

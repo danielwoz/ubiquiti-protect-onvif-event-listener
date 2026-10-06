@@ -251,6 +251,16 @@ std::int64_t monotonic_ms() {
 std::string MsrClient::StoreSnapshot(const std::string& mac,
                                      const void* jpeg,
                                      std::size_t jpeg_len) {
+  return StoreSnapshot(mac, jpeg, jpeg_len, nullptr);
+}
+
+std::string MsrClient::StoreSnapshot(const std::string& mac,
+                                     const void* jpeg,
+                                     std::size_t jpeg_len,
+                                     Outcome* outcome) {
+  Outcome dummy;
+  Outcome& out = outcome ? *outcome : dummy;
+  out = Outcome::kSkipped;
   if (url_.empty() || mac.empty() || jpeg == nullptr || jpeg_len == 0) {
     return "";
   }
@@ -287,7 +297,12 @@ std::string MsrClient::StoreSnapshot(const std::string& mac,
         mac,
         std::string(static_cast<const char*>(jpeg), jpeg_len));
     constexpr int kSuspendThreshold = 5;
+    if (id == kRejectedForTesting) {
+      out = Outcome::kRejected;
+      return "";
+    }
     if (id.empty()) {
+      out = Outcome::kTransport;
       last_failure_ms_.store(clock_fn_ ? clock_fn_() : monotonic_ms());
       int n = consecutive_failures_.fetch_add(1) + 1;
       if (n == kSuspendThreshold && !suspended_.exchange(true)) {
@@ -302,6 +317,7 @@ std::string MsrClient::StoreSnapshot(const std::string& mac,
     } else if (!seen_first_success_.exchange(true)) {
       LOG(INFO) << "[msr] connected to " << url_;
     }
+    out = Outcome::kOk;
     return id;
   }
 
@@ -319,6 +335,7 @@ std::string MsrClient::StoreSnapshot(const std::string& mac,
   framed.push_back(static_cast<char>(n & 0xffU));
   framed.append(body);
 
+  out = Outcome::kTransport;
   CURL* curl = curl_easy_init();
   if (!curl) return "";
 
@@ -381,6 +398,7 @@ std::string MsrClient::StoreSnapshot(const std::string& mac,
     return "";
   }
   if (ctx.grpc_status != 0) {
+    out = Outcome::kGrpc;
     LOG(WARNING) << "MSR StoreSnapshots gRPC error: status="
                  << ctx.grpc_status << " msg=" << ctx.grpc_message;
     note_failure();
@@ -398,12 +416,15 @@ std::string MsrClient::StoreSnapshot(const std::string& mac,
   std::size_t msg_len = ctx.body.size() - 5;
   std::string id = msr_client_internal::parse_store_response(msg, msg_len);
   if (id.empty()) {
-    LOG(WARNING) << "MSR StoreSnapshots: response parse returned no id ("
-                 << msg_len << " bytes)";
-    note_failure();
+    // A well-formed reply without an id: MSR is up but stored nothing for
+    // this camera, typically because it is not recording it.
+    out = Outcome::kRejected;
+    LOG(WARNING) << "MSR StoreSnapshots: no snapshot stored for " << mac
+                 << " (" << msg_len << " byte reply)";
     return "";
   }
   note_success();
+  out = Outcome::kOk;
   return id;
 }
 

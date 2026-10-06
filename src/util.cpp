@@ -85,6 +85,20 @@ std::string generate_uuid() {
   return buf;
 }
 
+std::string host_without_port(const std::string& host_port) {
+  if (!host_port.empty() && host_port[0] == '[') {
+    const size_t close = host_port.find(']');
+    if (close != std::string::npos) return host_port.substr(1, close - 1);
+    return host_port;
+  }
+  const size_t colon = host_port.find(':');
+  if (colon == std::string::npos ||
+      host_port.find(':', colon + 1) != std::string::npos) {
+    return host_port;
+  }
+  return host_port.substr(0, colon);
+}
+
 std::string generate_24hex_id() {
   static std::random_device rd;
   thread_local std::mt19937_64 gen(rd());
