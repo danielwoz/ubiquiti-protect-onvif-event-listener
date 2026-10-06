@@ -372,6 +372,12 @@ ABSL_FLAG(bool, auto_heal_protect, true,
     "restarts per 24 h. Every restart is logged at ERROR level and "
     "surfaced on the admin page's Recent errors card. Set to false to "
     "disable and rely on the user to restart Protect manually.");
+ABSL_FLAG(bool, trigger_automations, true,
+    "Trigger Protect automations (push notifications, chimes, sirens) for "
+    "detections from third-party cameras and for first-party motion "
+    "classified by onvif-recorder.  Set to false to record events "
+    "without notifying; automations for Protect's own detections are "
+    "unaffected.");
 ABSL_FLAG(bool, notify_via_uos, true,
     "Send Protect automation notifications through the UOS external "
     "automation manager instead of the legacy /api/automations/<id>/run "
@@ -1185,7 +1191,10 @@ int main(int argc, char* argv[]) {
   // AlarmNotifier: triggers Protect automations (e.g. chime play) on
   // detections.  user-id was discovered earlier (above admin_server.start).
   std::unique_ptr<onvif::AlarmNotifier> alarm_notifier;
-  if (!protect_user_id_provider.empty()) {
+  if (!absl::GetFlag(FLAGS_trigger_automations)) {
+    LOG(WARNING) << "[alarm] --trigger_automations=false: detections are "
+                    "recorded but no Protect automations are triggered";
+  } else if (!protect_user_id_provider.empty()) {
     alarm_notifier = std::make_unique<onvif::AlarmNotifier>(
         absl::GetFlag(FLAGS_protect_url), &protect_user_id_provider, db_conn);
     alarm_notifier->set_notify_via_uos(absl::GetFlag(FLAGS_notify_via_uos));

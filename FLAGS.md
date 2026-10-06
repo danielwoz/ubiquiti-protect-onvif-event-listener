@@ -238,6 +238,7 @@ ExecStart=/usr/bin/onvif-recorder \
 | `--pre_buffer_sec` | `2` | Seconds before the first detection to mark as clip start. |
 | `--post_buffer_sec` | `2` | Seconds after the last detection to mark as clip end. |
 | `--coalesce_window_sec` | `30` | Merge consecutive detections within this window into one event. `0` to disable. |
+| `--trigger_automations` | `true` | Trigger Protect automations (push notifications, chimes, sirens) for detections onvif-recorder records. Set to `false` to keep recording events without notifying. Automations for Protect's own detections (e.g. a UniFi doorbell) are unaffected. |
 | `--drop_unclassified_motion` | `false` | Drop generic motion events (CellMotionDetector / MotionAlarm) that carry no ONVIF object class and that NanoDet-M cannot classify, instead of recording them as `--default_object_type`. Real camera AI events (Person / Vehicle / Pet), `--camera_object_types` overrides and momentary topics such as line crossing are unaffected. Cuts false-positive clutter from AI cameras (e.g. Reolink) that also emit noisy basic-motion events. Recommended on Protect 7.2+, which creates basic motion events for third-party cameras itself; with it off, unclassified motion appears twice (Protect's motion event plus a `person` smart detection). |
 | `--max_events_per_hour` | `10` | Maximum new events per camera per hour. `0` for unlimited. |
 | `--coalesce_history` | `true` | On startup, merge consecutive historical detections within `--coalesce_window_sec`. |

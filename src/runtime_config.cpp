@@ -49,6 +49,12 @@ const std::vector<Entry>& Schema() {
      "Seconds of padding added after a detection's end time.  Raise it if "
      "clips cut off before the subject has left frame.",
      "Detection"},
+    {"trigger_automations", Type::Bool,
+     "Trigger Protect automations (push notifications, chimes, sirens) for "
+     "detections onvif-recorder records.  Turn off to keep recording "
+     "events without notifying.  Automations for Protect's own "
+     "detections (e.g. a UniFi doorbell) are unaffected.  Default on.",
+     "Detection"},
     {"notify_via_uos", Type::Bool,
      "Send push notifications via Protect's UOS external automation "
      "manager so a thumbnail can be attached.  Requires Protect's Global "

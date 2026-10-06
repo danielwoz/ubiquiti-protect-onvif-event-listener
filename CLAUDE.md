@@ -648,6 +648,7 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--protect_url` | `http://localhost:7080` | Base URL for the local Protect API used to trigger automations on smart detection events. |
 | `--protect_user_id` | _(auto-discovered)_ | X-UserId header for Protect API auth bypass. Auto-discovered from unifi-core DB on first run and cached to `<state_dir>/protect-user-id`. Pass explicitly to override. |
 | `--msr_url` | `http://127.0.0.1:7700` | Base URL for the local UniFi Media Server Recording (MSR) gRPC service. Detection thumbnails are forwarded via `RecordingAPI.StoreSnapshots` so MSR persists them as native UBV files owned by `ms:unifi-streaming`, making third-party thumbnails indistinguishable from first-party. Set to empty string to disable. |
+| `--trigger_automations` | `true` | Trigger Protect automations (push notifications, chimes, sirens) for detections onvif-recorder records. `false` keeps recording without notifying; Protect's own detections are unaffected. |
 | `--patch_alarm_picker` | `true` | Live-patch the Protect UI to allow third-party cameras in the alarm creation picker. Re-applied on every startup so it survives firmware updates. |
 
 Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default is `kError`.
