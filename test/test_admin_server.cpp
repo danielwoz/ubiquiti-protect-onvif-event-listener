@@ -200,6 +200,27 @@ int main() {
   server.stop();
   ::unlink(channel_path.c_str());
 
+  // The thumbnail hook URL's query string (often a token) is redacted in
+  // the diagnostic dump's config.json; other keys are untouched.
+  {
+    const std::string cfg =
+        "{\"detect\":\"true\",\"thumbnail_hook_url\":"
+        "\"https://hook.example/t?token=s3cret&x=1\",\"msr_url\":\"a?b\"}";
+    const std::string out =
+        onvif::redact_url_queries(cfg, {"thumbnail_hook_url"});
+    check(out.find("s3cret") == std::string::npos,
+          "redact_url_queries removes the hook token");
+    check(out.find("\"https://hook.example/t?[REDACTED]\"") !=
+              std::string::npos,
+          "redact_url_queries keeps scheme, host and path");
+    check(out.find("\"msr_url\":\"a?b\"") != std::string::npos,
+          "redact_url_queries leaves other keys alone");
+    check(onvif::redact_url_queries("{\"thumbnail_hook_url\":\"\"}",
+                                    {"thumbnail_hook_url"}) ==
+              "{\"thumbnail_hook_url\":\"\"}",
+          "redact_url_queries handles an empty URL");
+  }
+
   std::cerr << "PASS " << g_pass << " / FAIL " << g_fail << '\n';
   return g_fail == 0 ? 0 : 1;
 }

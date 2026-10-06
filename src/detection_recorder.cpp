@@ -472,6 +472,93 @@ static std::vector<unsigned char> fetch_snapshot(const std::string& url,
   return buf;
 }
 
+// Largest thumbnail-hook response accepted; anything bigger is aborted.
+static constexpr size_t kMaxHookResponseBytes = 4 * 1024 * 1024;
+
+static size_t hook_write_cb(void* data, size_t size, size_t nmemb,
+                            void* userp) {
+  auto* buf = static_cast<std::vector<unsigned char>*>(userp);
+  const size_t n = size * nmemb;
+  if (buf->size() + n > kMaxHookResponseBytes) return 0;  // abort transfer
+  const auto* p = static_cast<const unsigned char*>(data);
+  buf->insert(buf->end(), p, p + n);
+  return n;
+}
+
+static bool jpeg_read_dimensions(const std::vector<unsigned char>& jpeg,
+                                 int* w, int* h);
+
+// POST @p jpeg to the external thumbnail hook and return the JPEG it
+// answers with, or empty on any failure (timeout, non-200, not a JPEG).
+// Context travels as X-* headers so the hook can tell cameras apart.
+static std::vector<unsigned char> call_thumbnail_hook(
+    const std::string& url, const std::vector<unsigned char>& jpeg,
+    const std::string& camera_ip, const std::string& camera_mac,
+    const std::string& object_type, const std::string& event_id,
+    uint64_t ts_ms, int timeout_ms) {
+  std::vector<unsigned char> out;
+  CURL* curl = curl_easy_init();
+  if (!curl) return out;
+  struct curl_slist* hdrs = nullptr;
+  const std::string h_ip   = "X-Camera-Ip: " + camera_ip;
+  const std::string h_mac  = "X-Camera-Mac: " + camera_mac;
+  const std::string h_type = "X-Object-Type: " + object_type;
+  const std::string h_ev   = "X-Event-Id: " + event_id;
+  const std::string h_ts   = "X-Event-Ts-Ms: " + std::to_string(ts_ms);
+  hdrs = curl_slist_append(hdrs, "Content-Type: image/jpeg");
+  hdrs = curl_slist_append(hdrs, "Expect:");
+  hdrs = curl_slist_append(hdrs, h_ip.c_str());
+  hdrs = curl_slist_append(hdrs, h_mac.c_str());
+  hdrs = curl_slist_append(hdrs, h_type.c_str());
+  hdrs = curl_slist_append(hdrs, h_ev.c_str());
+  hdrs = curl_slist_append(hdrs, h_ts.c_str());
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+  curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jpeg.data());
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
+                   static_cast<curl_off_t>(jpeg.size()));
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
+                   static_cast<long>(timeout_ms));  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+#if LIBCURL_VERSION_NUM >= 0x075500  // 7.85.0
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS,
+                   static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS,
+                   static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));  // NOLINT(runtime/int)
+#endif
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, hook_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+  const CURLcode rc = curl_easy_perform(curl);
+  long http_code = 0;  // NOLINT(runtime/int)
+  if (rc == CURLE_OK)
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  curl_slist_free_all(hdrs);
+  curl_easy_cleanup(curl);
+  if (rc != CURLE_OK) {
+    LOG(WARNING) << '[' << camera_ip << "] thumbnail hook error: "
+                 << (rc == CURLE_WRITE_ERROR
+                         ? "response larger than 4 MB"
+                         : curl_easy_strerror(rc));
+    return {};
+  }
+  int w = 0;
+  int h = 0;
+  if (http_code != 200 || out.size() < 4 || out[0] != 0xFF ||
+      out[1] != 0xD8 || !jpeg_read_dimensions(out, &w, &h) || w <= 0 ||
+      h <= 0) {
+    LOG(WARNING) << '[' << camera_ip << "] thumbnail hook declined (HTTP "
+                 << http_code << ", " << out.size() << " bytes); using the "
+                 << "built-in thumbnail";
+    return {};
+  }
+  return out;
+}
+
 // JPEG error manager for header-only dimension reads.
 struct JpegDimErr {
   jpeg_error_mgr base;  // must be first
@@ -1601,6 +1688,12 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     bool momentary_reopen = false;
     // Snapshot-source routing captured under the lock (see below).
     bool        snap_via_protect = false;
+    std::string hook_url;
+    int         hook_timeout_ms = 0;
+    // Last thumbnail id MSR stored for this camera and when; lets a merged
+    // detection reuse its event's thumbnail when the hook is on.
+    std::string last_msr_id;
+    uint64_t    last_msr_age_ms = 0;
     std::string protect_url_copy;
     onvif::ProtectUserIdProvider* protect_user_id_provider_copy = nullptr;
     {
@@ -1701,6 +1794,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       snap_via_protect =
           find_camera_setting(camera_snapshot_via_protect_, ev.camera_ip) !=
           camera_snapshot_via_protect_.end();
+      hook_url        = thumbnail_hook_url_;
+      hook_timeout_ms = thumbnail_hook_timeout_ms_;
       protect_url_copy = protect_url_;
       protect_user_id_provider_copy = protect_user_id_provider_;
       // Probe the burst cache while we still hold the lock.  We can't
@@ -1715,6 +1810,14 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           if (age <= msr_burst_window_ms) {
             burst_cached_id = bit->second.id;
           }
+        }
+      }
+      if (!hook_url.empty() && !cam_mac.empty()) {
+        auto bit = msr_burst_cache_.find(cam_mac);
+        if (bit != msr_burst_cache_.end()) {
+          last_msr_id = bit->second.id;
+          last_msr_age_ms = util::now_ms() > bit->second.ts_ms
+                                ? util::now_ms() - bit->second.ts_ms : 0;
         }
       }
     }
@@ -1745,6 +1848,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     //     requests while RTSP is active (issue #34, field-observed).
     //     Falls back to the direct path if Protect can't serve it.
     std::vector<unsigned char> snapshot;
+    // Uncropped copy for the thumbnail hook (only kept when it is on).
+    std::vector<unsigned char> full_frame;
+    bool hook_supplied = false;
     // Did NanoDet-M actually produce a class for this event?  Tracked out
     // here because the --drop_unclassified_motion decision must not depend
     // on whether a snapshot happened to arrive (see below).
@@ -1785,6 +1891,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         LOG(INFO) << '[' << ev.camera_ip << "] snapshot fetched: "
                   << snapshot.size() << " bytes";
         stats_snapshots_.fetch_add(1);
+        if (!hook_url.empty() && coalesced_event_id.empty())
+          full_frame = snapshot;
       }
       // Crop snapshot.
       //   default (no detector):  ONVIF bbox → crop; no bbox → full image
@@ -1880,6 +1988,44 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
                   << canonical_object_type(obj_type)
                   << " detection (disabled object type)";
         return;
+      }
+    }
+
+    // 3a. External thumbnail hook: hand the full frame to a better
+    // detector / cropper and use what it returns.  Only for detections
+    // that will be recorded, and only for the first detection of an
+    // event (coalesced merges keep the event's thumbnail).
+    // Skipped when MSR burst reuse is about to substitute a cached id,
+    // which would discard whatever the hook returned.
+    if (!hook_url.empty() && !full_frame.empty() &&
+        !(msr && !cam_mac.empty() && !burst_cached_id.empty())) {
+      const auto t0 = std::chrono::steady_clock::now();
+      auto hooked = call_thumbnail_hook(hook_url, full_frame, ev.camera_ip,
+                                        cam_mac, obj_type, event_id, ts_ms,
+                                        hook_timeout_ms);
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (!hooked.empty()) {
+        LOG(INFO) << '[' << ev.camera_ip << "] thumbnail hook returned "
+                  << hooked.size() << " bytes in " << ms << " ms";
+        snapshot = std::move(hooked);
+        hook_supplied = true;
+      }
+    }
+    // With the hook on, a detection merged into an existing event does not
+    // forward its own full frame: MSR rejects many full-size third-party
+    // frames, and a run of rejections suspends MSR forwarding (and can trip
+    // the wedge healer), which then drops the hook's thumbnails for the next
+    // events too.  The merge reuses the thumbnail its event already stored.
+    // Only applies when MSR is in use and actually holds a recent id for
+    // this camera; otherwise the merge keeps its own snapshot, so the DB /
+    // UBV paths never lose a thumbnail.
+    if (!hook_url.empty() && !hook_supplied && !coalesced_event_id.empty() &&
+        !snapshot.empty() && msr && !last_msr_id.empty()) {
+      constexpr uint64_t kReuseWindowMs = 120000;
+      if (last_msr_age_ms <= kReuseWindowMs) {
+        thumb_id = last_msr_id;
+        snapshot.clear();
       }
     }
 
@@ -2333,6 +2479,15 @@ void DetectionRecorder::set_camera_snapshot_via_protect(
     const std::string& camera_ip) {
   absl::MutexLock lk(&mu_);
   camera_snapshot_via_protect_.insert(camera_ip);
+}
+
+void DetectionRecorder::set_thumbnail_hook(const std::string& url,
+                                           int timeout_ms) {
+  absl::MutexLock lk(&mu_);
+  thumbnail_hook_url_        = url;
+  thumbnail_hook_timeout_ms_ =
+      timeout_ms <= 0 ? kDefaultHookTimeoutMs
+                      : std::min(std::max(timeout_ms, 1000), 30000);
 }
 
 }  // namespace onvif

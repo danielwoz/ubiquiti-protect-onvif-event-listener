@@ -27,6 +27,7 @@
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <csignal>
@@ -223,6 +224,17 @@ ABSL_FLAG(std::string, camera_snapshot_urls, "",
     "(common on Dahua, see issue #32).  The path is appended to "
     "http://<camera_ip>/ and authenticated with the camera's username "
     "and password from the Protect cameras table.");
+ABSL_FLAG(std::string, thumbnail_hook_url, "",
+    "URL to POST each recorded detection's full-frame JPEG to (headers "
+    "X-Camera-Ip, X-Camera-Mac, X-Object-Type, X-Event-Id, "
+    "X-Event-Ts-Ms).  A 200 JPEG answer becomes the event thumbnail; "
+    "anything else falls back to the built-in thumbnail.  Empty "
+    "disables the hook.");
+ABSL_FLAG(int32_t, thumbnail_hook_timeout_sec, 5,
+    "Seconds to wait for --thumbnail_hook_url before falling back to "
+    "the built-in thumbnail (1-30).  The camera's event thread waits "
+    "this long at most, once per new event, delaying that event's row "
+    "and alarm by the same amount.");
 ABSL_FLAG(std::string, camera_snapshot_via_protect, "",
     "Comma-separated list of camera IPs whose detection thumbnails "
     "should be fetched via Protect's own /api/cameras/<id>/snapshot?"
@@ -899,6 +911,22 @@ int main(int argc, char* argv[]) {
       });
   det_rec.set_protect_snapshot_source(absl::GetFlag(FLAGS_protect_url),
                                        &protect_user_id_provider);
+  {
+    const int32_t sec = absl::GetFlag(FLAGS_thumbnail_hook_timeout_sec);
+    const int32_t clamped = sec <= 0 ? 5 : std::min(sec, 30);
+    if (clamped != sec)
+      LOG(WARNING) << "--thumbnail_hook_timeout_sec=" << sec
+                   << " out of range; using " << clamped;
+    det_rec.set_thumbnail_hook(absl::GetFlag(FLAGS_thumbnail_hook_url),
+                               clamped * 1000);
+  }
+  if (!absl::GetFlag(FLAGS_thumbnail_hook_url).empty()) {
+    // Log the endpoint without its query string: it may carry a token.
+    std::string shown = absl::GetFlag(FLAGS_thumbnail_hook_url);
+    const auto q = shown.find('?');
+    if (q != std::string::npos) shown = shown.substr(0, q) + "?...";
+    LOG(INFO) << "Thumb hook : " << shown;
+  }
   {
     const std::string list = absl::GetFlag(FLAGS_camera_snapshot_via_protect);
     for (const auto& ip : parse_csv(list)) {

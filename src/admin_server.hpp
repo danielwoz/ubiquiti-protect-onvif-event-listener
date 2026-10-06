@@ -93,4 +93,9 @@ class AdminServer {
   uint16_t port_{0};
 };
 
+/// Replace the query string of each named URL-valued key in a flat JSON
+/// object with "?[REDACTED]".  Used on config.json in the diagnostic dump.
+std::string redact_url_queries(std::string json,
+                               const std::vector<std::string>& keys);
+
 }  // namespace onvif

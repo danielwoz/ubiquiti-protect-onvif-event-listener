@@ -321,6 +321,18 @@ class DetectionRecorder {
   void set_camera_disabled_object_types(const std::string& ip,
                                         const std::set<std::string>& types);
 
+  /// POST the full-frame snapshot of every detection that will be
+  /// recorded (after --drop_unclassified_motion) to @p url and, if it
+  /// answers 200 with a JPEG within @p timeout_ms, store that image as
+  /// the event thumbnail instead of the built-in crop.  Lets an external
+  /// service (e.g. a better person detector or an LLM) produce the
+  /// Protect preview.  Empty @p url disables the hook.  Any failure,
+  /// timeout or non-200 answer falls back to the normal thumbnail path.
+  /// The camera's event thread waits for the hook, so the event row and
+  /// any alarm are written that much later.  @p timeout_ms is clamped to
+  /// [1 s, 30 s]; zero or negative selects the 5 s default.
+  void set_thumbnail_hook(const std::string& url, int timeout_ms);
+
   /// Test observability — number of times MSR was actually contacted
   /// vs. how many events triggered an MSR-eligible path.  Reset by the
   /// hourly aggregate emitter.
@@ -640,6 +652,11 @@ class DetectionRecorder {
   absl::Mutex failure_log_mu_;
   std::map<std::string, uint64_t> failure_log_last_ms_
       ABSL_GUARDED_BY(failure_log_mu_);
+
+  // External thumbnail hook (set_thumbnail_hook()); empty = disabled.
+  std::string thumbnail_hook_url_;
+  static constexpr int kDefaultHookTimeoutMs = 5000;
+  int thumbnail_hook_timeout_ms_{kDefaultHookTimeoutMs};
 
   // Protect API base + X-UserId provider, plumbed via
   // set_protect_snapshot_source(); required whenever

@@ -731,6 +731,32 @@ async function resetPgStats(){
 </body></html>
 )HTML";
 
+// Replace the query string of each named URL-valued key in a flat JSON
+// object with "?[REDACTED]".  A webhook URL commonly carries its access
+// token there, and the generic sanitiser only knows a few query keys.
+std::string redact_url_queries(std::string json,
+                               const std::vector<std::string>& keys) {
+  for (const auto& key : keys) {
+    const std::string needle = "\"" + key + "\"";
+    size_t k = json.find(needle);
+    if (k == std::string::npos) continue;
+    const size_t colon = json.find(':', k + needle.size());
+    if (colon == std::string::npos) continue;
+    const size_t v = json.find('"', colon + 1);
+    if (v == std::string::npos) continue;
+    size_t end = v + 1;
+    while (end < json.size() && json[end] != '"') {
+      if (json[end] == '\\') ++end;
+      ++end;
+    }
+    if (end >= json.size()) continue;
+    const size_t q = json.find('?', v + 1);
+    if (q != std::string::npos && q < end)
+      json.replace(q, end - q, "?[REDACTED]");
+  }
+  return json;
+}
+
 namespace {
 
 // Helper: run a shell command, capture stdout+stderr, return exit code.
@@ -1908,7 +1934,8 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
   };
 
   write("config.json",
-        read_file(ctx.config_path ? ctx.config_path : ""));
+        redact_url_queries(read_file(ctx.config_path ? ctx.config_path : ""),
+                           {"thumbnail_hook_url"}));
   write("status.json", build_status_json(ctx));
   write("camera_health.json", build_camera_health_json(ctx));
   // Per-camera Protect DB rows and recordingFiles aggregates.  Both are

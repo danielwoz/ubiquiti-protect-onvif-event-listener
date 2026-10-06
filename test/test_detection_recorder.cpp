@@ -1418,6 +1418,164 @@ static void test_thumbnail_crop_dimensions(const std::string& ubv_dir) {
 }
 
 // ============================================================
+// Thumbnail hook tests
+// ============================================================
+
+// Stands in for an external thumbnail service: any POST to /hook gets a
+// fixed JPEG back; every other path is a 404.
+class ThumbnailHookEmulator : public OnvifCameraEmulator {
+ public:
+  explicit ThumbnailHookEmulator(std::vector<unsigned char> jpeg,
+                                 int delay_ms = 0)
+    : OnvifCameraEmulator("127.0.0.1"), jpeg_(std::move(jpeg)),
+      delay_ms_(delay_ms) {}
+
+  std::string url(const std::string& path) const {
+    return "http://127.0.0.1:" + std::to_string(port()) + path;
+  }
+  int calls() const { return calls_.load(); }
+
+ protected:
+  std::pair<int, std::string> handle(const std::string& path,
+                                     const std::string& /*soap_action*/,
+                                     const std::string& body) override {
+    if (path != "/hook") return {404, ""};
+    calls_.fetch_add(1);
+    if (body.size() < 4) return {400, ""};
+    if (delay_ms_ > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms_));
+    return {200, std::string(reinterpret_cast<const char*>(jpeg_.data()),
+                             jpeg_.size())};
+  }
+
+ private:
+  std::vector<unsigned char> jpeg_;
+  int delay_ms_;
+  std::atomic<int> calls_{0};
+};
+
+// Every UBV thumbnail frame stored for @p ip must be @p want_w x @p want_h.
+static void check_thumb_dims(const std::string& ubv_dir, const std::string& ip,
+                             int want_w, int want_h, const std::string& tag) {
+  auto frames_or = ubv::decode(ubv_dir + "/" + ip + "_thumbnails.ubv");
+  if (!frames_or.ok()) {
+    CHECK(false, tag + ": ubv::decode failed for " + ip + ": "
+                 + std::string(frames_or.status().message()));
+    return;
+  }
+  CHECK(!frames_or->empty(), tag + ": " + ip + " has no UBV frames");
+  for (std::size_t i = 0; i < frames_or->size(); ++i) {
+    int w = 0, h = 0;
+    CHECK(jpeg_dims((*frames_or)[i].jpeg, &w, &h),
+          tag + ": " + ip + " frame " + std::to_string(i) + " not a JPEG");
+    CHECK(w == want_w && h == want_h,
+          tag + ": " + ip + " frame " + std::to_string(i) + " expected "
+          + std::to_string(want_w) + "x" + std::to_string(want_h) + ", got "
+          + std::to_string(w) + "x" + std::to_string(h));
+  }
+}
+
+// A hook that answers 200 + JPEG replaces the thumbnail of every new event.
+static void test_thumbnail_hook_replaces(const std::string& ubv_dir) {
+  ThumbnailHookEmulator hook(
+      load_file(source_dir() + "testdata/security_cam_vehicle.jpg"));  // 1050x656
+  hook.start();
+
+  TestContext ctx;
+  ctx.ubv_dir = ubv_dir;
+  auto backend = std::make_unique<MockBackend>();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_thumbnail_hook(hook.url("/hook"), 5000);
+
+  bool ok = run_standard_script(ctx, recorder);
+  CHECK(ok, "thumb_hook_replaces: timed out before all events arrived");
+  if (!ok) return;
+
+  CHECK(hook.calls() >= 3, "thumb_hook_replaces: expected one hook call per new "
+                           "event (3), got " + std::to_string(hook.calls()));
+  check_thumb_dims(ubv_dir, ctx.cfg108.ip, 1050, 656, "thumb_hook_replaces");
+  check_thumb_dims(ubv_dir, ctx.cfg109.ip, 1050, 656, "thumb_hook_replaces");
+}
+
+// A hook that answers 200 with something that is not a decodable JPEG
+// (here: bytes that start like one) is ignored.
+static void test_thumbnail_hook_rejects_non_jpeg(const std::string& ubv_dir) {
+  ThumbnailHookEmulator hook({0xFF, 0xD8, 0xFF, 0xE0, '{', '}'});
+  hook.start();
+
+  TestContext ctx;
+  ctx.ubv_dir = ubv_dir;
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(
+      std::make_unique<MockBackend>());
+  CHECK(rec_or.ok(), "thumb_hook_non_jpeg: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_thumbnail_hook(hook.url("/hook"), 5000);
+
+  bool ok = run_standard_script(ctx, recorder);
+  CHECK(ok, "thumb_hook_non_jpeg: timed out before all events arrived");
+  if (!ok) return;
+  CHECK(hook.calls() >= 3, "thumb_hook_non_jpeg: hook should be called");
+  check_thumb_dims(ubv_dir, ctx.cfg108.ip, 2560, 1440, "thumb_hook_non_jpeg");
+  check_thumb_dims(ubv_dir, ctx.cfg109.ip, 720, 480, "thumb_hook_non_jpeg");
+}
+
+// A hook slower than its timeout is abandoned and the built-in thumbnail
+// is kept.
+static void test_thumbnail_hook_timeout(const std::string& ubv_dir) {
+  ThumbnailHookEmulator hook(
+      load_file(source_dir() + "testdata/security_cam_vehicle.jpg"), 2500);
+  hook.start();
+
+  TestContext ctx;
+  ctx.ubv_dir = ubv_dir;
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(
+      std::make_unique<MockBackend>());
+  CHECK(rec_or.ok(), "thumb_hook_timeout: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_thumbnail_hook(hook.url("/hook"), 1000);
+
+  bool ok = run_standard_script(ctx, recorder);
+  CHECK(ok, "thumb_hook_timeout: timed out before all events arrived");
+  if (!ok) return;
+  CHECK(hook.calls() >= 3, "thumb_hook_timeout: hook should be called");
+  check_thumb_dims(ubv_dir, ctx.cfg108.ip, 2560, 1440, "thumb_hook_timeout");
+  check_thumb_dims(ubv_dir, ctx.cfg109.ip, 720, 480, "thumb_hook_timeout");
+}
+
+// A hook that fails (here a 404) leaves the built-in thumbnail in place.
+static void test_thumbnail_hook_fallback(const std::string& ubv_dir) {
+  ThumbnailHookEmulator hook(
+      load_file(source_dir() + "testdata/security_cam_vehicle.jpg"));
+  hook.start();
+
+  TestContext ctx;
+  ctx.ubv_dir = ubv_dir;
+  auto backend = std::make_unique<MockBackend>();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_thumbnail_hook(hook.url("/missing"), 5000);
+
+  bool ok = run_standard_script(ctx, recorder);
+  CHECK(ok, "thumb_hook_fallback: timed out before all events arrived");
+  if (!ok) return;
+
+  CHECK(hook.calls() == 0, "thumb_hook_fallback: /hook must not have been hit");
+  check_thumb_dims(ubv_dir, ctx.cfg108.ip, 2560, 1440, "thumb_hook_fallback");
+  check_thumb_dims(ubv_dir, ctx.cfg109.ip, 720, 480, "thumb_hook_fallback");
+}
+
+// ============================================================
 // ONVIF BoundingBox crop test
 // ============================================================
 static void test_onvif_bbox_crop(const std::string& ubv_dir) {
@@ -3380,6 +3538,14 @@ int main() {
            [&] { test_thumbnail_crop_dimensions(ubv_dir); });
   run_test("onvif_bbox_crop",
            [&] { test_onvif_bbox_crop(ubv_dir); });
+  run_test("thumbnail_hook_replaces",
+           [&] { test_thumbnail_hook_replaces(ubv_dir); });
+  run_test("thumbnail_hook_fallback",
+           [&] { test_thumbnail_hook_fallback(ubv_dir); });
+  run_test("thumbnail_hook_rejects_non_jpeg",
+           [&] { test_thumbnail_hook_rejects_non_jpeg(ubv_dir); });
+  run_test("thumbnail_hook_timeout",
+           [&] { test_thumbnail_hook_timeout(ubv_dir); });
   run_test("alarm_notify_person",        [] { test_alarm_notify_person(); });
   run_test("alarm_type_filtering",       [] { test_alarm_type_filtering(); });
   run_test("alarm_no_alarms",            [] { test_alarm_no_alarms(); });
