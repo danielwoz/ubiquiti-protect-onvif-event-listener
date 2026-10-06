@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -35,11 +36,26 @@ namespace protect_ui {
 // ---------------------------------------------------------------
 // Patch table.  Each entry is {original, replacement} where both
 // strings MUST be the same byte length so file offsets are preserved.
+//
+// A patch is applied only when `original` occurs exactly once in its
+// search range.  Minified bundles reuse short expressions in unrelated
+// places, so a second occurrence means the anchor no longer identifies
+// the intended code and the patch is skipped rather than guessed.
+//
+// `region_begin` / `region_end` optionally narrow the search range to the
+// text between the single occurrence of `region_begin` and the next
+// `region_end` after it (or end of file).
+//
+// `below` optionally restricts the patch to Protect versions strictly
+// lower than the given one.
 // ---------------------------------------------------------------
 struct Patch {
   const char* original;
   const char* replacement;
   size_t len;
+  const char* region_begin = nullptr;
+  const char* region_end = nullptr;
+  onvif::protect_version::Version below = {0, 0, 0};
 };
 
 // --- Frontend patches (swai*.js, vantage*.js) ---
@@ -47,7 +63,8 @@ struct Patch {
 // 1a. Camera picker filter (pre-7.0.57): always pass third-party cameras.
 static const Patch kUiPatch1a = {
 "!e.isThirdPartyCamera||e.isPairedWithAiPort",
-"!0/*sThirdPartyCamera||isPairedWithAiPort*/", 43};
+"!0/*sThirdPartyCamera||isPairedWithAiPort*/", 43,
+nullptr, nullptr, {7, 0, 57}};
 
 // 1b. Camera picker filter (7.0.57+): new exclusion filter. (40 bytes)
 static const Patch kUiPatch1b = {
@@ -55,9 +72,12 @@ static const Patch kUiPatch1b = {
 "!0/*hirdPartyCamera&&!v.includes(e.id)*/", 40};
 
 // 2. Automation camera list negated filter (pre-7.0.57). (43 bytes)
+// Later bundles use the same expression for the microphone capability
+// check and the ONVIF profile settings form, so it must not run there.
 static const Patch kUiPatch2 = {
 "e.isThirdPartyCamera&&!e.isPairedWithAiPort",
-"!1/*ThirdPartyCamera&&!isPairedWithAiPort*/", 43};
+"!1/*ThirdPartyCamera&&!isPairedWithAiPort*/", 43,
+nullptr, nullptr, {7, 0, 57}};
 
 // 3. hasFullFeatureSet getter: always true. (55 bytes)
 static const Patch kUiPatch3 = {
@@ -71,9 +91,12 @@ static constexpr size_t kUiPatchCount = 4;
 // --- Backend patches (service.js) ---
 
 // 4. scope_all_ui_cameras: remove third-party exclusion. (23 bytes)
+// The same fragment also guards the ONVIF stream-settings validator, so
+// the search is confined to the scope predicate's own definition.
 static const Patch kBackendPatch1 = {
 "&&!e.isThirdPartyCamera",
-"/*isThirdPartyCamera */", 23};
+"/*isThirdPartyCamera */", 23,
+"scope_all_ui_cameras:e=>", ",scope_"};
 
 static const Patch kBackendPatches[] = {kBackendPatch1};
 static constexpr size_t kBackendPatchCount = 1;
@@ -182,61 +205,149 @@ static std::vector<std::string> find_ui_files(const char* dir,
 }
 
 // ---------------------------------------------------------------
+// Matching helpers.
+// ---------------------------------------------------------------
+static size_t count_in(const std::string& s, const char* needle,
+                       size_t from, size_t to) {
+  const size_t n = std::strlen(needle);
+  size_t count = 0;
+  for (size_t pos = s.find(needle, from);
+       pos != std::string::npos && pos + n <= to;
+       pos = s.find(needle, pos + n)) {
+    ++count;
+  }
+  return count;
+}
+
+// Resolve the [begin, end) search range for a patch.  Returns false if the
+// patch defines a region whose start marker is absent or not unique.
+static bool resolve_region(const std::string& content, const Patch& p,
+                           size_t* begin, size_t* end) {
+  *begin = 0;
+  *end = content.size();
+  if (p.region_begin == nullptr) return true;
+  if (count_in(content, p.region_begin, 0, content.size()) != 1) return false;
+  *begin = content.find(p.region_begin);
+  if (p.region_end != nullptr) {
+    size_t stop = content.find(p.region_end,
+                               *begin + std::strlen(p.region_begin));
+    if (stop != std::string::npos) *end = stop;
+  }
+  return true;
+}
+
+enum class PatchState { kApply, kAlreadyApplied, kNotApplicable, kAmbiguous };
+
+static PatchState classify_patch(const std::string& content, const Patch& p,
+                                 const onvif::protect_version::Version* ver,
+                                 size_t* pos) {
+  const onvif::protect_version::Version none = {0, 0, 0};
+  if (ver != nullptr && !(p.below == none) && !(*ver < p.below)) {
+    return PatchState::kNotApplicable;
+  }
+  size_t begin = 0;
+  size_t end = 0;
+  if (!resolve_region(content, p, &begin, &end)) {
+    return PatchState::kNotApplicable;
+  }
+  const size_t originals = count_in(content, p.original, begin, end);
+  if (originals == 1) {
+    *pos = content.find(p.original, begin);
+    return PatchState::kApply;
+  }
+  if (originals > 1) return PatchState::kAmbiguous;
+  return count_in(content, p.replacement, begin, end) == 1
+             ? PatchState::kAlreadyApplied
+             : PatchState::kNotApplicable;
+}
+
+static bool file_md5_is(const std::string& path, const std::string& md5) {
+  return !md5.empty() && md5_of_file(path) == md5;
+}
+
+// ---------------------------------------------------------------
 // Apply patches to a single file.
 // Returns number of patches applied, or -1 if file not readable.
 //
-// Backup strategy uses dpkg md5sums to validate file integrity:
-//   - If the live file matches its dpkg md5 -> always overwrite .bak
-//     (the live file is a known-good original; any existing .bak may
-//     be stale from a prior firmware version).
-//   - If the live file does NOT match -> do not overwrite .bak
-//     (we would be backing up a modified file).
-//   - If no dpkg md5sums exist (dev machine) -> always back up.
+// The patched file is always derived from the unmodified package original
+// when one is available, so a file patched by an older, less precise rule
+// set is rebuilt correctly rather than patched on top of:
+//   - live file matches its dpkg md5 -> it is the original; refresh .bak.
+//   - live file differs and .bak matches dpkg md5 -> start from .bak.
+//   - neither matches -> start from the live file and keep the existing
+//     .bak (we would otherwise back up a modified file).
+//   - no dpkg md5sums (dev machine) -> start from the live file and back
+//     it up before the first modification.
 // ---------------------------------------------------------------
 static int apply_patches(
     const std::string& path, const Patch* patches, size_t count,
-    const std::unordered_map<std::string, std::string>& md5sums) {
-  std::string content = read_file(path);
-  if (content.empty()) return -1;
+    const std::unordered_map<std::string, std::string>& md5sums,
+    const onvif::protect_version::Version* ver = nullptr) {
+  const std::string live = read_file(path);
+  if (live.empty()) return -1;
 
-  std::vector<std::pair<size_t, const Patch*>> todo;
-  for (size_t i = 0; i < count; ++i) {
-    const Patch& p = patches[i];
-    if (content.find(p.replacement) != std::string::npos) continue;
-    size_t pos = content.find(p.original);
-    if (pos == std::string::npos) continue;
-    todo.emplace_back(pos, &p);
+  const std::string bak_path = path + ".bak";
+  const std::string expected = dpkg_expected_md5(path, md5sums);
+  const bool live_is_original = file_md5_is(path, expected);
+
+  std::string source = live;
+  bool source_is_bak = false;
+  if (!expected.empty() && !live_is_original &&
+      file_md5_is(bak_path, expected)) {
+    source = read_file(bak_path);
+    source_is_bak = !source.empty();
+    if (!source_is_bak) source = live;
   }
 
-  if (todo.empty()) {
+  std::string result = source;
+  int applied = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const Patch& p = patches[i];
+    size_t pos = 0;
+    switch (classify_patch(result, p, ver, &pos)) {
+      case PatchState::kApply:
+        result.replace(pos, p.len, p.replacement);
+        ++applied;
+        break;
+      case PatchState::kAmbiguous:
+        LOG(WARNING) << "[ui_patch] " << path << ": pattern \""
+                     << p.original << "\" is not unique -- skipped";
+        break;
+      case PatchState::kAlreadyApplied:
+      case PatchState::kNotApplicable:
+        break;
+    }
+  }
+
+  if (result == live) {
     LOG(INFO) << "[ui_patch] " << path << " already patched";
     return 0;
   }
 
-  // Back up the file if it is an unmodified package original.
-  std::string bak_path = path + ".bak";
-  if (md5sums.empty() || dpkg_md5_matches(path, md5sums)) {
-    if (!write_file(bak_path, content)) {
-      LOG(ERROR) << "[ui_patch] failed to write backup: " << bak_path;
-      return 0;
+  if (!source_is_bak) {
+    if (md5sums.empty() || live_is_original) {
+      if (!write_file(bak_path, live)) {
+        LOG(ERROR) << "[ui_patch] failed to write backup: " << bak_path;
+        return 0;
+      }
+    } else {
+      LOG(INFO) << "[ui_patch] " << path
+                << " already modified -- keeping existing .bak";
     }
   } else {
-    LOG(INFO) << "[ui_patch] " << path
-              << " already modified -- keeping existing .bak";
+    LOG(WARNING) << "[ui_patch] " << path
+                 << " differs from the patch set for this version -- "
+                    "rebuilding from " << bak_path;
   }
 
-  for (auto& [pos, p] : todo) {
-    content.replace(pos, p->len, p->replacement);
-  }
-
-  if (!write_file(path, content)) {
+  if (!write_file(path, result)) {
     LOG(ERROR) << "[ui_patch] failed to write: " << path;
     return 0;
   }
 
   LOG(INFO) << "[ui_patch] patched " << path
-            << " (" << todo.size() << " replacement(s))";
-  return static_cast<int>(todo.size());
+            << " (" << applied << " replacement(s))";
+  return applied;
 }
 
 // ---------------------------------------------------------------
@@ -246,6 +357,7 @@ absl::Status patch_alarm_picker() {
   // Log the detected Protect firmware so a journal capture from a user
   // running a brand-new firmware makes the version visible up-front.
   // Fast popen path; failure is silent (we still proceed with patching).
+  std::optional<onvif::protect_version::Version> detected;
   {
     std::string ver;
     FILE* p = popen("dpkg-query -W -f='${Version}' "
@@ -265,6 +377,7 @@ absl::Status patch_alarm_picker() {
       // Publish the version so live writers (detection_recorder,
       // motion_poller) can gate on it via IsAtLeast(7, 1, 0).
       if (auto v = onvif::protect_version::Parse(ver)) {
+        detected = v;
         onvif::protect_version::SetCurrent(*v);
         LOG(INFO) << "[ui_patch] protect_version published: "
                   << v->major << "." << v->minor << "." << v->patch;
@@ -281,7 +394,8 @@ absl::Status patch_alarm_picker() {
   // Patch all swai*.js and vantage*.js variants (versioned and unversioned).
   for (const char* prefix : {"swai", "vantage"}) {
     for (const auto& path : find_ui_files(kUiDir, prefix)) {
-      int n = apply_patches(path, kUiPatches, kUiPatchCount, md5sums);
+      int n = apply_patches(path, kUiPatches, kUiPatchCount, md5sums,
+                            detected ? &*detected : nullptr);
       if (n >= 0) {
         ++files_found;
         total += n;
@@ -292,7 +406,7 @@ absl::Status patch_alarm_picker() {
   // Patch service.js (backend scope filter).
   {
     int n = apply_patches(kServicePath, kBackendPatches, kBackendPatchCount,
-                          md5sums);
+                          md5sums, detected ? &*detected : nullptr);
     if (n >= 0) {
       ++files_found;
       total += n;
