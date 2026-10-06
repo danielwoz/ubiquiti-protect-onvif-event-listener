@@ -62,7 +62,9 @@ const std::vector<Entry>& Schema() {
      "classify, instead of recording them as default_object_type.  Camera AI "
      "events (Person/Vehicle/Pet), per-camera overrides and momentary topics "
      "such as line crossing are unaffected.  Cuts false-positive clutter from "
-     "AI cameras (e.g. Reolink) that also emit noisy basic-motion events.",
+     "AI cameras (e.g. Reolink) that also emit noisy basic-motion events.  "
+     "Recommended on Protect 7.2+, which records basic motion for "
+     "third-party cameras itself.",
      "Detection"},
     {"momentary_event_sec", Type::Int,
      "Synthetic duration for momentary ONVIF events -- topics that fire "
