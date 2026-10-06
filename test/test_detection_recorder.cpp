@@ -1475,6 +1475,15 @@ static void check_thumb_dims(const std::string& ubv_dir, const std::string& ip,
   }
 }
 
+// A per-test directory under @p base.  UBV files are named by camera
+// ip:port, and a later test's emulator can reuse an earlier test's port,
+// so a shared directory lets one test read another's frames.
+static std::string fresh_subdir(const std::string& base, const std::string& name) {
+  std::string tmpl = base + "/" + name + "_XXXXXX";
+  if (::mkdtemp(&tmpl[0]) == nullptr) return base;
+  return tmpl;
+}
+
 // A hook that answers 200 + JPEG replaces the thumbnail of every new event.
 static void test_thumbnail_hook_replaces(const std::string& ubv_dir) {
   ThumbnailHookEmulator hook(
@@ -3557,54 +3566,56 @@ int main() {
 
   onvif::global_init();
 
-  run_test("detection_e2e",             [&] { test_detection_e2e(ubv_dir); });
-  run_test("buffer_padding",            [&] { test_buffer_padding(ubv_dir); });
+  // Each test gets its own UBV directory (see fresh_subdir).
+  auto dir = [&] { return fresh_subdir(ubv_dir, "t"); };
+  run_test("detection_e2e",             [&] { test_detection_e2e(dir()); });
+  run_test("buffer_padding",            [&] { test_buffer_padding(dir()); });
   run_test("cell_motion_classification",
-           [&] { test_cell_motion_classification(ubv_dir); });
+           [&] { test_cell_motion_classification(dir()); });
   run_test("motion_alarm_fallback",
-           [&] { test_motion_alarm_fallback(ubv_dir); });
+           [&] { test_motion_alarm_fallback(dir()); });
   run_test("cell_motion_suppresses_alarm",
-           [&] { test_cell_motion_suppresses_alarm(ubv_dir); });
+           [&] { test_cell_motion_suppresses_alarm(dir()); });
   run_test("ai_suppresses_cell_motion",
-           [&] { test_ai_suppresses_cell_motion(ubv_dir); });
+           [&] { test_ai_suppresses_cell_motion(dir()); });
   run_test("thumbnail_crop_dimensions",
-           [&] { test_thumbnail_crop_dimensions(ubv_dir); });
+           [&] { test_thumbnail_crop_dimensions(dir()); });
   run_test("onvif_bbox_crop",
-           [&] { test_onvif_bbox_crop(ubv_dir); });
+           [&] { test_onvif_bbox_crop(dir()); });
   run_test("thumbnail_hook_replaces",
-           [&] { test_thumbnail_hook_replaces(ubv_dir); });
+           [&] { test_thumbnail_hook_replaces(dir()); });
   run_test("thumbnail_hook_fallback",
-           [&] { test_thumbnail_hook_fallback(ubv_dir); });
+           [&] { test_thumbnail_hook_fallback(dir()); });
   run_test("thumbnail_hook_rejects_non_jpeg",
-           [&] { test_thumbnail_hook_rejects_non_jpeg(ubv_dir); });
+           [&] { test_thumbnail_hook_rejects_non_jpeg(dir()); });
   run_test("thumbnail_hook_timeout",
-           [&] { test_thumbnail_hook_timeout(ubv_dir); });
+           [&] { test_thumbnail_hook_timeout(dir()); });
   run_test("alarm_notify_person",        [] { test_alarm_notify_person(); });
   run_test("alarm_type_filtering",       [] { test_alarm_type_filtering(); });
   run_test("alarm_no_alarms",            [] { test_alarm_no_alarms(); });
   run_test("alarm_uos_unreachable",      [] { test_alarm_uos_unreachable(); });
   run_test("alarm_integration_e2e",
-           [&] { test_alarm_integration_e2e(ubv_dir); });
+           [&] { test_alarm_integration_e2e(dir()); });
   run_test("default_object_type_animal",
-           [&] { test_default_object_type_animal(ubv_dir); });
+           [&] { test_default_object_type_animal(dir()); });
   run_test("default_object_type_vehicle",
-           [&] { test_default_object_type_vehicle(ubv_dir); });
+           [&] { test_default_object_type_vehicle(dir()); });
   run_test("default_object_type_no_effect_on_ai",
-           [&] { test_default_object_type_no_effect_on_ai(ubv_dir); });
+           [&] { test_default_object_type_no_effect_on_ai(dir()); });
   run_test("camera_object_type_override",
-           [&] { test_camera_object_type_override(ubv_dir); });
+           [&] { test_camera_object_type_override(dir()); });
   run_test("camera_object_types_multi",
-           [&] { test_camera_object_types_multi(ubv_dir); });
+           [&] { test_camera_object_types_multi(dir()); });
   run_test("disabled_object_types", [] { test_disabled_object_types(); });
   run_test("camera_setting_matches_bare_host",
-           [&] { test_camera_setting_matches_bare_host(ubv_dir); });
+           [&] { test_camera_setting_matches_bare_host(dir()); });
   run_test("snapshot_url_with_path", [] { test_snapshot_url_with_path(); });
   run_test("alarm_notify_animal",        [] { test_alarm_notify_animal(); });
-  run_test("alt_port_camera",            [&] { test_alt_port_camera(ubv_dir); });
+  run_test("alt_port_camera",            [&] { test_alt_port_camera(dir()); });
   run_test("unhandled_topic_records_nothing",
            [] { test_unhandled_topic_records_nothing(); });
   run_test("drop_unclassified_motion",
-           [&] { test_drop_unclassified_motion(ubv_dir); });
+           [&] { test_drop_unclassified_motion(dir()); });
   run_test("drop_unclassified_spares_line_crossing",
            [] { test_drop_unclassified_spares_line_crossing(); });
   run_test("drop_unclassified_without_snapshot",
