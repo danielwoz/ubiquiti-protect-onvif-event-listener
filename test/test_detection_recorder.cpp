@@ -1425,8 +1425,10 @@ static void test_thumbnail_crop_dimensions(const std::string& ubv_dir) {
 // fixed JPEG back; every other path is a 404.
 class ThumbnailHookEmulator : public OnvifCameraEmulator {
  public:
-  explicit ThumbnailHookEmulator(std::vector<unsigned char> jpeg)
-    : OnvifCameraEmulator("127.0.0.1"), jpeg_(std::move(jpeg)) {}
+  explicit ThumbnailHookEmulator(std::vector<unsigned char> jpeg,
+                                 int delay_ms = 0)
+    : OnvifCameraEmulator("127.0.0.1"), jpeg_(std::move(jpeg)),
+      delay_ms_(delay_ms) {}
 
   std::string url(const std::string& path) const {
     return "http://127.0.0.1:" + std::to_string(port()) + path;
@@ -1440,12 +1442,15 @@ class ThumbnailHookEmulator : public OnvifCameraEmulator {
     if (path != "/hook") return {404, ""};
     calls_.fetch_add(1);
     if (body.size() < 4) return {400, ""};
+    if (delay_ms_ > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms_));
     return {200, std::string(reinterpret_cast<const char*>(jpeg_.data()),
                              jpeg_.size())};
   }
 
  private:
   std::vector<unsigned char> jpeg_;
+  int delay_ms_;
   std::atomic<int> calls_{0};
 };
 
@@ -1496,6 +1501,51 @@ static void test_thumbnail_hook_replaces(const std::string& ubv_dir) {
                            "event (3), got " + std::to_string(hook.calls()));
   check_thumb_dims(ubv_dir, ctx.cfg108.ip, 1050, 656, "thumb_hook_replaces");
   check_thumb_dims(ubv_dir, ctx.cfg109.ip, 1050, 656, "thumb_hook_replaces");
+}
+
+// A hook that answers 200 with something that is not a decodable JPEG
+// (here: bytes that start like one) is ignored.
+static void test_thumbnail_hook_rejects_non_jpeg(const std::string& ubv_dir) {
+  ThumbnailHookEmulator hook({0xFF, 0xD8, 0xFF, 0xE0, '{', '}'});
+  hook.start();
+
+  TestContext ctx;
+  ctx.ubv_dir = ubv_dir;
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(
+      std::make_unique<MockBackend>());
+  CHECK(rec_or.ok(), "thumb_hook_non_jpeg: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_thumbnail_hook(hook.url("/hook"), 5000);
+
+  bool ok = run_standard_script(ctx, recorder);
+  CHECK(ok, "thumb_hook_non_jpeg: timed out before all events arrived");
+  if (!ok) return;
+  CHECK(hook.calls() >= 3, "thumb_hook_non_jpeg: hook should be called");
+  check_thumb_dims(ubv_dir, ctx.cfg108.ip, 2560, 1440, "thumb_hook_non_jpeg");
+  check_thumb_dims(ubv_dir, ctx.cfg109.ip, 720, 480, "thumb_hook_non_jpeg");
+}
+
+// A hook slower than its timeout is abandoned and the built-in thumbnail
+// is kept.
+static void test_thumbnail_hook_timeout(const std::string& ubv_dir) {
+  ThumbnailHookEmulator hook(
+      load_file(source_dir() + "testdata/security_cam_vehicle.jpg"), 2500);
+  hook.start();
+
+  TestContext ctx;
+  ctx.ubv_dir = ubv_dir;
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(
+      std::make_unique<MockBackend>());
+  CHECK(rec_or.ok(), "thumb_hook_timeout: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_thumbnail_hook(hook.url("/hook"), 1000);
+
+  bool ok = run_standard_script(ctx, recorder);
+  CHECK(ok, "thumb_hook_timeout: timed out before all events arrived");
+  if (!ok) return;
+  CHECK(hook.calls() >= 3, "thumb_hook_timeout: hook should be called");
+  check_thumb_dims(ubv_dir, ctx.cfg108.ip, 2560, 1440, "thumb_hook_timeout");
+  check_thumb_dims(ubv_dir, ctx.cfg109.ip, 720, 480, "thumb_hook_timeout");
 }
 
 // A hook that fails (here a 404) leaves the built-in thumbnail in place.
@@ -3322,6 +3372,10 @@ int main() {
            [&] { test_thumbnail_hook_replaces(ubv_dir); });
   run_test("thumbnail_hook_fallback",
            [&] { test_thumbnail_hook_fallback(ubv_dir); });
+  run_test("thumbnail_hook_rejects_non_jpeg",
+           [&] { test_thumbnail_hook_rejects_non_jpeg(ubv_dir); });
+  run_test("thumbnail_hook_timeout",
+           [&] { test_thumbnail_hook_timeout(ubv_dir); });
   run_test("alarm_notify_person",        [] { test_alarm_notify_person(); });
   run_test("alarm_type_filtering",       [] { test_alarm_type_filtering(); });
   run_test("alarm_no_alarms",            [] { test_alarm_no_alarms(); });

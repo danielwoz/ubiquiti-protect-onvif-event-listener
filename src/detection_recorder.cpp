@@ -427,6 +427,22 @@ static std::vector<unsigned char> fetch_snapshot(const std::string& url,
   return buf;
 }
 
+// Largest thumbnail-hook response accepted; anything bigger is aborted.
+static constexpr size_t kMaxHookResponseBytes = 4 * 1024 * 1024;
+
+static size_t hook_write_cb(void* data, size_t size, size_t nmemb,
+                            void* userp) {
+  auto* buf = static_cast<std::vector<unsigned char>*>(userp);
+  const size_t n = size * nmemb;
+  if (buf->size() + n > kMaxHookResponseBytes) return 0;  // abort transfer
+  const auto* p = static_cast<const unsigned char*>(data);
+  buf->insert(buf->end(), p, p + n);
+  return n;
+}
+
+static bool jpeg_read_dimensions(const std::vector<unsigned char>& jpeg,
+                                 int* w, int* h);
+
 // POST @p jpeg to the external thumbnail hook and return the JPEG it
 // answers with, or empty on any failure (timeout, non-200, not a JPEG).
 // Context travels as X-* headers so the hook can tell cameras apart.
@@ -461,7 +477,16 @@ static std::vector<unsigned char> call_thumbnail_hook(
                    static_cast<long>(timeout_ms));  // NOLINT(runtime/int)
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+#if LIBCURL_VERSION_NUM >= 0x075500  // 7.85.0
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS,
+                   static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS,
+                   static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));  // NOLINT(runtime/int)
+#endif
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, hook_write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
   const CURLcode rc = curl_easy_perform(curl);
   long http_code = 0;  // NOLINT(runtime/int)
@@ -471,13 +496,19 @@ static std::vector<unsigned char> call_thumbnail_hook(
   curl_easy_cleanup(curl);
   if (rc != CURLE_OK) {
     LOG(WARNING) << '[' << camera_ip << "] thumbnail hook error: "
-                 << curl_easy_strerror(rc);
+                 << (rc == CURLE_WRITE_ERROR
+                         ? "response larger than 4 MB"
+                         : curl_easy_strerror(rc));
     return {};
   }
-  if (http_code != 200 || out.size() < 4 || out[0] != 0xFF || out[1] != 0xD8) {
-    LOG(INFO) << '[' << camera_ip << "] thumbnail hook declined (HTTP "
-              << http_code << ", " << out.size() << " bytes); using the "
-              << "built-in thumbnail";
+  int w = 0;
+  int h = 0;
+  if (http_code != 200 || out.size() < 4 || out[0] != 0xFF ||
+      out[1] != 0xD8 || !jpeg_read_dimensions(out, &w, &h) || w <= 0 ||
+      h <= 0) {
+    LOG(WARNING) << '[' << camera_ip << "] thumbnail hook declined (HTTP "
+                 << http_code << ", " << out.size() << " bytes); using the "
+                 << "built-in thumbnail";
     return {};
   }
   return out;
@@ -1863,7 +1894,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // detector / cropper and use what it returns.  Only for detections
     // that will be recorded, and only for the first detection of an
     // event (coalesced merges keep the event's thumbnail).
-    if (!hook_url.empty() && !full_frame.empty()) {
+    // Skipped when MSR burst reuse is about to substitute a cached id,
+    // which would discard whatever the hook returned.
+    if (!hook_url.empty() && !full_frame.empty() &&
+        !(msr && !cam_mac.empty() && !burst_cached_id.empty())) {
       const auto t0 = std::chrono::steady_clock::now();
       auto hooked = call_thumbnail_hook(hook_url, full_frame, ev.camera_ip,
                                         cam_mac, obj_type, event_id, ts_ms,
@@ -1882,12 +1916,16 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // frames, and a run of rejections suspends MSR forwarding (and can trip
     // the wedge healer), which then drops the hook's thumbnails for the next
     // events too.  The merge reuses the thumbnail its event already stored.
+    // Only applies when MSR is in use and actually holds a recent id for
+    // this camera; otherwise the merge keeps its own snapshot, so the DB /
+    // UBV paths never lose a thumbnail.
     if (!hook_url.empty() && !hook_supplied && !coalesced_event_id.empty() &&
-        !snapshot.empty()) {
+        !snapshot.empty() && msr && !last_msr_id.empty()) {
       constexpr uint64_t kReuseWindowMs = 120000;
-      if (!last_msr_id.empty() && last_msr_age_ms <= kReuseWindowMs)
+      if (last_msr_age_ms <= kReuseWindowMs) {
         thumb_id = last_msr_id;
-      snapshot.clear();
+        snapshot.clear();
+      }
     }
 
     // 3b. Forward the cropped JPEG to MSR when configured.  MSR persists it as
@@ -2287,7 +2325,9 @@ void DetectionRecorder::set_thumbnail_hook(const std::string& url,
                                            int timeout_ms) {
   absl::MutexLock lk(&mu_);
   thumbnail_hook_url_        = url;
-  thumbnail_hook_timeout_ms_ = timeout_ms > 0 ? timeout_ms : 20000;
+  thumbnail_hook_timeout_ms_ =
+      timeout_ms <= 0 ? kDefaultHookTimeoutMs
+                      : std::min(std::max(timeout_ms, 1000), 30000);
 }
 
 }  // namespace onvif

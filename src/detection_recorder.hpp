@@ -321,6 +321,9 @@ class DetectionRecorder {
   /// service (e.g. a better person detector or an LLM) produce the
   /// Protect preview.  Empty @p url disables the hook.  Any failure,
   /// timeout or non-200 answer falls back to the normal thumbnail path.
+  /// The camera's event thread waits for the hook, so the event row and
+  /// any alarm are written that much later.  @p timeout_ms is clamped to
+  /// [1 s, 30 s]; zero or negative selects the 5 s default.
   void set_thumbnail_hook(const std::string& url, int timeout_ms);
 
   /// Test observability — number of times MSR was actually contacted
@@ -631,7 +634,8 @@ class DetectionRecorder {
 
   // External thumbnail hook (set_thumbnail_hook()); empty = disabled.
   std::string thumbnail_hook_url_;
-  int thumbnail_hook_timeout_ms_{20000};
+  static constexpr int kDefaultHookTimeoutMs = 5000;
+  int thumbnail_hook_timeout_ms_{kDefaultHookTimeoutMs};
 
   // Protect API base + X-UserId provider, plumbed via
   // set_protect_snapshot_source(); required whenever
