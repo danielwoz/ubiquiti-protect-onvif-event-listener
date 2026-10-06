@@ -2461,6 +2461,63 @@ static void test_momentary_does_not_close_stateful_event() {
 }
 
 
+// Issue #60: a crossing that coalesces into a recently ended event must
+// close it again.  Momentary detections never send "ended", so leaving the
+// re-opened event in open_ made every later detection of the same type on
+// that camera merge into it until the service restarted.
+static void test_momentary_reopen_does_not_stick() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  CHECK(rec_or.ok(), "momentary/reopen: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(1);
+  recorder.set_buffer(0, 0);
+  recorder.set_momentary_event_sec(6);
+
+  const char* kCam = "192.168.1.221";
+  onvif::OnvifEvent cross;
+  cross.camera_ip   = kCam;
+  cross.topic       = "tns1:RuleEngine/LineDetector/Crossed";
+  cross.event_time  = "2026-03-24T12:00:00Z";
+  cross.property_op = "Changed";
+  cross.data["ObjectId"]   = "1";
+  cross.data["ClassTypes"] = "Human";
+  recorder.on_event(cross);
+  CHECK(bptr->events.size() == 1, "momentary/reopen: first crossing records");
+  const std::string first_id = bptr->events.front().id;
+  const uint64_t first_end = bptr->events.front().end_ms;
+
+  // Second crossing inside the window merges into the first event ...
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  cross.event_time = "2026-03-24T12:00:01Z";
+  cross.data["ObjectId"] = "2";
+  recorder.on_event(cross);
+  CHECK(bptr->events.size() == 1,
+        "momentary/reopen: second crossing coalesces, got " +
+            std::to_string(bptr->events.size()));
+  // ... and leaves it closed, extended to the second crossing.
+  CHECK(bptr->events.front().end_ms > first_end,
+        "momentary/reopen: coalesced crossing must extend the event end");
+
+  // Once the window has passed, a new detection of the same type must
+  // start its own event instead of merging into the crossing's.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  onvif::OnvifEvent person;
+  person.camera_ip   = kCam;
+  person.topic       = "tns1:UserAlarm/IVA/HumanShapeDetect";
+  person.event_time  = "2026-03-24T12:05:00Z";
+  person.property_op = "Changed";
+  person.data["State"] = "true";
+  recorder.on_event(person);
+  CHECK(bptr->events.size() == 2,
+        "momentary/reopen: later detection must open a new event, got " +
+            std::to_string(bptr->events.size()));
+  CHECK(bptr->events.back().id != first_id,
+        "momentary/reopen: later detection must not reuse the crossing event");
+}
+
+
 // The UOS notification path is the whole point of the thumbnail feature,
 // and until UosEmulator learned these endpoints every test here silently
 // exercised the legacy fallback instead.  Pin the payload schema, the
@@ -3240,6 +3297,8 @@ int main() {
            [] { test_uos_notify_payload_and_retry(); });
   run_test("momentary_does_not_close_stateful_event",
            [] { test_momentary_does_not_close_stateful_event(); });
+  run_test("momentary_reopen_does_not_stick",
+           [] { test_momentary_reopen_does_not_stick(); });
   run_test("class_types_mapping",
            [] { test_class_types_mapping(); });
   run_test("line_crossing_synthetic_duration",

@@ -1534,6 +1534,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     std::string burst_cached_id;  // empty if no recent id within window
     // Non-empty when merging this detection into an existing event row.
     std::string coalesced_event_id;
+    // A momentary detection that extended a recently ended event.  It is
+    // closed again below, since no "ended" message will follow.
+    bool momentary_reopen = false;
     // Snapshot-source routing captured under the lock (see below).
     bool        snap_via_protect = false;
     std::string protect_url_copy;
@@ -1570,8 +1573,14 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
             if (cur >= lei->second.real_end_ms &&
                 cur - lei->second.real_end_ms <= cam_coalesce_ms) {
               coalesced_event_id = lei->second.event_id;
-              open_[key] = coalesced_event_id;
-              lei->second.real_end_ms = 0;  // mark as re-opened
+              if (det->momentary) {
+                // Momentary detections never receive "ended", so the event
+                // must not enter open_; it is re-closed after the insert.
+                momentary_reopen = true;
+              } else {
+                open_[key] = coalesced_event_id;
+                lei->second.real_end_ms = 0;  // mark as re-opened
+              }
             }
           }
         }
@@ -2032,9 +2041,11 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // the key would either truncate that in-progress detection or, with
     // coalescing off, erase its id from open_ so its real "ended" finds
     // nothing and the row is left for purge_stale_open_events to delete.
-    // Likewise, if we coalesced into an existing event we only extended
-    // it; its lifecycle still belongs to whatever opened it.
-    if (det->momentary && coalesced_event_id.empty()) {
+    // Likewise, if we coalesced into an event that is still open we only
+    // extended it; its lifecycle still belongs to whatever opened it.  An
+    // already-ended event re-opened by this crossing has no owner, so it
+    // is closed here with the new end.
+    if (det->momentary && (coalesced_event_id.empty() || momentary_reopen)) {
       absl::MutexLock lk(&mu_);
       {
         const uint64_t end_ms =
