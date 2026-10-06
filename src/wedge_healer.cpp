@@ -13,6 +13,7 @@
 #include "wedge_healer.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <ctime>
 #include <cstdlib>
@@ -346,6 +347,60 @@ void WedgeHealer::run() {
     }
     maybe_check_flag_drift(/*force=*/false);
   }
+}
+
+namespace {
+
+// Position just past the first occurrence of "key": that is a real object
+// key (not inside a string value), or npos.
+size_t find_json_key_value(const std::string& body, const std::string& key) {
+  const std::string needle = "\"" + key + "\"";
+  bool in_string = false;
+  for (size_t i = 0; i < body.size(); ++i) {
+    const char c = body[i];
+    if (in_string) {
+      if (c == '\\') {
+        ++i;
+      } else if (c == '"') {
+        in_string = false;
+      }
+      continue;
+    }
+    if (c != '"') continue;
+    if (body.compare(i, needle.size(), needle) == 0) {
+      size_t j = i + needle.size();
+      while (j < body.size() &&
+             std::isspace(static_cast<unsigned char>(body[j]))) ++j;
+      if (j < body.size() && body[j] == ':') {
+        ++j;
+        while (j < body.size() &&
+               std::isspace(static_cast<unsigned char>(body[j]))) ++j;
+        return j;
+      }
+    }
+    in_string = true;
+  }
+  return std::string::npos;
+}
+
+}  // namespace
+
+std::string describe_protect_flag_drift(const std::string& api_body) {
+  std::string out;
+  const size_t sdt = find_json_key_value(api_body, "smartDetectTypes");
+  if (sdt != std::string::npos && api_body[sdt] == '[') {
+    size_t j = sdt + 1;
+    while (j < api_body.size() &&
+           std::isspace(static_cast<unsigned char>(api_body[j]))) ++j;
+    if (j < api_body.size() && api_body[j] == ']')
+      out = "smartDetectTypes=[]";
+  }
+  const size_t hsd = find_json_key_value(api_body, "hasSmartDetect");
+  if (hsd != std::string::npos && api_body.compare(hsd, 5, "false") == 0) {
+    if (!out.empty()) out += ", ";
+    out += "hasSmartDetect=false";
+  }
+  return out;
 }
 
 }  // namespace onvif

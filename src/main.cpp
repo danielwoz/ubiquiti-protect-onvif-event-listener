@@ -1393,42 +1393,14 @@ int main(int argc, char* argv[]) {
         const std::string body = onvif::AlarmNotifier::protect_api_get(
             protect_url_for_drift + "/api/cameras/" + cam_id, user_id);
         if (body.empty()) continue;  // API unreachable; not evidence of drift
-        // Protect echoes featureFlags in the camera object.  Comparing
-        // for the presence of a non-empty smartDetectTypes array is
-        // enough: the drift we are hunting is [] in Protect vs
-        // ["person","vehicle"] in Postgres.
-        // Locate the key, then require the very next non-space character
-        // after its colon to be '['.  The previous version took the first
-        // '[' anywhere after the key, which had two bad failure modes:
-        // a "smartDetectTypes":null would silently latch onto an unrelated
-        // array later in the document (e.g. smartDetectZones), and -- worse
-        // -- the key is matched anywhere in the raw body, including inside
-        // a user-controlled string value.  Protect camera names are set by
-        // the user, so naming a camera  "smartDetectTypes": []  was enough
-        // to fake drift and make us run `systemctl restart unifi-protect`.
-        const size_t k = body.find("\"smartDetectTypes\"");
-        if (k == std::string::npos) continue;
-        size_t c = body.find(':', k + 18);
-        if (c == std::string::npos) continue;
-        ++c;
-        while (c < body.size() &&
-               std::isspace(static_cast<unsigned char>(body[c]))) ++c;
-        if (c >= body.size() || body[c] != '[') continue;  // null / not an array
-        const size_t lb = c;
-        const size_t rb = body.find(']', lb);
-        if (rb == std::string::npos) continue;
-        const std::string api_arr = body.substr(lb, rb - lb + 1);
-        bool api_empty = true;
-        for (size_t i = 1; i + 1 < api_arr.size(); ++i) {
-          if (!std::isspace(static_cast<unsigned char>(api_arr[i]))) {
-            api_empty = false;
-            break;
-          }
-        }
-        if (api_empty) {
+        // We wrote a non-empty smartDetectTypes and hasSmartDetect=true.
+        // Protect reporting either as empty/false means its in-memory
+        // model is stale.
+        const std::string drift = onvif::describe_protect_flag_drift(body);
+        if (!drift.empty()) {
           LOG(WARNING) << "[healer] camera " << cam_id
                        << " featureFlags drift: postgres=" << db_json
-                       << " protect=" << api_arr;
+                       << " protect: " << drift;
           drifted.push_back(cam_id);
         }
       }
@@ -1445,12 +1417,21 @@ int main(int argc, char* argv[]) {
     // first-party smart support in the admin UI, which restarts *us*,
     // we write featureFlags into Postgres -- and a Protect that has
     // been up for days never re-reads them.
-    if (!first_party_managed_ids.empty()) {
-      healer->arm_flag_drift_check(
-          std::vector<std::string>(first_party_managed_ids.begin(),
-                                    first_party_managed_ids.end()));
+    //
+    // Third-party cameras get the same check.  Protect forces a
+    // third-party camera in Events/Adaptive recording mode to "never"
+    // record unless it believes hasSmartDetect is true, so a stale
+    // in-memory flag silently stops recording (#58).
+    std::vector<std::string> drift_ids(first_party_managed_ids.begin(),
+                                       first_party_managed_ids.end());
+    for (const auto& c : cameras)
+      if (!c.id.empty()) drift_ids.push_back(c.id);
+    if (!drift_ids.empty()) {
+      healer->arm_flag_drift_check(drift_ids);
       LOG(INFO) << "[healer] armed featureFlags drift check for "
-                << first_party_managed_ids.size() << " first-party camera(s)";
+                << first_party_managed_ids.size() << " first-party and "
+                << (drift_ids.size() - first_party_managed_ids.size())
+                << " third-party camera(s)";
     }
   } else {
     LOG(INFO) << "[healer] auto-heal disabled (--auto_heal_protect=false)";
@@ -1517,8 +1498,15 @@ int main(int argc, char* argv[]) {
       LOG(INFO) << "[rescan] detected " << fresh.size()
                 << " new third-party camera(s)";
       if (auto s = unifi::enable_smart_detect(fresh, cam_db, cam_log);
-          !s.ok())
+          !s.ok()) {
         LOG(WARNING) << "[rescan] enable_smart_detect: " << s.message();
+      } else if (healer) {
+        // A hot-added camera is the likeliest to have Protect holding
+        // hasSmartDetect=false in memory (#58).
+        std::vector<std::string> ids;
+        for (const auto& c : fresh) ids.push_back(c.id);
+        healer->arm_flag_drift_check(ids);
+      }
       if (auto s = unifi::ensure_smart_detect_zones(fresh, cam_db, cam_log);
           !s.ok())
         LOG(WARNING) << "[rescan] ensure_smart_detect_zones: "

@@ -260,6 +260,39 @@ int main() {
     std::remove(path.c_str());
   }
 
+  // Protect flag drift parser (#34, #58).
+  {
+    using onvif::describe_protect_flag_drift;
+    const std::string synced =
+        "{\"name\":\"Front\",\"featureFlags\":{\"hasSmartDetect\":true,"
+        "\"smartDetectTypes\":[\"person\",\"vehicle\"]},"
+        "\"recordingSettings\":{\"mode\":\"detections\"}}";
+    assert(describe_protect_flag_drift(synced).empty());
+
+    const std::string stale_flag =
+        "{\"featureFlags\":{\"hasSmartDetect\": false,"
+        "\"smartDetectTypes\":[\"person\"]}}";
+    assert(describe_protect_flag_drift(stale_flag) == "hasSmartDetect=false");
+
+    const std::string stale_both =
+        "{\"featureFlags\":{\"smartDetectTypes\":[ ],"
+        "\"hasSmartDetect\":false}}";
+    assert(describe_protect_flag_drift(stale_both) ==
+           "smartDetectTypes=[], hasSmartDetect=false");
+
+    // A camera named after the keys must not fake drift.
+    const std::string spoof =
+        "{\"name\":\"\\\"hasSmartDetect\\\":false \\\"smartDetectTypes\\\":[]\","
+        "\"featureFlags\":{\"hasSmartDetect\":true,"
+        "\"smartDetectTypes\":[\"person\"]}}";
+    assert(describe_protect_flag_drift(spoof).empty());
+
+    // null smartDetectTypes is not evidence of drift.
+    assert(describe_protect_flag_drift(
+               "{\"featureFlags\":{\"smartDetectTypes\":null,"
+               "\"smartDetectZones\":[]}}").empty());
+  }
+
   std::printf("test_wedge_healer: OK\n");
   return 0;
 }
