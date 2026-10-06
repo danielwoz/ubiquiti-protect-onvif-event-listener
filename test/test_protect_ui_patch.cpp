@@ -26,6 +26,7 @@ using namespace protect_ui;  // NOLINT(build/namespaces)
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -180,10 +181,17 @@ static void test_backend_patch() {
   std::string path = dir + "/test_service.js";
   std::remove(path.c_str());
 
-  std::string content = "var x = cameras.filter(e => e.isAdopted";
-  content += kBackendPatch1.original;
-  content += ");";
-
+  // Protect 7.3.70 uses the same fragment in the ONVIF stream-settings
+  // validator *before* the scope predicate.  Only the predicate may change.
+  const std::string validator =
+      "if((g||f||p||m||h||u)&&!e.isThirdPartyCamera)throw new "
+      "i.BadRequestError(\"Camera is not a third-party (ONVIF) camera\");";
+  const std::string scope =
+      "scope_all_ui_cameras:e=>(0,t.deviceNotDeleted)(e)&&e.isAdopted&&"
+      "(0,s.isCamera)(e)&&!e.isThirdPartyCamera,"
+      "scope_all_cameras_with_nfcs:e=>e.isAdopted";
+  const std::string content =
+      validator + "x={scope_all_ui_cameras:_};" + scope;
   write_test_file(path, content);
 
   std::unordered_map<std::string, std::string> empty_md5;
@@ -191,12 +199,105 @@ static void test_backend_patch() {
   check(n == 1, "backend patch returns 1");
 
   std::string patched = read_test_file(path);
-  check(patched.find(kBackendPatch1.replacement) != std::string::npos,
-        "backend replacement present");
+  check(patched.find(validator) == 0,
+        "backend: ONVIF stream-settings validator left untouched");
+  check(patched.find("(0,s.isCamera)(e)/*isThirdPartyCamera */,"
+                     "scope_all_cameras_with_nfcs") != std::string::npos,
+        "backend: scope predicate patched");
   check(patched.size() == content.size(), "backend file size unchanged");
+
+  // Re-running is a no-op.
+  check(apply_patches(path, kBackendPatches, kBackendPatchCount,
+                      empty_md5) == 0,
+        "backend: second run is a no-op");
 
   std::remove(path.c_str());
   std::remove((path + ".bak").c_str());
+}
+
+// An anchor that occurs more than once no longer identifies one piece of
+// code, so the patch must be skipped and the file left alone.
+static void test_ambiguous_anchor_skipped() {
+  std::string dir = temp_dir();
+  std::string path = dir + "/test_ambiguous.js";
+  std::remove(path.c_str());
+
+  std::string content = "a=";
+  content += kUiPatch3.original;
+  content += ";b=";
+  content += kUiPatch3.original;
+  write_test_file(path, content);
+
+  std::unordered_map<std::string, std::string> empty_md5;
+  int n = apply_patches(path, kUiPatches, kUiPatchCount, empty_md5);
+  check(n == 0, "ambiguous: nothing applied");
+  check(read_test_file(path) == content, "ambiguous: file unchanged");
+
+  std::remove(path.c_str());
+  std::remove((path + ".bak").c_str());
+}
+
+// Patches written for pre-7.0.57 bundles must not run on newer Protect,
+// where the same expression is the microphone capability check.
+static void test_version_gate() {
+  std::string dir = temp_dir();
+  std::string path = dir + "/test_gate.js";
+  std::remove(path.c_str());
+
+  std::string content = "eqy=e=>";
+  content += kUiPatch2.original;
+  content += "?!!e.thirdPartyCameraInfo?.enableRtspAudio:e.featureFlags.hasMic";
+  write_test_file(path, content);
+
+  std::unordered_map<std::string, std::string> empty_md5;
+  const onvif::protect_version::Version v7370 = {7, 3, 70};
+  int n = apply_patches(path, kUiPatches, kUiPatchCount, empty_md5, &v7370);
+  check(n == 0, "gate: pre-7.0.57 patch not applied on 7.3.70");
+  check(read_test_file(path) == content, "gate: file unchanged on 7.3.70");
+
+  const onvif::protect_version::Version v7050 = {7, 0, 50};
+  n = apply_patches(path, kUiPatches, kUiPatchCount, empty_md5, &v7050);
+  check(n == 1, "gate: pre-7.0.57 patch applied on 7.0.50");
+
+  std::remove(path.c_str());
+  std::remove((path + ".bak").c_str());
+}
+
+// A file patched by an older rule set (here: the stream-settings validator
+// instead of the scope predicate) must be rebuilt from the pristine .bak
+// when dpkg confirms the .bak is the package original.
+static void test_rebuild_from_pristine_bak() {
+  std::string dir = temp_dir();
+  std::string path = dir + "/test_rebuild_service.js";
+  std::string bak = path + ".bak";
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+
+  const std::string original =
+      "if((g)&&!e.isThirdPartyCamera)throw 1;"
+      "scope_all_ui_cameras:e=>e.isAdopted&&!e.isThirdPartyCamera,scope_x:1";
+  std::string mispatched = original;
+  mispatched.replace(mispatched.find(kBackendPatch1.original),
+                     kBackendPatch1.len, kBackendPatch1.replacement);
+  write_test_file(bak, original);
+  write_test_file(path, mispatched);
+
+  std::unordered_map<std::string, std::string> md5sums;
+  md5sums[path.substr(1)] = md5_of_file(bak);
+
+  int n = apply_patches(path, kBackendPatches, kBackendPatchCount, md5sums);
+  check(n == 1, "rebuild: one patch applied to the pristine source");
+
+  std::string expected = original;
+  size_t at = expected.find("e.isAdopted&&!e.isThirdPartyCamera");
+  expected.replace(at + std::strlen("e.isAdopted"), kBackendPatch1.len,
+                   kBackendPatch1.replacement);
+  check(read_test_file(path) == expected,
+        "rebuild: validator restored and scope predicate patched");
+  check(read_test_file(bak) == original, "rebuild: pristine .bak kept");
+
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
 }
 
 // ---------------------------------------------------------------
@@ -392,6 +493,9 @@ int main() {
   test_already_patched();
   test_missing_file();
   test_backend_patch();
+  test_ambiguous_anchor_skipped();
+  test_version_gate();
+  test_rebuild_from_pristine_bak();
   test_dpkg_backup_logic();
   test_partial_patch();
   test_revert_byte_for_byte();
