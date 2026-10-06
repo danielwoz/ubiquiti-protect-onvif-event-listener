@@ -1406,8 +1406,10 @@ std::string build_cameras_json(const Ctx& ctx) {
     return "[]";
   }
   // Strip the largest opaque-blob columns to keep the output triage-
-  // friendly.  A missing column produces NULL in the row jsonb (the
-  // `-` operator is a no-op on absent keys), so the query stays
+  // friendly, keeping the recording mode and the feature flags that
+  // decide whether Protect records a third-party camera in
+  // Events/Adaptive mode.  A missing column produces NULL in the row jsonb
+  // (the `-` operator is a no-op on absent keys), so the query stays
   // schema-tolerant across Protect versions.
   static const char* kSql =
       "SELECT COALESCE("
@@ -1423,6 +1425,15 @@ std::string build_cameras_json(const Ctx& ctx) {
       "         - 'featureFlags' - 'hdrMode' - 'videoMode' "
       "         - 'homekitSettings' - 'recordingSettings' "
       "         - 'wifiConnectionState' - 'stats' - 'timelapseSettings' "
+      "         || jsonb_build_object("
+      "              'recordingMode', c.\"recordingSettings\"::jsonb->'mode', "
+      "              'featureFlags', jsonb_build_object("
+      "                'hasSmartDetect', "
+      "                  c.\"featureFlags\"::jsonb->'hasSmartDetect', "
+      "                'hasMotionDetection', "
+      "                  c.\"featureFlags\"::jsonb->'hasMotionDetection', "
+      "                'smartDetectTypes', "
+      "                  c.\"featureFlags\"::jsonb->'smartDetectTypes')) "
       "    AS row_data, "
       "    \"isThirdPartyCamera\" AS tp, name "
       "  FROM cameras c "

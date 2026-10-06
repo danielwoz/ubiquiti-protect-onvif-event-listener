@@ -202,6 +202,17 @@ class WedgeHealer {
   std::chrono::steady_clock::time_point last_msr_ok_advance_{};
 };
 
+/// Inspect a Protect `GET /api/cameras/<id>` body for the in-memory state
+/// that makes Protect ignore our featureFlags writes: an empty
+/// `smartDetectTypes` array, or `hasSmartDetect` false.  The latter makes
+/// Protect force a third-party camera in Events/Adaptive recording mode
+/// to "never" record (#58).  Returns a short description of the drift, or
+/// an empty string if none was found.
+///
+/// Keys are only honoured outside JSON string values, so a camera named
+/// after a key cannot fake drift.
+std::string describe_protect_flag_drift(const std::string& api_body);
+
 }  // namespace onvif
 
 #endif  // SRC_WEDGE_HEALER_HPP_
