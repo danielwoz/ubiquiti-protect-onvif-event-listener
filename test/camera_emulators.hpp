@@ -313,6 +313,12 @@ class UosEmulator : public OnvifCameraEmulator {
   /// Make /actions/notify answer with @p code (default 200).  Lets a
   /// test drive the 500 re-register retry and the 404 fallback.
   void set_notify_status(int code);
+  /// Make /api/automations/{id}/run answer 400 the way Protect does when
+  /// Global Alarm Manager is on.
+  void set_global_alarm_manager(bool on);
+  /// Requests to /internal/ routes rejected because they carried
+  /// X-UserId (Protect 7.3 answers those with 404).
+  int rejected_internal_with_user() const;
 
   /// Every notification the recorder sent, by whichever path it chose --
   /// the legacy /api/automations/{id}/run URL or the UOS notify body.
@@ -336,4 +342,6 @@ class UosEmulator : public OnvifCameraEmulator {
   std::vector<std::string> notify_bodies_;
   std::vector<std::string> register_bodies_;
   int                      notify_status_{200};
+  bool                     global_alarm_manager_{false};
+  int                      rejected_internal_with_user_{0};
 };

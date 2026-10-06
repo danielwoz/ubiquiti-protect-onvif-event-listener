@@ -650,11 +650,22 @@ std::pair<int, std::string> UosEmulator::handle(
     const std::string& /*soap_action*/,
     const std::string& body) {
   std::lock_guard<std::mutex> lk(mu_);
+  // Protect 7.3 hides /internal/ automation routes from any request that
+  // carries user credentials (requireUcoreIpc), answering 404.
+  if (path.rfind("/internal/", 0) == 0 && !request_header("X-UserId").empty()) {
+    ++rejected_internal_with_user_;
+    return {404, ""};
+  }
   if (path == "/api/automations" && body.empty())
     return {200, alarms_json_};
   // Match POST /api/automations/{id}/run
   if (path.rfind("/api/automations/", 0) == 0 &&
       path.size() > 18 && path.find("/run") != std::string::npos) {
+    if (global_alarm_manager_) {
+      return {400, "{\"error\":\"This operation is not available when "
+                   "global alarm manager is enabled\",\"name\":"
+                   "\"BAD_REQUEST\"}"};
+    }
     posted_.push_back(path);
     return {200, "{}"};
   }
@@ -690,4 +701,14 @@ std::vector<std::string> UosEmulator::triggered_automations() const {
 void UosEmulator::set_notify_status(int code) {
   std::lock_guard<std::mutex> lk(mu_);
   notify_status_ = code;
+}
+
+void UosEmulator::set_global_alarm_manager(bool on) {
+  std::lock_guard<std::mutex> lk(mu_);
+  global_alarm_manager_ = on;
+}
+
+int UosEmulator::rejected_internal_with_user() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return rejected_internal_with_user_;
 }

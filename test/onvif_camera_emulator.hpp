@@ -75,6 +75,10 @@ class OnvifCameraEmulator {
         const std::string& soap_action,
         const std::string& body) = 0;
 
+    /// Value of request header @p name for the request being handled, or
+    /// empty.  Only valid while inside handle().
+    static std::string request_header(const char* name);
+
     /// Rewrite occurrences of the real camera IP in a response body so
     /// that the listener follows URLs back to this local emulator.
     std::string rewrite_urls(const std::string& response) const;

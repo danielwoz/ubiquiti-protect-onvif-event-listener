@@ -89,6 +89,19 @@ std::string OnvifCameraEmulator::rewrite_urls(const std::string& resp) const {
 // ============================================================
 // libmicrohttpd callbacks
 // ============================================================
+// Connection of the request currently being dispatched on this thread.
+static struct MHD_Connection*& current_connection() {
+    thread_local struct MHD_Connection* conn = nullptr;
+    return conn;
+}
+
+std::string OnvifCameraEmulator::request_header(const char* name) {
+    if (current_connection() == nullptr) return {};
+    const char* v = MHD_lookup_connection_value(current_connection(),
+                                                MHD_HEADER_KIND, name);
+    return v ? v : "";
+}
+
 MHD_Result OnvifCameraEmulator::on_request(
     void* cls, struct MHD_Connection* conn,
     const char* url, const char* /*method*/, const char* /*version*/,
@@ -138,7 +151,9 @@ MHD_Result OnvifCameraEmulator::on_request(
     }
 
     // Dispatch
+    current_connection() = conn;
     auto [status, body] = emulator->handle(url, soap_action, data->body);
+    current_connection() = nullptr;
 
     struct MHD_Response* response = MHD_create_response_from_buffer(
         body.size(),

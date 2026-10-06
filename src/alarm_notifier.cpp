@@ -18,6 +18,7 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -349,7 +350,8 @@ long AlarmNotifier::perform_get(const std::string& url,  // NOLINT(runtime/int)
 
 long AlarmNotifier::perform_post(const std::string& url,  // NOLINT(runtime/int)
                                   const std::string& user_id,
-                                  const std::string& body) {
+                                  const std::string& body,
+                                  std::string* response_body) {
   CURL* curl = curl_easy_init();
   if (!curl) return 0;
 
@@ -358,9 +360,13 @@ long AlarmNotifier::perform_post(const std::string& url,  // NOLINT(runtime/int)
   headers = curl_slist_append(headers, "Accept: application/json");
   headers = curl_slist_append(headers, "X-Source: unifi-os");
   std::string user_hdr = "X-UserId: " + user_id;
-  headers = curl_slist_append(headers, user_hdr.c_str());
+  if (!user_id.empty()) headers = curl_slist_append(headers, user_hdr.c_str());
 
-  auto discard = +[](char*, size_t s, size_t n, void*) -> size_t {
+  auto collect = +[](char* d, size_t s, size_t n, void* out) -> size_t {
+    if (out != nullptr) {
+      auto* str = static_cast<std::string*>(out);
+      if (str->size() < 4096) str->append(d, std::min(s * n, 4096 - str->size()));
+    }
     return s * n;
   };
 
@@ -371,7 +377,8 @@ long AlarmNotifier::perform_post(const std::string& url,  // NOLINT(runtime/int)
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS,     body.c_str());
   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
                    static_cast<long>(body.size()));  // NOLINT(runtime/int)
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  discard);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  collect);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA,      response_body);
 
   const CURLcode rc = curl_easy_perform(curl);
   long http_code = 0;  // NOLINT(runtime/int)
@@ -423,12 +430,22 @@ std::string AlarmNotifier::http_get(const std::string& url) {
   return body;
 }
 
+bool AlarmNotifier::is_internal_automation_url(const std::string& url) {
+  return url.find("/internal/automationManager/") != std::string::npos;
+}
+
 long AlarmNotifier::http_post(const std::string& url,  // NOLINT(runtime/int)
-                               const std::string& body) {
-  long code = perform_post(url, user_id_provider_->current(), body);  // NOLINT(runtime/int)
-  if (code == 401 && user_id_provider_->try_refresh()) {
+                               const std::string& body,
+                               std::string* response_body) {
+  const bool internal = is_internal_automation_url(url);
+  const std::string user_id =
+      internal ? std::string() : user_id_provider_->current();
+  long code = perform_post(url, user_id, body, response_body);  // NOLINT(runtime/int)
+  if (!internal && code == 401 && user_id_provider_->try_refresh()) {
     LOG(INFO) << "[alarm] retrying POST " << url << " after user_id refresh";
-    code = perform_post(url, user_id_provider_->current(), body);  // NOLINT(runtime/int)
+    if (response_body) response_body->clear();
+    code = perform_post(url, user_id_provider_->current(), body,  // NOLINT(runtime/int)
+                        response_body);
   }
   if (code == 0) return code;  // network error already logged
   if (code < 200 || code >= 300) {
@@ -444,7 +461,8 @@ long AlarmNotifier::http_post(const std::string& url,  // NOLINT(runtime/int)
 // Automation registration
 // ============================================================
 
-void AlarmNotifier::register_automation(const AutomationEntry& entry) {
+long AlarmNotifier::register_automation(  // NOLINT(runtime/int)
+    const AutomationEntry& entry) {
   // Build the /change payload understood by the UOS automation manager:
   //
   // {"type":"created","data":[{
@@ -484,13 +502,11 @@ void AlarmNotifier::register_automation(const AutomationEntry& entry) {
   }
   long code = http_post(  // NOLINT(runtime/int)
       url + "/internal/automationManager/external/change", payload);
-  if (code == 204 || (code >= 200 && code < 300)) {
+  if (code >= 200 && code < 300) {
     LOG(INFO) << "[alarm] registered automation " << entry.id
               << " (\"" << entry.name << "\") with UOS automation manager";
-  } else {
-    LOG(ERROR) << "[alarm] failed to register automation " << entry.id
-               << " HTTP " << code;
   }
+  return code;
 }
 
 // ============================================================
@@ -730,10 +746,22 @@ void AlarmNotifier::refresh_alarms() {
   // /change "created" call before /actions/notify will succeed.  This
   // registration is lost on every Protect restart; we redo it here.
   // notify() will also re-register on-demand when it receives HTTP 500.
+  // One summary line rather than one error per automation: a rejected
+  // registration usually affects all of them for the same reason.
+  int failed = 0;
+  long last_code = 0;  // NOLINT(runtime/int)
   for (const auto& entry : parsed) {
-    if (entry.enabled) {
-      register_automation(entry);
+    if (!entry.enabled) continue;
+    const long code = register_automation(entry);  // NOLINT(runtime/int)
+    if (code < 200 || code >= 300) {
+      ++failed;
+      last_code = code;
     }
+  }
+  if (failed > 0) {
+    LOG(ERROR) << "[alarm] failed to register " << failed
+               << " automation(s) with the UOS automation manager (HTTP "
+               << last_code << "); notifications will use the legacy path";
   }
 
   absl::MutexLock lk(&mu_);
@@ -836,8 +864,8 @@ void AlarmNotifier::notify(const std::string& obj_type,
                      << code << "); falling back to the legacy "
                      << "/api/automations/<id>/run path for all "
                      << "notifications. Thumbnails cannot be attached on "
-                     << "that path -- to enable them, switch Protect "
-                     << "Settings -> Alarm Manager from Local to Global.";
+                     << "that path. If Protect Settings -> Alarm Manager "
+                     << "is Local, switching it to Global enables them.";
           {
             absl::MutexLock lk(&mu_);
             uos_unavailable_ = true;
@@ -849,7 +877,17 @@ void AlarmNotifier::notify(const std::string& obj_type,
       if (!use_uos) {
         // Legacy path: fires the automation but cannot carry a thumbnail,
         // because Protect hardcodes eventId="expectedNoEventId" here.
-        http_post(url + "/api/automations/" + automation.id + "/run", "{}");
+        std::string resp;
+        const long run_code = http_post(  // NOLINT(runtime/int)
+            url + "/api/automations/" + automation.id + "/run", "{}", &resp);
+        if (run_code == 400 &&
+            resp.find("global alarm manager") != std::string::npos) {
+          LOG(ERROR) << "[alarm] automation " << automation.id
+                     << " not triggered: Protect refuses the legacy run "
+                        "path while Global Alarm Manager is on, and the "
+                        "UOS automation manager did not accept our "
+                        "request either";
+        }
       }
 
       // HTTP 500 ("Alarm not found") means the in-memory UOS registration

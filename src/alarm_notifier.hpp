@@ -169,9 +169,14 @@ class AlarmNotifier {
 
   std::string http_get(const std::string& url);
   // POST helper; returns the HTTP status code (0 on network error).
-  // Handles 401 → user_id refresh → retry automatically.
+  // Handles 401 → user_id refresh → retry automatically.  Requests to
+  // Protect's /internal/automationManager/ routes are sent without user
+  // credentials: from Protect 7.3 those routes answer 404 to any request
+  // carrying X-UserId and accept only credential-less calls from the
+  // console itself.  @p response_body, if given, receives the body.
   long http_post(const std::string& url,   // NOLINT(runtime/int)
-                 const std::string& body);
+                 const std::string& body,
+                 std::string* response_body = nullptr);
   // Inner request workers; return the HTTP status code.  perform_get
   // also writes the response body into `*body`.  Empty body and non-200
   // codes are surfaced to the caller, which decides whether to retry
@@ -180,15 +185,20 @@ class AlarmNotifier {
   static long perform_get(const std::string& url,
                           const std::string& user_id,
                           std::string* body);
+  // An empty @p user_id omits the X-UserId header.
   long perform_post(const std::string& url, const std::string& user_id,  // NOLINT(runtime/int)
-                    const std::string& body);
+                    const std::string& body,
+                    std::string* response_body = nullptr);
 
   // Register one automation with the in-memory UOS automation manager via
   //   POST /internal/automationManager/external/change  (type "created")
   // so that subsequent /actions/notify calls can find it.
   // Must be called once per automation on startup and again whenever
   // /actions/notify returns HTTP 500 (in-memory state lost after restart).
-  void register_automation(const AutomationEntry& entry);
+  // Returns the HTTP status (2xx on success, 0 on network error).
+  long register_automation(const AutomationEntry& entry);  // NOLINT(runtime/int)
+  // Request goes to an internal route that rejects user credentials.
+  static bool is_internal_automation_url(const std::string& url);
 
   void record_history(const AutomationEntry& automation,
                       const std::string& obj_type,

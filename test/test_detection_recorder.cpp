@@ -2811,6 +2811,9 @@ static void test_uos_notify_payload_and_retry() {
     const auto regs = uos.register_bodies();
     CHECK(!regs.empty(),
           "UOS: startup must register automations with the external manager");
+    CHECK(uos.rejected_internal_with_user() == 0,
+          "UOS: /internal/ automation calls must not carry X-UserId "
+          "(Protect 7.3 answers those with 404)");
 
     const auto bodies = uos.notify_bodies();
     CHECK(bodies.size() == 1,
@@ -2851,6 +2854,29 @@ static void test_uos_notify_payload_and_retry() {
               std::to_string(uos.notify_bodies().size()) + " attempt(s)");
     CHECK(uos.register_bodies().size() > regs_before,
           "UOS: a 500 must trigger a re-registration before the retry");
+  }
+
+  // Part 3: Global Alarm Manager on (legacy /run refused with 400).  The
+  // notification must still be delivered through the UOS manager.
+  {
+    UosEmulator uos;
+    uos.set_alarms_json(R"([{"id":"ccc333","name":"Drive person",
+      "enable":true,"conditions":[{"source":"person"}]}])");
+    uos.set_global_alarm_manager(true);
+    uos.start();
+
+    onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+    notifier.refresh_alarms();
+    notifier.notify("person", "AABBCCDDEEFF", "event-uuid-global",
+                    1234567890000ULL);
+
+    CHECK(uos.notify_bodies().size() == 1,
+          "UOS/global: notification must go through the UOS manager, got " +
+              std::to_string(uos.notify_bodies().size()));
+    CHECK(uos.posted_events().empty(),
+          "UOS/global: the refused legacy path must not be used");
+    CHECK(uos.rejected_internal_with_user() == 0,
+          "UOS/global: no /internal/ call may carry X-UserId");
   }
 }
 
