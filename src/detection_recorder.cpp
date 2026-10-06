@@ -22,6 +22,7 @@
 #include <jpeglib.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -283,6 +285,14 @@ typename Container::const_iterator find_camera_setting(
   if (it != c.end()) return it;
   const std::string host = util::host_without_port(camera_key);
   return host == camera_key ? c.end() : c.find(host);
+}
+
+// Normalise a user-facing or internal type name: the recorder uses
+// "human" internally while settings and Protect use "person".
+std::string canonical_object_type(std::string t) {
+  for (char& c : t) c = static_cast<char>(std::tolower(
+      static_cast<unsigned char>(c)));
+  return t == "human" ? "person" : t;
 }
 
 bool looks_like_jpeg(const std::vector<unsigned char>& b) {
@@ -1553,6 +1563,23 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
   if (!cam_override_type.empty())
     det->type = cam_override_type;
 
+  // A disabled type is dropped before any work when the type is final
+  // here: the camera classified it, or a per-camera override forces it.
+  // Generic motion may still be reclassified by NanoDet-M, so it is
+  // checked again once the type is settled.  A dropped "started" never
+  // enters open_, so its "ended" is a no-op.
+  if (!det->from_fallback || !cam_override_type.empty()) {
+    absl::MutexLock lk(&mu_);
+    if (is_type_disabled_locked(ev.camera_ip, det->type)) {
+      if (det->started) {
+        LOG(INFO) << '[' << ev.camera_ip << "] dropping "
+                  << canonical_object_type(det->type)
+                  << " detection (disabled object type)";
+      }
+      return;
+    }
+  }
+
   auto key = std::make_pair(ev.camera_ip, det->type);
 
   if (det->started) {
@@ -1828,6 +1855,23 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
                 << "] dropping unclassified motion event "
                    "(--drop_unclassified_motion)";
       return;
+    }
+
+    // Disabled object types, now that NanoDet-M has had its say on generic
+    // motion.  As above, merges into an existing event are left alone.
+    if (det->from_fallback && cam_override_type.empty() &&
+        coalesced_event_id.empty()) {
+      bool disabled = false;
+      {
+        absl::MutexLock lk(&mu_);
+        disabled = is_type_disabled_locked(ev.camera_ip, obj_type);
+      }
+      if (disabled) {
+        LOG(INFO) << '[' << ev.camera_ip << "] dropping "
+                  << canonical_object_type(obj_type)
+                  << " detection (disabled object type)";
+        return;
+      }
     }
 
     // 3b. Forward the cropped JPEG to MSR when configured.  MSR persists it as
@@ -2246,6 +2290,32 @@ void DetectionRecorder::log_first_per_camera(const std::string& camera_ip,
   } else {
     LOG(WARNING) << '[' << camera_ip << "] " << message;
   }
+}
+
+void DetectionRecorder::set_disabled_object_types(
+    const std::set<std::string>& types) {
+  std::set<std::string> norm;
+  for (const auto& t : types) norm.insert(canonical_object_type(t));
+  absl::MutexLock lk(&mu_);
+  disabled_object_types_ = std::move(norm);
+}
+
+void DetectionRecorder::set_camera_disabled_object_types(
+    const std::string& ip, const std::set<std::string>& types) {
+  std::set<std::string> norm;
+  for (const auto& t : types) norm.insert(canonical_object_type(t));
+  absl::MutexLock lk(&mu_);
+  camera_disabled_object_types_[ip] = std::move(norm);
+}
+
+bool DetectionRecorder::is_type_disabled_locked(
+    const std::string& camera_ip, const std::string& type) const {
+  const std::string t = canonical_object_type(type);
+  auto it = find_camera_setting(camera_disabled_object_types_, camera_ip);
+  const std::set<std::string>& set =
+      it != camera_disabled_object_types_.end() ? it->second
+                                                : disabled_object_types_;
+  return set.count(t) > 0;
 }
 
 void DetectionRecorder::set_camera_snapshot_via_protect(

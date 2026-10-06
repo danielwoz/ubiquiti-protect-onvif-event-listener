@@ -86,6 +86,15 @@ const std::vector<Entry>& Schema() {
      "Per-camera type overrides as comma-separated ip=type pairs, e.g. "
      "192.168.1.108=person,192.168.1.109=vehicle.",
      "Detection"},
+    {"disabled_object_types", Type::String,
+     "Object types never recorded for third-party cameras, comma-separated "
+     "(person, vehicle, animal, package), e.g. package.",
+     "Detection"},
+    {"camera_disabled_object_types", Type::String,
+     "Per-camera disabled types as comma-separated ip=types pairs, types "
+     "separated by |, e.g. 192.168.1.108=package|animal.  Replaces the "
+     "global list for that camera; ip= with no types re-enables all.",
+     "Detection"},
     {"camera_coalesce_window_sec", Type::String,
      "Per-camera coalesce-window overrides as comma-separated ip=sec pairs, "
      "e.g. 192.168.1.108=120,192.168.1.109=60.  Bumping the window for a "

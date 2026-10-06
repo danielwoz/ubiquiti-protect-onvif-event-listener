@@ -638,6 +638,8 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--max_events_per_hour` | `10` | Maximum new detection events per camera per hour. Events beyond this limit are dropped. Set to 0 for unlimited. |
 | `--coalesce_history` | `true` | On startup, scan the last `--coalesce_history_days` days of events and merge consecutive detections from the same third-party camera within `--coalesce_window_sec`. Only third-party (ONVIF) cameras are affected. |
 | `--coalesce_history_days` | `30` | Number of days to look back when `--coalesce_history` is set. |
+| `--disabled_object_types` | _(empty)_ | Comma-separated object types never recorded (`person`, `vehicle`, `animal`, `package`). |
+| `--camera_disabled_object_types` | _(empty)_ | Per-camera `ip=types` pairs (types separated by `\|`). Replaces the global list for that camera; `ip=` re-enables all. |
 | `--first_party_cameras` | _(empty)_ | Comma-separated camera IDs of first-party cameras to enable smart detection flags for in the cameras table. |
 | `--first_party_camera_models` | _(empty)_ | Comma-separated model substrings to match first-party cameras (e.g. `G3 Instant,G4 Bullet`). Case-insensitive. Merged with `--first_party_cameras`. |
 | `--poll_interval_sec` | `10` | Seconds between motion-event poll cycles for first-party cameras. |

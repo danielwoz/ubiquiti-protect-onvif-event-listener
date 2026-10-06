@@ -60,6 +60,26 @@ ExecStart=/usr/bin/onvif-recorder \
   --camera_object_types=192.168.1.108=animal,192.168.1.109=package
 ```
 
+**Disabling classes.** `--disabled_object_types` drops every detection of the
+listed types, after camera classification, per-camera overrides and NanoDet-M
+have settled the type. `--camera_disabled_object_types` replaces the global
+list for one camera; separate its types with `|` (quote the value in a shell),
+and use `ip=` with nothing after it to re-enable every type on that camera.
+Disabling the type that `--default_object_type` or `--camera_object_types`
+assigns mutes generic motion from those cameras. Both settings are also
+editable from the admin page.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--disabled_object_types` | _(empty)_ | Comma-separated types never recorded, e.g. `package` or `package,animal`. |
+| `--camera_disabled_object_types` | _(empty)_ | Per-camera `ip=types` pairs, types separated by `\|`, e.g. `192.168.1.108=package\|animal`. Replaces the global list for that camera. |
+
+```bash
+ExecStart=/usr/bin/onvif-recorder \
+  --disabled_object_types=package \
+  '--camera_disabled_object_types=192.168.1.108=package|animal'
+```
+
 ---
 
 ## Security alarms
