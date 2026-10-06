@@ -111,6 +111,51 @@ static void test_default_timeout_constant() {
 }
 
 // ---------------------------------------------------------------------------
+// BestEffortGate: back-off for optional writes that time out
+// ---------------------------------------------------------------------------
+namespace gate_test {
+int64_t now_ms = 0;
+int64_t clock() { return now_ms; }
+}  // namespace gate_test
+
+static void test_best_effort_gate() {
+  onvif::pg::BestEffortGate gate("test write", /*base_ms=*/1000,
+                                 /*max_ms=*/4000);
+  gate.set_clock_for_testing(&gate_test::clock);
+  gate_test::now_ms = 10'000;
+
+  check(gate.allowed(), "gate: allowed initially");
+  gate.record(false);
+  check(gate.allowed(), "gate: success keeps it open");
+
+  gate.record(true);  // back off 1 s
+  check(!gate.allowed(), "gate: closed after a timeout");
+  gate_test::now_ms += 999;
+  check(!gate.allowed(), "gate: still closed inside the back-off");
+  gate_test::now_ms += 1;
+  check(gate.allowed(), "gate: reopens after the back-off");
+
+  gate.record(true);  // 2 s
+  gate_test::now_ms += 1999;
+  check(!gate.allowed(), "gate: back-off doubles");
+  gate_test::now_ms += 1;
+  gate.record(true);  // 4 s
+  gate_test::now_ms += 4000;
+  gate.record(true);  // capped at 4 s
+  gate_test::now_ms += 4000;
+  check(gate.allowed(), "gate: back-off capped at max_ms");
+
+  gate.record(false);  // success resets
+  gate.record(true);
+  gate_test::now_ms += 1000;
+  check(gate.allowed(), "gate: success resets the back-off to base");
+
+  check(onvif::pg::kBestEffortTimeoutMs > 0 &&
+        onvif::pg::kBestEffortTimeoutMs < onvif::pg::kDefaultTimeoutMs,
+        "kBestEffortTimeoutMs shorter than the default timeout");
+}
+
+// ---------------------------------------------------------------------------
 // DB-dependent tests
 // ---------------------------------------------------------------------------
 static void test_simple_select(PGconn* conn) {
@@ -216,6 +261,7 @@ int main() {
   // Always-runnable tests
   test_null_conn_returns_null();
   test_default_timeout_constant();
+  test_best_effort_gate();
 
   // DB-dependent tests
   PGconn* conn = try_connect();

@@ -843,7 +843,19 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         " $3::bigint, $4::bigint, $5::bigint, $6::bigint,"
         " $7::bigint, $8::bigint)"
         " ON CONFLICT (id) DO NOTHING";
-    exec_params(sql.c_str(), 8, params);
+    // Best effort: the row only drives the UI's "show areas" overlay.  A
+    // short timeout keeps a stalled insert from holding up the detection,
+    // and the gate stops retrying while inserts are timing out.
+    auto& gate = onvif::pg::AreaInsertGate();
+    if (!gate.allowed()) return;
+    maybe_reconnect();
+    PGresult* res = onvif::pg::ExecParamsWithTimeout(
+        conn_, onvif::pg::kBestEffortTimeoutMs, sql.c_str(), 8, nullptr,
+        params, nullptr, nullptr, 0);
+    gate.record(res == nullptr);
+    if (res != nullptr && PQresultStatus(res) != PGRES_COMMAND_OK)
+      LOG(WARNING) << "[pg] area insert failed: " << pg_errmsg(res);
+    PQclear(res);
   }
 
   void insert_sdo(const std::string& id,

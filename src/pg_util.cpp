@@ -16,11 +16,13 @@
 
 #include <poll.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include "absl/log/log.h"
 #include "pg_stats.hpp"
@@ -214,6 +216,45 @@ PGresult* ExecWithTimeout(PGconn* conn, int timeout_ms, const char* sql) {
       std::chrono::steady_clock::now() - t0).count();
   RecordQueryStats(sql, us, /*timed_out=*/res == nullptr);
   return res;
+}
+
+BestEffortGate::BestEffortGate(std::string name, int64_t base_ms,
+                               int64_t max_ms)
+    : name_(std::move(name)), base_ms_(base_ms), max_ms_(max_ms) {}
+
+int64_t BestEffortGate::now() const {
+  if (clock_ != nullptr) return clock_();
+  return std::chrono::duration_cast<milliseconds>(
+             steady_clock::now().time_since_epoch()).count();
+}
+
+bool BestEffortGate::allowed() {
+  std::lock_guard<std::mutex> lk(mu_);
+  return now() >= skip_until_ms_;
+}
+
+void BestEffortGate::record(bool timed_out) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!timed_out) {
+    backoff_ms_ = 0;
+    return;
+  }
+  backoff_ms_ = backoff_ms_ == 0 ? base_ms_ : std::min(backoff_ms_ * 2, max_ms_);
+  skip_until_ms_ = now() + backoff_ms_;
+  LOG(ERROR) << "[pg] " << name_ << " timed out; skipping it for "
+             << backoff_ms_ / 60'000 << " min.  The database is not "
+             << "completing this write -- check for stuck backends in "
+             << "pg_stat_activity.";
+}
+
+void BestEffortGate::set_clock_for_testing(int64_t (*now_ms)()) {
+  std::lock_guard<std::mutex> lk(mu_);
+  clock_ = now_ms;
+}
+
+BestEffortGate& AreaInsertGate() {
+  static BestEffortGate gate("smartDetectObjectAreas insert");
+  return gate;
 }
 
 }  // namespace pg

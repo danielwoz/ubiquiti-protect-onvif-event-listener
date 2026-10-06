@@ -1296,12 +1296,18 @@ void MotionPoller::poll_loop() {
               " $3::bigint, $4::bigint, $5::bigint, $6::bigint,"
               " $7::bigint, $8::bigint)"
               " ON CONFLICT (id) DO NOTHING";
-          PGresult* r = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1, sql.c_str(),
-                                     8, nullptr, ap, nullptr, nullptr, 0);
-          if (PQresultStatus(r) != PGRES_COMMAND_OK)
-            LOG(WARNING) << "[motion_poller] insert sda: "
-                         << PQerrorMessage(impl_->conn);
-          PQclear(r);
+          // Best effort, as in detection_recorder: overlay data only.
+          auto& gate = onvif::pg::AreaInsertGate();
+          if (gate.allowed()) {
+            PGresult* r = onvif::pg::ExecParamsWithTimeout(
+                impl_->conn, onvif::pg::kBestEffortTimeoutMs, sql.c_str(),
+                8, nullptr, ap, nullptr, nullptr, 0);
+            gate.record(r == nullptr);
+            if (r != nullptr && PQresultStatus(r) != PGRES_COMMAND_OK)
+              LOG(WARNING) << "[motion_poller] insert sda: "
+                           << PQerrorMessage(impl_->conn);
+            PQclear(r);
+          }
         }
 
         // INSERT detectionLabels.  The /api/detection-search endpoint

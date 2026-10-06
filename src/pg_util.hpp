@@ -17,6 +17,8 @@
 #include <libpq-fe.h>
 
 #include <cstdint>
+#include <mutex>  // NOLINT(build/c++11)
+#include <string>
 
 namespace onvif {
 namespace pg {
@@ -67,6 +69,45 @@ PGresult* ExecWithTimeout(PGconn* conn, int timeout_ms, const char* sql);
 // matching PQexecParams(..., result_format=1).  Exists as a convenience
 // only -- ExecParamsWithTimeout with result_format=1 produces the same
 // PGresult.
+
+// Timeout for writes that are nice to have but never required.
+constexpr int kBestEffortTimeoutMs = 2'000;
+
+// Back-off for an optional write.  After a timeout the write is skipped
+// for base_ms, doubling on each further timeout up to max_ms; a success
+// resets the back-off.  A timed-out query whose backend ignores the
+// cancel keeps running server-side after the connection is reset, so
+// retrying on every call would leak one busy backend per attempt.
+// Thread-safe.
+class BestEffortGate {
+ public:
+  explicit BestEffortGate(std::string name,
+                          int64_t base_ms = 3'600'000,
+                          int64_t max_ms = 86'400'000);
+
+  // True if the write should be attempted now.
+  bool allowed();
+  // Report the outcome of an attempted write.
+  void record(bool timed_out);
+
+  // Test seam: milliseconds from a monotonic clock.
+  void set_clock_for_testing(int64_t (*now_ms)());
+
+ private:
+  int64_t now() const;
+
+  const std::string name_;
+  const int64_t base_ms_;
+  const int64_t max_ms_;
+  std::mutex mu_;
+  int64_t skip_until_ms_ = 0;
+  int64_t backoff_ms_ = 0;
+  int64_t (*clock_)() = nullptr;
+};
+
+// Shared gate for smartDetectObjectAreas inserts (third-party recorder and
+// first-party motion poller write the same table).
+BestEffortGate& AreaInsertGate();
 
 }  // namespace pg
 }  // namespace onvif
