@@ -620,6 +620,15 @@ class DetectionRecorder {
   // strict concurrent-HTTP-session limits (Amcrest / Dahua firmwares).
   std::set<std::string> camera_snapshot_via_protect_;
 
+  // Thumbnail failures are logged at ERROR (visible without --verbose) at
+  // most once per hour per (camera, reason), and at WARNING otherwise.
+  void log_first_per_camera(const std::string& camera_ip,
+                            const std::string& reason,
+                            const std::string& message);
+  absl::Mutex failure_log_mu_;
+  std::map<std::string, uint64_t> failure_log_last_ms_
+      ABSL_GUARDED_BY(failure_log_mu_);
+
   // Protect API base + X-UserId provider, plumbed via
   // set_protect_snapshot_source(); required whenever
   // camera_snapshot_via_protect_ is non-empty.
@@ -663,5 +672,12 @@ class DetectionRecorder {
   // from on_event() from any camera thread.
   void maybe_emit_hourly_stats();
 };
+
+/// Replace the path of a camera's advertised snapshot URL, keeping its
+/// scheme and host:port.  Falls back to http://<host><path> (no port) when
+/// no URL was advertised.  Used by --camera_snapshot_urls.
+std::string snapshot_url_with_path(const std::string& advertised_url,
+                                   const std::string& camera_key,
+                                   const std::string& path);
 
 }  // namespace onvif

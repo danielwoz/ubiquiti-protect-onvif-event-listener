@@ -346,6 +346,64 @@ static void test_cooldown_disabled_always_attempts() {
         "cooldown=0: perform-fn invoked");
 }
 
+namespace rejected_test {
+static std::string rejecting_perform(const std::string& /*mac*/,
+                                     const std::string& /*jpeg*/) {
+  return onvif::MsrClient::kRejectedForTesting;
+}
+static std::string failing_perform(const std::string& /*mac*/,
+                                   const std::string& /*jpeg*/) {
+  return "";
+}
+}  // namespace rejected_test
+
+// MSR refusing one camera (e.g. not recording it) is reported as kRejected
+// and must not suspend forwarding for every other camera.
+static void test_rejection_reported_and_does_not_suspend() {
+  onvif::MsrClient client("http://127.0.0.1:1");
+  client.set_perform_fn_for_testing(&rejected_test::rejecting_perform);
+  client.set_clock_for_testing(&cooldown_test::clock);
+  client.set_suspend_cooldown(30);
+  cooldown_test::fake_now_ms = 3'000'000;
+
+  onvif::MsrClient::Outcome out = onvif::MsrClient::Outcome::kOk;
+  for (int i = 0; i < 6; ++i) {
+    std::string id = client.StoreSnapshot("AABBCCDDEEFF", "X", 1, &out);
+    check(id.empty(), "rejected: no id returned");
+  }
+  check(out == onvif::MsrClient::Outcome::kRejected,
+        "rejected: outcome is kRejected");
+
+  client.set_perform_fn_for_testing(&cooldown_test::ok_perform);
+  cooldown_test::calls_seen.store(0);
+  std::string id = client.StoreSnapshot("112233445566", "X", 1, &out);
+  check(id == "ok-id" && out == onvif::MsrClient::Outcome::kOk,
+        "rejected: another camera still forwarded");
+  check(cooldown_test::calls_seen.load() == 1,
+        "rejected: forwarding not suspended");
+}
+
+static void test_transport_failures_still_suspend() {
+  onvif::MsrClient client("http://127.0.0.1:1");
+  client.set_perform_fn_for_testing(&rejected_test::failing_perform);
+  client.set_clock_for_testing(&cooldown_test::clock);
+  client.set_suspend_cooldown(30);
+  cooldown_test::fake_now_ms = 4'000'000;
+
+  onvif::MsrClient::Outcome out = onvif::MsrClient::Outcome::kOk;
+  for (int i = 0; i < 5; ++i)
+    client.StoreSnapshot("AABBCCDDEEFF", "X", 1, &out);
+  check(out == onvif::MsrClient::Outcome::kTransport,
+        "transport: outcome is kTransport");
+
+  client.set_perform_fn_for_testing(&cooldown_test::ok_perform);
+  cooldown_test::calls_seen.store(0);
+  client.StoreSnapshot("112233445566", "X", 1, &out);
+  check(cooldown_test::calls_seen.load() == 0 &&
+            out == onvif::MsrClient::Outcome::kSkipped,
+        "transport: five failures suspend forwarding");
+}
+
 int main() {
   test_build_store_request_shape();
   test_build_store_request_large_jpeg();
@@ -361,6 +419,8 @@ int main() {
   test_cooldown_skips_calls_when_suspended_within_window();
   test_cooldown_allows_probe_after_window_elapses();
   test_cooldown_disabled_always_attempts();
+  test_rejection_reported_and_does_not_suspend();
+  test_transport_failures_still_suspend();
 
   std::cerr << "\nResult: " << g_pass << " passed, "
             << g_fail << " failed\n";

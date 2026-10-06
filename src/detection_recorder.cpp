@@ -256,10 +256,45 @@ std::optional<Detection> classify(const OnvifEvent& ev,
 
 }  // anonymous namespace
 
+std::string snapshot_url_with_path(const std::string& advertised_url,
+                                   const std::string& camera_key,
+                                   const std::string& path) {
+  const std::string p = (path.empty() || path[0] == '/') ? path : "/" + path;
+  const size_t scheme_end = advertised_url.find("://");
+  if (scheme_end != std::string::npos) {
+    const size_t path_start = advertised_url.find('/', scheme_end + 3);
+    return advertised_url.substr(0, path_start) + p;
+  }
+  return "http://" + util::host_without_port(camera_key) + p;
+}
+
 // ============================================================
 // Detection type helpers (file-local)
 // ============================================================
 namespace {
+
+// Per-camera settings are keyed by whatever the user typed.  The camera key
+// carries the ONVIF port when it is not 80 (Reolink: 8000) while the admin
+// UI and most users name the bare host, so fall back to that.
+template <typename Container>
+typename Container::const_iterator find_camera_setting(
+    const Container& c, const std::string& camera_key) {
+  auto it = c.find(camera_key);
+  if (it != c.end()) return it;
+  const std::string host = util::host_without_port(camera_key);
+  return host == camera_key ? c.end() : c.find(host);
+}
+
+bool looks_like_jpeg(const std::vector<unsigned char>& b) {
+  return b.size() >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF;
+}
+
+std::string printable_prefix(const std::vector<unsigned char>& b, size_t n) {
+  std::string out;
+  for (size_t i = 0; i < b.size() && i < n; ++i)
+    out.push_back(b[i] >= 0x20 && b[i] < 0x7F ? static_cast<char>(b[i]) : '.');
+  return out;
+}
 
 // Map our internal detection type to the Ubiquiti smartDetect object type.
 static const char* sdo_type(const std::string& det_type) {
@@ -1444,7 +1479,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           cell_motion_cameras_.count(ev.camera_ip)) return;
     }
     default_obj_type = default_object_type_;
-    auto it = camera_object_types_.find(ev.camera_ip);
+    auto it = find_camera_setting(camera_object_types_, ev.camera_ip);
     if (it != camera_object_types_.end())
       cam_override_type = it->second;
   }
@@ -1556,7 +1591,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       // can bump (or drop) the window for a noisy camera (#29).
       uint64_t cam_coalesce_ms = coalesce_window_ms_;
       {
-        auto cit = camera_coalesce_window_ms_.find(ev.camera_ip);
+        auto cit = find_camera_setting(camera_coalesce_window_ms_,
+                                       ev.camera_ip);
         if (cit != camera_coalesce_window_ms_.end())
           cam_coalesce_ms = cit->second;
       }
@@ -1607,17 +1643,19 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         snap_user = it->second.user;
         snap_pass = it->second.password;
       }
-      // --camera_snapshot_urls override: rewrite the snapshot URL to
-      // http://<camera_ip><path> (auth from the original cam config still
-      // applies).  Useful when the ONVIF-advertised snapshotUrl is wrong,
-      // e.g. some Dahuas advertise /onvif/snapshot which 404s while
-      // /cgi-bin/snapshot.cgi works (#32).
+      // --camera_snapshot_urls override: replace the path of the snapshot
+      // URL (auth from the original cam config still applies).  Useful when
+      // the ONVIF-advertised snapshotUrl is wrong, e.g. some Dahuas
+      // advertise /onvif/snapshot which 404s while /cgi-bin/snapshot.cgi
+      // works (#32).  The scheme and host:port come from the advertised
+      // snapshotUrl, which names the camera's web port; the ONVIF port in
+      // the camera key may differ (Reolink: ONVIF 8000, HTTP 80).
       {
-        auto pit = camera_snapshot_url_paths_.find(ev.camera_ip);
+        auto pit = find_camera_setting(camera_snapshot_url_paths_,
+                                       ev.camera_ip);
         if (pit != camera_snapshot_url_paths_.end() && !pit->second.empty()) {
-          const std::string& path = pit->second;
-          snap_url = "http://" + ev.camera_ip +
-              (path.empty() || path[0] == '/' ? path : "/" + path);
+          snap_url = snapshot_url_with_path(snap_url, ev.camera_ip,
+                                            pit->second);
         }
       }
       auto cit = camera_ids_.find(ev.camera_ip);
@@ -1634,7 +1672,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       msr_drop_on_failure = msr_drop_on_failure_;
       msr_burst_window_ms = msr_burst_window_ms_;
       snap_via_protect =
-          camera_snapshot_via_protect_.count(ev.camera_ip) > 0;
+          find_camera_setting(camera_snapshot_via_protect_, ev.camera_ip) !=
+          camera_snapshot_via_protect_.end();
       protect_url_copy = protect_url_;
       protect_user_id_provider_copy = protect_user_id_provider_;
       // Probe the burst cache while we still hold the lock.  We can't
@@ -1703,9 +1742,18 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
                   << snap_url;
         snapshot = fetch_snapshot(snap_url, snap_user, snap_pass);
       }
+      if (!snapshot.empty() && !looks_like_jpeg(snapshot)) {
+        // Some cameras answer HTTP 200 with an error document (JSON, HTML)
+        // instead of an image.  Treat that as a failed fetch.
+        LOG(WARNING) << '[' << ev.camera_ip << "] snapshot is not a JPEG ("
+                     << snapshot.size() << " bytes, starts \""
+                     << printable_prefix(snapshot, 80) << "\")";
+        snapshot.clear();
+      }
       if (snapshot.empty()) {
-        LOG(WARNING) << '[' << ev.camera_ip << "] snapshot fetch failed or "
-                     << "returned empty (thumbnail will be missing)";
+        log_first_per_camera(ev.camera_ip, "snapshot_failed",
+            "snapshot fetch failed or returned no image; thumbnails will be "
+            "missing (run with --verbose for details)");
       } else {
         LOG(INFO) << '[' << ev.camera_ip << "] snapshot fetched: "
                   << snapshot.size() << " bytes";
@@ -1810,8 +1858,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
                 << burst_cached_id;
     }
     if (msr && !stored_by_msr && !snapshot.empty() && !cam_mac.empty()) {
+      MsrClient::Outcome msr_outcome = MsrClient::Outcome::kSkipped;
       std::string msr_id = msr->StoreSnapshot(
-          cam_mac, snapshot.data(), snapshot.size());
+          cam_mac, snapshot.data(), snapshot.size(), &msr_outcome);
       if (!msr_id.empty()) {
         thumb_id = msr_id;
         stored_by_msr = true;
@@ -1832,7 +1881,15 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         stats_msr_last_fail_ns_.store(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
-        if (msr_drop_on_failure) {
+        if (msr_outcome == MsrClient::Outcome::kRejected) {
+          // MSR answered but stored nothing for this camera -- usually
+          // because Protect is not recording it.  MSR is not overloaded,
+          // so the contention concern below does not apply; keep the
+          // image by writing it to the thumbnails table instead.
+          log_first_per_camera(ev.camera_ip, "msr_rejected",
+              "MSR stored no snapshot for this camera (is Protect "
+              "recording it?); writing the thumbnail locally");
+        } else if (msr_drop_on_failure) {
           // Dropping the snapshot is the right call here: writing it
           // ourselves into the same `thumbnails` table that Protect
           // (via MSR) is also trying to write piles contention onto a
@@ -2178,6 +2235,28 @@ void DetectionRecorder::set_protect_snapshot_source(
   absl::MutexLock lk(&mu_);
   protect_url_               = base_url;
   protect_user_id_provider_  = provider;
+}
+
+void DetectionRecorder::log_first_per_camera(const std::string& camera_ip,
+                                             const std::string& reason,
+                                             const std::string& message) {
+  constexpr uint64_t kInterval = 3600 * 1000;
+  const uint64_t now = util::now_ms();
+  bool loud = false;
+  {
+    absl::MutexLock lk(&failure_log_mu_);
+    uint64_t& last = failure_log_last_ms_[camera_ip + "|" + reason];
+    if (last == 0 || now - last >= kInterval) {
+      last = now;
+      loud = true;
+    }
+  }
+  if (loud) {
+    LOG(ERROR) << '[' << camera_ip << "] " << message
+               << " (further occurrences logged at WARNING for 1h)";
+  } else {
+    LOG(WARNING) << '[' << camera_ip << "] " << message;
+  }
 }
 
 void DetectionRecorder::set_camera_snapshot_via_protect(

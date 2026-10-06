@@ -43,6 +43,12 @@ std::string generate_24hex_id();
 // which looks them up in UBV files on disk.
 std::string make_msr_thumbnail_id(const std::string& mac, uint64_t ts_ms);
 
+// Strip a trailing ":port" from "host:port".  Camera keys carry the ONVIF
+// port when it is not 80, while user-facing settings name the bare host.
+// Bracketed IPv6 ("[::1]:8000") is handled; an unbracketed string with more
+// than one colon is returned unchanged.
+std::string host_without_port(const std::string& host_port);
+
 // JSON-escape a string and wrap it in double quotes.
 // Handles \", \\, \n, \r, \t, and control chars < 0x20.
 std::string json_str(const std::string& s);

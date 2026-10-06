@@ -1947,6 +1947,54 @@ static void test_default_object_type_no_effect_on_ai(const std::string& ubv_dir)
 }
 
 // ============================================================
+// Issue #50: per-camera settings are entered as a bare host (the admin UI
+// saves cameras.host), but a camera whose ONVIF port is not 80 is keyed
+// "host:port".  The bare-host setting must still apply.
+// ============================================================
+static void test_camera_setting_matches_bare_host(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  CHECK(rec_or.ok(), "bare_host: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_ubv_dir(ubv_dir);
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+  SnapshotSyntheticEmulator emu("192.168.1.232",
+    {make_cell_motion_response(true,  "2026-03-30T15:00:00Z"),
+     make_cell_motion_response(false, "2026-03-30T15:00:05Z")},
+    jpeg);
+  emu.start();
+  const std::string key = emu.local_address();
+  CHECK(key.find(':') != std::string::npos,
+        "bare_host: emulator key should carry a port");
+  recorder.set_camera_object_type(key.substr(0, key.find(':')), "animal");
+
+  CHECK(run_single_camera(emu, recorder, 2), "bare_host: camera timed out");
+  int animal_sdo = 0;
+  for (auto& s : bptr->sdos)
+    if (s.obj_type == "animal") ++animal_sdo;
+  CHECK(animal_sdo == 1,
+        "bare_host: setting for the bare host must apply to host:port, got " +
+            std::to_string(animal_sdo) + " animal SDOs");
+}
+
+static void test_snapshot_url_with_path() {
+  CHECK(onvif::snapshot_url_with_path(
+            "http://192.168.1.200:80/cgi-bin/api.cgi?cmd=Snap",
+            "192.168.1.200:8000", "/snap.jpg") ==
+            "http://192.168.1.200:80/snap.jpg",
+        "snapshot_url_with_path: keeps the advertised web port");
+  CHECK(onvif::snapshot_url_with_path(
+            "https://cam.local/onvif/snapshot", "cam.local", "cgi-bin/s.cgi") ==
+            "https://cam.local/cgi-bin/s.cgi",
+        "snapshot_url_with_path: keeps scheme, adds leading slash");
+  CHECK(onvif::snapshot_url_with_path("", "192.168.1.200:8000", "/s.jpg") ==
+            "http://192.168.1.200/s.jpg",
+        "snapshot_url_with_path: no advertised URL drops the ONVIF port");
+}
+
+// ============================================================
 // Multiple per-camera overrides: each camera gets its own type.
 // Exercises the comma-separated ip=type parsing behaviour of
 // --camera_object_types by wiring two cameras with different overrides
@@ -3283,6 +3331,9 @@ int main() {
            [&] { test_camera_object_type_override(ubv_dir); });
   run_test("camera_object_types_multi",
            [&] { test_camera_object_types_multi(ubv_dir); });
+  run_test("camera_setting_matches_bare_host",
+           [&] { test_camera_setting_matches_bare_host(ubv_dir); });
+  run_test("snapshot_url_with_path", [] { test_snapshot_url_with_path(); });
   run_test("alarm_notify_animal",        [] { test_alarm_notify_animal(); });
   run_test("alt_port_camera",            [&] { test_alt_port_camera(ubv_dir); });
   run_test("unhandled_topic_records_nothing",
