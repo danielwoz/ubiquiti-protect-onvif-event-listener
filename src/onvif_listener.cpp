@@ -1051,6 +1051,9 @@ void OnvifListener::enable_raw_recording(const std::string& path) {
 
 void OnvifListener::run(EventCallback cb) {
   running_ = true;
+  // stop() sets stop_requested_ before clearing running_, so either this
+  // check sees it or stop()'s own store lands after ours.
+  if (stop_requested_) running_ = false;
 
   // Build workers (heap-allocated so their address is stable across moves)
   std::vector<std::unique_ptr<CameraWorker>> workers;
@@ -1138,6 +1141,7 @@ void OnvifListener::run(EventCallback cb) {
 }
 
 void OnvifListener::stop() {
+  stop_requested_ = true;
   running_ = false;
 }
 

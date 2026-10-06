@@ -426,16 +426,17 @@ ABSL_FLAG(std::string, channel_file, "/etc/onvif-recorder/channel",
 // Signal handling
 // ============================================================
 static onvif::OnvifListener* g_listener = nullptr;
-static onvif::MotionPoller*  g_poller   = nullptr;
 // Flipped by signal_handler to signal an in-flight auto_recover
 // background thread that it should exit at the next batch boundary
 // (or during an inter-batch sleep slice).  Read via a pointer stored
 // in EnrichOptions.cancelled -- see the auto_recover block below.
 static std::atomic<bool>     g_recovery_shutdown{false};
 
+// Only async-signal-safe work here: atomic stores.  main() stops the
+// motion poller, healer and background threads once listener.run()
+// returns.
 static void signal_handler(int) {
   if (g_listener) g_listener->stop();
-  if (g_poller)   g_poller->stop();
   g_recovery_shutdown.store(true, std::memory_order_relaxed);
 }
 
@@ -1381,7 +1382,6 @@ int main(int argc, char* argv[]) {
 
   // Start the motion poller before the listener (non-blocking).
   if (motion_poller) {
-    g_poller = motion_poller.get();
     motion_poller->start();
   }
 
@@ -1581,7 +1581,6 @@ int main(int argc, char* argv[]) {
   g_recovery_shutdown.store(true, std::memory_order_relaxed);
   if (auto_recover_thread.joinable())
     auto_recover_thread.join();
-  g_poller   = nullptr;
   g_listener = nullptr;
   onvif::global_cleanup();
   LOG(INFO) << "Done";

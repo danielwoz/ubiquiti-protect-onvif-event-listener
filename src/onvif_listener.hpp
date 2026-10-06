@@ -231,6 +231,9 @@ class OnvifListener {
 
  private:
     std::atomic<bool>         running_{false};
+    // Set by stop().  Survives a stop() that arrives before run() starts,
+    // which run() would otherwise overwrite by setting running_ = true.
+    std::atomic<bool>         stop_requested_{false};
     std::vector<CameraConfig> cameras_;
 
     // Queue of cameras added via add_camera_live() after run() started.

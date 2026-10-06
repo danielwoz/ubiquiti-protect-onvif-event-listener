@@ -19,6 +19,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <atomic>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -742,6 +743,24 @@ static void test_backoff_doubles_and_clamps() {
   CHECK(b == max, "ladder settles at max");
 }
 
+// A stop() that arrives before run() -- e.g. SIGTERM from the admin
+// page's "Save & restart" while the service is still starting up -- must
+// make run() return instead of being overwritten.
+static void test_stop_before_run() {
+  onvif::OnvifListener listener;
+  listener.stop();
+  std::atomic<bool> returned{false};
+  std::thread t([&] {
+    listener.run([](const onvif::OnvifEvent&) {});
+    returned = true;
+  });
+  for (int i = 0; i < 50 && !returned; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  CHECK(returned, "run() must return promptly after an earlier stop()");
+  if (!returned) listener.stop();
+  t.join();
+}
+
 int main(int argc, char* argv[]) {
   if (argc < 19) {
     std::cerr << "Usage: " << argv[0] << "\n"
@@ -786,6 +805,7 @@ int main(int argc, char* argv[]) {
 
   onvif::global_init();
 
+  run_test("stop_before_run", [] { test_stop_before_run(); });
   run_test("backoff_doubles_and_clamps",
            [&] { test_backoff_doubles_and_clamps(); });
   run_test("hikvision_basic",
