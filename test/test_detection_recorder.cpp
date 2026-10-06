@@ -1946,6 +1946,71 @@ static void test_default_object_type_no_effect_on_ai(const std::string& ubv_dir)
         + std::to_string(vehicle_sdo));
 }
 
+// Issue #59: disabled object types are never recorded.
+static onvif::OnvifEvent make_human_event(const std::string& ip,
+                                          const std::string& state) {
+  onvif::OnvifEvent e;
+  e.camera_ip   = ip;
+  e.topic       = "tns1:UserAlarm/IVA/HumanShapeDetect";
+  e.event_time  = "2026-03-24T13:00:00Z";
+  e.property_op = "Changed";
+  e.data["State"] = state;
+  return e;
+}
+
+static onvif::OnvifEvent make_motion_event(const std::string& ip) {
+  onvif::OnvifEvent e;
+  e.camera_ip   = ip;
+  e.topic       = "tns1:RuleEngine/CellMotionDetector/Motion";
+  e.event_time  = "2026-03-24T13:00:00Z";
+  e.property_op = "Changed";
+  e.data["IsMotion"] = "true";
+  return e;
+}
+
+static void test_disabled_object_types() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  CHECK(rec_or.ok(), "disabled_types: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(0);
+  recorder.set_disabled_object_types({"Person", "package"});
+
+  // Camera-classified person: dropped, and its "ended" is harmless.
+  recorder.on_event(make_human_event("192.168.1.240", "true"));
+  recorder.on_event(make_human_event("192.168.1.240", "false"));
+  CHECK(bptr->events.empty(),
+        "disabled_types: camera person event must be dropped, got " +
+            std::to_string(bptr->events.size()));
+
+  // Generic motion falls back to default_object_type (person): dropped.
+  recorder.on_event(make_motion_event("192.168.1.241"));
+  CHECK(bptr->events.empty(),
+        "disabled_types: motion defaulting to person must be dropped");
+
+  // A per-camera override to a disabled type is dropped too.
+  recorder.set_camera_object_type("192.168.1.242", "package");
+  recorder.on_event(make_motion_event("192.168.1.242"));
+  CHECK(bptr->events.empty(),
+        "disabled_types: override to a disabled type must be dropped");
+
+  // A per-camera list replaces the global one; an empty list re-enables.
+  recorder.set_camera_disabled_object_types("192.168.1.243", {});
+  recorder.on_event(make_human_event("192.168.1.243", "true"));
+  CHECK(bptr->events.size() == 1,
+        "disabled_types: empty per-camera list must re-enable person, got " +
+            std::to_string(bptr->events.size()));
+
+  // Matching falls back to the bare host for host:port camera keys.
+  recorder.set_camera_disabled_object_types("192.168.1.244", {"vehicle"});
+  recorder.on_event(make_human_event("192.168.1.244:8000", "true"));
+  CHECK(bptr->events.size() == 2,
+        "disabled_types: per-camera list must apply to host:port and "
+        "replace the global list, got " +
+            std::to_string(bptr->events.size()));
+}
+
 // ============================================================
 // Issue #50: per-camera settings are entered as a bare host (the admin UI
 // saves cameras.host), but a camera whose ONVIF port is not 80 is keyed
@@ -3331,6 +3396,7 @@ int main() {
            [&] { test_camera_object_type_override(ubv_dir); });
   run_test("camera_object_types_multi",
            [&] { test_camera_object_types_multi(ubv_dir); });
+  run_test("disabled_object_types", [] { test_disabled_object_types(); });
   run_test("camera_setting_matches_bare_host",
            [&] { test_camera_setting_matches_bare_host(ubv_dir); });
   run_test("snapshot_url_with_path", [] { test_snapshot_url_with_path(); });

@@ -200,6 +200,16 @@ ABSL_FLAG(std::string, camera_object_types, "",
     "e.g. '192.168.1.108=animal,192.168.1.109=package'. "
     "Overrides the detection type for all events from that camera. "
     "Valid types: person, vehicle, animal, package.");
+ABSL_FLAG(std::string, disabled_object_types, "",
+    "Comma-separated object types never recorded for third-party cameras, "
+    "e.g. 'package' or 'package,animal'.  Applies after camera and "
+    "NanoDet-M classification.  Valid types: person, vehicle, animal, "
+    "package.");
+ABSL_FLAG(std::string, camera_disabled_object_types, "",
+    "Per-camera disabled object types as comma-separated ip=types pairs, "
+    "types separated by '|', e.g. '192.168.1.108=package|animal'.  "
+    "Replaces --disabled_object_types for that camera; 'ip=' with no "
+    "types re-enables every type on it.");
 ABSL_FLAG(std::string, camera_coalesce_window_sec, "",
     "Per-camera coalesce-window overrides as comma-separated ip=sec pairs, "
     "e.g. '192.168.1.108=120,192.168.1.109=60'. "
@@ -861,6 +871,28 @@ int main(int argc, char* argv[]) {
         const uint32_t sec = static_cast<uint32_t>(std::atoi(v.c_str()));
         det_rec.set_camera_coalesce_window(ip, sec);
       });
+  {
+    auto parse_types = [](const std::string& list, char sep) {
+      std::set<std::string> out;
+      size_t pos = 0;
+      while (pos <= list.size()) {
+        size_t end = list.find(sep, pos);
+        if (end == std::string::npos) end = list.size();
+        std::string t = list.substr(pos, end - pos);
+        t.erase(0, t.find_first_not_of(" \t"));
+        t.erase(t.find_last_not_of(" \t") + 1);
+        if (!t.empty()) out.insert(t);
+        pos = end + 1;
+      }
+      return out;
+    };
+    det_rec.set_disabled_object_types(
+        parse_types(absl::GetFlag(FLAGS_disabled_object_types), ','));
+    for_each_ip_value(absl::GetFlag(FLAGS_camera_disabled_object_types),
+        [&](const std::string& ip, const std::string& v) {
+          det_rec.set_camera_disabled_object_types(ip, parse_types(v, '|'));
+        });
+  }
   for_each_ip_value(absl::GetFlag(FLAGS_camera_snapshot_urls),
       [&](const std::string& ip, const std::string& v) {
         det_rec.set_camera_snapshot_url_path(ip, v);

@@ -314,6 +314,13 @@ class DetectionRecorder {
   /// additional HTTP session is opened against the camera.
   void set_camera_snapshot_via_protect(const std::string& camera_ip);
 
+  /// Object types (person, vehicle, animal, package) that are never
+  /// recorded.  A per-camera set replaces the global one for that camera;
+  /// an empty per-camera set re-enables every type on it.
+  void set_disabled_object_types(const std::set<std::string>& types);
+  void set_camera_disabled_object_types(const std::string& ip,
+                                        const std::set<std::string>& types);
+
   /// Test observability — number of times MSR was actually contacted
   /// vs. how many events triggered an MSR-eligible path.  Reset by the
   /// hourly aggregate emitter.
@@ -619,6 +626,11 @@ class DetectionRecorder {
   // /api/cameras/<id>/snapshot?ts=<ms> endpoint.  Useful for cameras with
   // strict concurrent-HTTP-session limits (Amcrest / Dahua firmwares).
   std::set<std::string> camera_snapshot_via_protect_;
+  std::set<std::string> disabled_object_types_;
+  std::map<std::string, std::set<std::string>> camera_disabled_object_types_;
+  // Whether @p type is disabled for @p camera_ip.  Caller holds mu_.
+  bool is_type_disabled_locked(const std::string& camera_ip,
+                               const std::string& type) const;
 
   // Thumbnail failures are logged at ERROR (visible without --verbose) at
   // most once per hour per (camera, reason), and at WARNING otherwise.
