@@ -63,6 +63,21 @@ echo "=== $(date -Is) boot-restore start ==="
 # Wait for the system to settle (network, systemd, apt locks).
 sleep 60
 
+# The first boot after a firmware update can stay busy for a while (its own
+# apt run, network still coming up), so retry a failed install (issue #51).
+run_install() {
+    n=1
+    until sh /data/onvif-recorder/install.sh; do
+        if [ "$n" -ge 3 ]; then
+            echo "install.sh failed $n times; giving up until next boot"
+            return 1
+        fi
+        echo "install.sh failed (attempt $n of 3); retrying in 5 minutes"
+        n=$((n + 1))
+        sleep 300
+    done
+}
+
 # Normal boot: package is already installed, nothing to do.
 if dpkg -s onvif-recorder >/dev/null 2>&1; then
     echo "package already installed; nothing to do"
@@ -85,7 +100,7 @@ fi
 if [ ! -x /usr/bin/onvif-recorder ] && \
    [ -f /data/onvif-recorder/backups/config-current.tar.gz ]; then
     echo "wipe-recovery: /usr/bin/onvif-recorder is missing; ignoring consent gate"
-    sh /data/onvif-recorder/install.sh
+    run_install
     echo "=== $(date -Is) boot-restore done (wipe-recovery) ==="
     exit 0
 fi
@@ -101,7 +116,7 @@ if [ "$consent" != "true" ]; then
 fi
 
 echo "running /data/onvif-recorder/install.sh"
-sh /data/onvif-recorder/install.sh
+run_install
 echo "=== $(date -Is) boot-restore done ==="
 EOF_BOOT_RESTORE
 chmod 0755 "$DATA_DIR/boot-restore.sh"

@@ -98,14 +98,32 @@ echo "deb [arch=$DEB_ARCH signed-by=$KEYRING] $REPO_URL $CHANNEL main" \
     > "$SRC_FILE"
 
 # 4. Install.
+# The first boot after a firmware update runs its own apt-get; wait for it
+# rather than failing on the apt lists or dpkg lock (issue #51).
+wait_for_apt() {
+    i=0
+    while [ "$i" -lt 120 ] && pgrep -x 'apt|apt-get|dpkg' >/dev/null 2>&1; do
+        [ "$i" -eq 0 ] && echo "==> Waiting for another apt/dpkg run to finish ..."
+        sleep 5
+        i=$((i + 1))
+    done
+}
+
 echo "==> apt-get update ..."
-apt-get update \
+n=1
+wait_for_apt
+until apt-get update \
     -o Dir::Etc::sourcelist="$SRC_FILE" \
     -o Dir::Etc::sourceparts=- \
-    -o APT::Get::List-Cleanup=0
+    -o APT::Get::List-Cleanup=0; do
+    [ "$n" -ge 5 ] && exit 1
+    n=$((n + 1))
+    sleep 10
+    wait_for_apt
+done
 
 echo "==> Installing onvif-recorder ..."
-apt-get install -y onvif-recorder
+apt-get install -y -o DPkg::Lock::Timeout=600 onvif-recorder
 
 # 5. Persistent recovery layer (survives firmware upgrades + apt purge).
 DATA_DIR=/data/onvif-recorder
