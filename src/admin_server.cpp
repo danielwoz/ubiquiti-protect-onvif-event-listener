@@ -133,7 +133,7 @@ line-height:14px;cursor:help;margin-left:4px;vertical-align:middle}
 <th style="padding:4px 6px">1h</th>
 <th style="padding:4px 6px"></th>
 <th style="padding:4px 6px">Via Protect<span class="help" title="Route thumbnail fetches through Protect's own /api/cameras/&lt;id&gt;/snapshot endpoint instead of hitting the camera's own HTTP snapshot server directly. Useful for cheap third-party cameras whose HTTP snapshot endpoint chokes or returns black frames while RTSP is streaming -- Protect is already decoding the stream, so we just grab a frame from that decode. Tradeoff: the frame is Protect's currently-decoded one, so there is 200-500 ms of slop vs the exact ONVIF-event moment. Third-party cameras only.">?</span></th>
-<th style="padding:4px 6px" title="Untick to skip this camera entirely (no ONVIF subscription for third-party, no motion polling for first-party). Useful when another integration (e.g. a UniFi AI Port) is already handling the same physical camera and would otherwise produce duplicate events. Saved as excluded_cameras (issue #42).">Enabled</th>
+<th style="padding:4px 6px" title="Untick to skip this camera entirely (no ONVIF subscription for third-party, no motion polling for first-party). Useful when another integration (e.g. a UniFi AI Port) is already handling the same physical camera and would otherwise produce duplicate events. Untick a third-party camera to make it pairable with an AI Port; it appears in Protect's pairing list after Protect restarts. Saved as excluded_cameras (issue #42).">Enabled</th>
 </tr></thead>
 <tbody id="camhealth-body"><tr><td colspan="8">Loading…</td></tr></tbody></table>
 <div style="margin-top:8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">

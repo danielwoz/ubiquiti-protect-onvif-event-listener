@@ -291,6 +291,43 @@ int main() {
     assert(describe_protect_flag_drift(
                "{\"featureFlags\":{\"smartDetectTypes\":null,"
                "\"smartDetectZones\":[]}}").empty());
+
+    // licensePlate cleared in Postgres but still held by Protect (#67).
+    const std::string with_lp =
+        "{\"featureFlags\":{\"smartDetectTypes\":[\"person\","
+        "\"licensePlate\"],\"hasSmartDetect\":true},"
+        "\"extendedAiFeatures\":{\"smartDetectTypes\":[]}}";
+    assert(describe_protect_flag_drift(with_lp, "[\"person\"]") ==
+           "smartDetectTypes has licensePlate");
+    assert(describe_protect_flag_drift(
+               with_lp, "[\"person\", \"licensePlate\"]").empty());
+    assert(describe_protect_flag_drift(with_lp).empty());
+    // licensePlate in Postgres that Protect has not loaded yet.
+    const std::string without_lp =
+        "{\"featureFlags\":{\"smartDetectTypes\":[\"person\"],"
+        "\"hasSmartDetect\":true}}";
+    assert(describe_protect_flag_drift(without_lp,
+                                       "[\"person\", \"licensePlate\"]") ==
+           "smartDetectTypes lacks licensePlate");
+    assert(describe_protect_flag_drift(
+               "{\"featureFlags\":{\"smartDetectTypes\":[]}}",
+               "[\"licensePlate\"]") == "smartDetectTypes=[]");
+    assert(describe_protect_flag_drift(
+               "{\"featureFlags\":{\"smartDetectTypes\":null}}",
+               "[\"licensePlate\"]").empty());
+
+    using onvif::protect_holds_cleared_license_plate;
+    assert(protect_holds_cleared_license_plate(with_lp, "[\"person\"]"));
+    assert(!protect_holds_cleared_license_plate(
+        with_lp, "[\"person\", \"licensePlate\"]"));
+    assert(!protect_holds_cleared_license_plate(without_lp, "[\"person\"]"));
+
+    // Only the first smartDetectTypes array (featureFlags) is compared.
+    assert(describe_protect_flag_drift(
+               "{\"featureFlags\":{\"smartDetectTypes\":[\"person\"]},"
+               "\"extendedAiFeatures\":{\"smartDetectTypes\":"
+               "[\"licensePlate\"]}}",
+               "[\"person\"]").empty());
   }
 
   std::printf("test_wedge_healer: OK\n");

@@ -347,8 +347,10 @@ ABSL_FLAG(std::string, excluded_cameras, "",
     "no motion-poll cycles (first-party).  Useful when a camera is "
     "already managed by another integration (e.g. a UniFi AI Port) and "
     "would otherwise produce duplicate detection events (issue #42).  "
-    "Managed via a per-row tickbox on the Camera Health card at "
-    "/onvif/admin/.");
+    "Excluding a third-party camera also lets Protect's AI Port pairing "
+    "list it (issue #67).  Cameras already paired with an AI Port are "
+    "skipped automatically.  Managed via a per-row tickbox on the Camera "
+    "Health card at /onvif/admin/.");
 ABSL_FLAG(std::string, first_party_cameras, "",
     "Comma-separated camera IDs of first-party cameras to enable smart "
     "detection flags for in the cameras table. Enables the Protect UI "
@@ -995,17 +997,57 @@ int main(int argc, char* argv[]) {
   }
   auto cameras = std::move(*cams_or);
 
-  if (auto s = unifi::enable_smart_detect(cameras, cam_db, cam_log); !s.ok()) {
+  // Cameras paired with an AI Port get smart detections from it, and
+  // Protect owns their settings, so the recorder leaves them alone (#67).
+  auto ai_port_or = unifi::load_ai_port_paired_ids(cam_db);
+  if (!ai_port_or.ok()) {
+    LOG(ERROR) << "Fatal: " << ai_port_or.status().message();
+    onvif::global_cleanup();
+    return 1;
+  }
+  const std::set<std::string> ai_port_ids = std::move(*ai_port_or);
+  auto is_excluded = [&](const std::string& mac) {
+    return !mac.empty() && excluded_macs.count(norm_mac(mac)) > 0;
+  };
+
+  // Third-party cameras the recorder subscribes to and writes flags for.
+  std::vector<onvif::CameraConfig> managed;
+  std::vector<std::string> excluded_ids;
+  for (const auto& cam : cameras) {
+    if (ai_port_ids.count(cam.id)) {
+      LOG(INFO) << "[ai_port] skipping " << cam.ip
+                << " (paired with an AI Port)";
+    } else if (is_excluded(cam.mac)) {
+      LOG(INFO) << "[excluded_cameras] skipping "
+                << cam.ip << " mac=" << cam.mac;
+      excluded_ids.push_back(cam.id);
+    } else {
+      managed.push_back(cam);
+    }
+  }
+
+  if (auto s = unifi::enable_smart_detect(managed, cam_db, cam_log); !s.ok()) {
     LOG(ERROR) << "Fatal: " << s.message();
     onvif::global_cleanup();
     return 1;
   }
 
-  if (auto s = unifi::ensure_smart_detect_zones(cameras, cam_db, cam_log);
+  if (auto s = unifi::ensure_smart_detect_zones(managed, cam_db, cam_log);
       !s.ok()) {
     LOG(ERROR) << "Fatal: " << s.message();
     onvif::global_cleanup();
     return 1;
+  }
+
+  // An excluded camera may still carry the licensePlate entry from an
+  // earlier run, which hides it from Protect's AI Port pairing (#67).
+  if (auto c = unifi::clear_license_plate_marker(excluded_ids, cam_db, cam_log);
+      c.ok()) {
+    if (!c->empty())
+      LOG(INFO) << "[excluded_cameras] removed licensePlate from "
+                << c->size() << " camera(s) for AI Port pairing";
+  } else {
+    LOG(WARNING) << "[excluded_cameras] " << c.status().message();
   }
 
   {
@@ -1081,6 +1123,22 @@ int main(int argc, char* argv[]) {
       }
     }
 
+    // Same rule as third-party cameras: no writes to excluded or AI Port
+    // paired cameras.
+    std::vector<unifi::FirstPartyCamera> kept;
+    for (auto& c : fp_cams) {
+      if (ai_port_ids.count(c.id)) {
+        LOG(INFO) << "[ai_port] skipping first-party " << c.name << " ("
+                  << c.id << ", paired with an AI Port)";
+      } else if (is_excluded(c.mac)) {
+        LOG(INFO) << "[excluded_cameras] skipping first-party " << c.name
+                  << " (" << c.id << ", mac=" << c.mac << ")";
+      } else {
+        kept.push_back(std::move(c));
+      }
+    }
+    fp_cams = std::move(kept);
+
     if (!fp_cams.empty()) {
       LOG(INFO) << "[first_party] " << fp_cams.size()
                 << " camera(s) matched for flag modification";
@@ -1124,7 +1182,12 @@ int main(int argc, char* argv[]) {
                           const std::string& name,
                           const std::string& mac) {
       if (id.empty() || !seen.insert(id).second) return;
-      if (!mac.empty() && excluded_macs.count(norm_mac(mac))) {
+      if (ai_port_ids.count(id)) {
+        LOG(INFO) << "[ai_port] skipping first-party " << name << " ("
+                  << id << ", paired with an AI Port)";
+        return;
+      }
+      if (is_excluded(mac)) {
         LOG(INFO) << "[excluded_cameras] skipping first-party "
                   << name << " (" << id << ", mac=" << mac << ")";
         return;
@@ -1356,19 +1419,14 @@ int main(int argc, char* argv[]) {
       LOG(INFO) << "[startup] purged " << n << " orphaned row(s)";
   }
 
-  for (auto cam : cameras) {
-    if (!cam.mac.empty() && excluded_macs.count(norm_mac(cam.mac))) {
-      LOG(INFO) << "[excluded_cameras] skipping "
-                << cam.ip << " mac=" << cam.mac;
-      continue;
-    }
+  for (auto cam : managed) {
     cam.max_consecutive_failures = 3;
     listener.add_camera(cam);
     det_rec.set_snapshot(cam);
     LOG(INFO) << "Watching camera " << cam.ip;
   }
 
-  if (cameras.empty() && !motion_poller) {
+  if (managed.empty() && !motion_poller) {
     LOG(WARNING) << "No third-party cameras found in Protect and no "
                  << "first-party cameras configured for motion polling; "
                  << "service will stay alive but idle. Add a third-party "
@@ -1409,7 +1467,10 @@ int main(int argc, char* argv[]) {
     const std::string protect_url_for_drift =
         absl::GetFlag(FLAGS_protect_url);
     healer->set_flag_drift_fn(
-        [protect_url_for_drift, &protect_user_id_provider, cam_db](
+        [protect_url_for_drift, &protect_user_id_provider, cam_db,
+         first_party = first_party_managed_ids,
+         excluded = std::set<std::string>(excluded_ids.begin(),
+                                          excluded_ids.end())](
             const std::vector<std::string>& ids)
             -> std::vector<std::string> {
       std::vector<std::string> drifted;
@@ -1430,10 +1491,17 @@ int main(int argc, char* argv[]) {
         const std::string body = onvif::AlarmNotifier::protect_api_get(
             protect_url_for_drift + "/api/cameras/" + cam_id, user_id);
         if (body.empty()) continue;  // API unreachable; not evidence of drift
-        // We wrote a non-empty smartDetectTypes and hasSmartDetect=true.
-        // Protect reporting either as empty/false means its in-memory
-        // model is stale.
-        const std::string drift = onvif::describe_protect_flag_drift(body);
+        // For an excluded camera only a licensePlate entry we removed
+        // matters.  First-party flags are re-synced from the device, so
+        // licensePlate is compared for third-party cameras only.
+        std::string drift;
+        if (excluded.count(cam_id)) {
+          if (onvif::protect_holds_cleared_license_plate(body, db_json))
+            drift = "smartDetectTypes has licensePlate";
+        } else {
+          drift = onvif::describe_protect_flag_drift(
+              body, first_party.count(cam_id) ? "" : db_json);
+        }
         if (!drift.empty()) {
           LOG(WARNING) << "[healer] camera " << cam_id
                        << " featureFlags drift: postgres=" << db_json
@@ -1459,10 +1527,15 @@ int main(int argc, char* argv[]) {
     // third-party camera in Events/Adaptive recording mode to "never"
     // record unless it believes hasSmartDetect is true, so a stale
     // in-memory flag silently stops recording (#58).
+    //
+    // Excluded cameras are checked on every start for a licensePlate entry
+    // Protect still holds in memory, which hides them from AI Port
+    // pairing (#67).
     std::vector<std::string> drift_ids(first_party_managed_ids.begin(),
                                        first_party_managed_ids.end());
-    for (const auto& c : cameras)
+    for (const auto& c : managed)
       if (!c.id.empty()) drift_ids.push_back(c.id);
+    drift_ids.insert(drift_ids.end(), excluded_ids.begin(), excluded_ids.end());
     if (!drift_ids.empty()) {
       healer->arm_flag_drift_check(drift_ids);
       LOG(INFO) << "[healer] armed featureFlags drift check for "
@@ -1530,6 +1603,28 @@ int main(int argc, char* argv[]) {
       std::vector<onvif::CameraConfig> fresh;
       for (const auto& c : *reloaded)
         if (!known_ids.count(c.id)) fresh.push_back(c);
+      if (fresh.empty()) continue;
+
+      // A new camera may already be excluded or paired with an AI Port.
+      // Without the pairing list, wait for the next round rather than
+      // write flags Protect owns.
+      auto paired = unifi::load_ai_port_paired_ids(cam_db);
+      if (!paired.ok()) {
+        LOG(WARNING) << "[rescan] " << paired.status().message();
+        continue;
+      }
+      std::vector<onvif::CameraConfig> added;
+      for (auto& c : fresh) {
+        if (paired->count(c.id) || is_excluded(c.mac)) {
+          known_ids.insert(c.id);
+          LOG(INFO) << "[rescan] skipping " << c.ip
+                    << (paired->count(c.id) ? " (paired with an AI Port)"
+                                            : " (excluded)");
+        } else {
+          added.push_back(std::move(c));
+        }
+      }
+      fresh = std::move(added);
       if (fresh.empty()) continue;
 
       LOG(INFO) << "[rescan] detected " << fresh.size()

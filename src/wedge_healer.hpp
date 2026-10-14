@@ -116,7 +116,7 @@ class WedgeHealer {
   void set_state_path(const std::string& path);
 
   // Arm a one-shot featureFlags drift check for @p camera_ids.  Call this
-  // immediately after enable_smart_detect() writes flags into Postgres.
+  // right after writing their featureFlags into Postgres.
   // kFlagDriftGraceSec later the healer runs flag_drift_fn once; if any
   // camera still disagrees, Protect is holding stale in-memory state
   // (issue #34) and only a `systemctl restart unifi-protect` clears it.
@@ -206,12 +206,22 @@ class WedgeHealer {
 /// that makes Protect ignore our featureFlags writes: an empty
 /// `smartDetectTypes` array, or `hasSmartDetect` false.  The latter makes
 /// Protect force a third-party camera in Events/Adaptive recording mode
-/// to "never" record (#58).  Returns a short description of the drift, or
-/// an empty string if none was found.
+/// to "never" record (#58).  When @p db_smart_detect_types (the Postgres
+/// value) is given, a "licensePlate" entry on one side only also counts.
+/// Returns a short description of the drift, or an empty string if none
+/// was found.
 ///
 /// Keys are only honoured outside JSON string values, so a camera named
 /// after a key cannot fake drift.
-std::string describe_protect_flag_drift(const std::string& api_body);
+std::string describe_protect_flag_drift(
+    const std::string& api_body,
+    const std::string& db_smart_detect_types = "");
+
+/// True if Protect still lists "licensePlate" in a camera's
+/// `smartDetectTypes` while @p db_smart_detect_types (the Postgres value)
+/// no longer does.
+bool protect_holds_cleared_license_plate(
+    const std::string& api_body, const std::string& db_smart_detect_types);
 
 }  // namespace onvif
 

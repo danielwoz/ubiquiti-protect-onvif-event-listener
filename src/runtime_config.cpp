@@ -115,7 +115,10 @@ const std::vector<Entry>& Schema() {
      "ignore entirely (no ONVIF subscription, no motion polling).  Use "
      "the Enabled tickbox on the Camera Health card above to manage "
      "this.  Useful when another integration (e.g. a UniFi AI Port) is "
-     "already producing detection events for the same physical camera.",
+     "already producing detection events for the same physical camera.  "
+     "Excluding a third-party camera also lets Protect's AI Port pairing "
+     "list it; cameras already paired with an AI Port are skipped "
+     "automatically.",
      "Detection"},
 
     // ---- First-party cameras ----

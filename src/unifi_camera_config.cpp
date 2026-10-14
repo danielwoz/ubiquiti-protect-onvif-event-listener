@@ -965,6 +965,84 @@ read_smart_detect_flags(const std::vector<std::string>& camera_ids,
 }
 
 // ---------------------------------------------------------------------------
+// AI Port pairing (issue #67)
+// ---------------------------------------------------------------------------
+
+// to_jsonb() over the whole row keeps the query valid on Protect versions
+// whose cameras table has no isPairedWithAiPort column.
+static absl::StatusOr<std::set<std::string>> query_ai_port_paired_ids(
+    PGconn* conn) {
+  PGresult* res = onvif::pg::ExecWithTimeout(conn, 10'000,
+      "SELECT id FROM cameras c "
+      "WHERE (to_jsonb(c)->>'isPairedWithAiPort') = 'true'");
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    const std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    return absl::InternalError("AI Port pairing query: " + err);
+  }
+  std::set<std::string> out;
+  for (int i = 0; i < PQntuples(res); ++i) out.insert(PQgetvalue(res, i, 0));
+  PQclear(res);
+  return out;
+}
+
+absl::StatusOr<std::set<std::string>> load_ai_port_paired_ids(
+    const DbConfig& db) {
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError("unifi::load_ai_port_paired_ids: " + pg.error());
+  return query_ai_port_paired_ids(pg.conn);
+}
+
+absl::StatusOr<std::vector<std::string>> clear_license_plate_marker(
+    const std::vector<std::string>& camera_ids,
+    const DbConfig& db,
+    CameraChangeLog* log) {
+  std::vector<std::string> cleared;
+  if (camera_ids.empty()) return cleared;
+
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError(
+        "unifi::clear_license_plate_marker: " + pg.error());
+
+  const std::string ids = internal::pg_array(camera_ids);
+  const char* params[] = { ids.c_str() };
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(pg.conn, 10'000,
+      "WITH old AS ("
+      "  SELECT id, \"featureFlags\"::jsonb->'smartDetectTypes' AS sdt "
+      "  FROM cameras c "
+      "  WHERE id = ANY($1::text[]) "
+      "    AND \"isThirdPartyCamera\" = true "
+      "    AND (to_jsonb(c)->>'isPairedWithAiPort') IS DISTINCT FROM 'true' "
+      "    AND jsonb_typeof(\"featureFlags\"::jsonb->'smartDetectTypes')"
+      "        = 'array' "
+      "    AND (\"featureFlags\"::jsonb->'smartDetectTypes') ? 'licensePlate' "
+      "  FOR UPDATE) "
+      "UPDATE cameras "
+      "SET \"featureFlags\" = jsonb_set(\"featureFlags\"::jsonb, "
+      "      '{smartDetectTypes}', old.sdt - 'licensePlate')::json, "
+      "    \"updatedAt\" = NOW() "
+      "FROM old WHERE cameras.id = old.id "
+      "RETURNING cameras.id, old.sdt::text, (old.sdt - 'licensePlate')::text",
+      1, nullptr, params, nullptr, nullptr, 0);
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    const std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    return absl::InternalError("unifi::clear_license_plate_marker: " + err);
+  }
+  for (int i = 0; i < PQntuples(res); ++i) {
+    cleared.push_back(PQgetvalue(res, i, 0));
+    if (log) {
+      log->record(cleared.back(), "featureFlags.smartDetectTypes",
+                  PQgetvalue(res, i, 1), PQgetvalue(res, i, 2));
+    }
+  }
+  PQclear(res);
+  return cleared;
+}
+
+// ---------------------------------------------------------------------------
 // ensure_smart_detect_zones — internal implementation
 //
 // Updates cameras in @p ids that have an empty smartDetectZones array.
@@ -1166,6 +1244,14 @@ absl::StatusOr<int> rollback_camera_changes(
     return absl::InternalError(
         "unifi::rollback_camera_changes: " + pg.error());
 
+  // Protect and the AI Port own the settings of paired cameras.
+  auto paired_or = query_ai_port_paired_ids(pg.conn);
+  if (!paired_or.ok())
+    return absl::InternalError(
+        "unifi::rollback_camera_changes: " +
+        std::string(paired_or.status().message()));
+  const std::set<std::string>& paired = *paired_or;
+
   auto records = CameraChangeLog::read_all(log_path);
   int updated = 0;
 
@@ -1193,6 +1279,11 @@ absl::StatusOr<int> rollback_camera_changes(
       bool is_fp = fp_set.count(cam_id) > 0;
       if (is_fp && !do_fp) continue;
       if (!is_fp && !do_tp) continue;
+      if (paired.count(cam_id)) {
+        LOG(INFO) << "[rollback] skipping " << cam_id << " " << column
+                  << " (paired with an AI Port)";
+        continue;
+      }
 
       // Apply the original value back.  Map column names to SQL.
       std::string sql;
@@ -1294,7 +1385,9 @@ absl::StatusOr<int> rollback_camera_changes(
       "    \"smartDetectZones\" = '[]'::json,"
       "    \"updatedAt\" = NOW() "
       "WHERE \"isThirdPartyCamera\" = true "
-      "  AND \"isAdopted\" = true";
+      "  AND \"isAdopted\" = true "
+      "  AND (to_jsonb(cameras)->>'isPairedWithAiPort') IS DISTINCT FROM "
+      "      'true'";
 
     PGresult* res = onvif::pg::ExecWithTimeout(pg.conn, -1, sql);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {

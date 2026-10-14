@@ -383,9 +383,17 @@ size_t find_json_key_value(const std::string& body, const std::string& key) {
   return std::string::npos;
 }
 
+constexpr char kLicensePlate[] = "\"licensePlate\"";
+
+// Whether the smartDetectTypes array starting at @p sdt lists licensePlate.
+bool array_lists_license_plate(const std::string& body, size_t sdt) {
+  return body.find(kLicensePlate, sdt) < body.find(']', sdt);
+}
+
 }  // namespace
 
-std::string describe_protect_flag_drift(const std::string& api_body) {
+std::string describe_protect_flag_drift(
+    const std::string& api_body, const std::string& db_smart_detect_types) {
   std::string out;
   const size_t sdt = find_json_key_value(api_body, "smartDetectTypes");
   if (sdt != std::string::npos && api_body[sdt] == '[') {
@@ -394,6 +402,17 @@ std::string describe_protect_flag_drift(const std::string& api_body) {
            std::isspace(static_cast<unsigned char>(api_body[j]))) ++j;
     if (j < api_body.size() && api_body[j] == ']')
       out = "smartDetectTypes=[]";
+
+    if (!db_smart_detect_types.empty()) {
+      const bool protect_has = array_lists_license_plate(api_body, sdt);
+      const bool db_has =
+          db_smart_detect_types.find(kLicensePlate) != std::string::npos;
+      if (protect_has && !db_has) {
+        out = "smartDetectTypes has licensePlate";
+      } else if (!protect_has && db_has && out.empty()) {
+        out = "smartDetectTypes lacks licensePlate";
+      }
+    }
   }
   const size_t hsd = find_json_key_value(api_body, "hasSmartDetect");
   if (hsd != std::string::npos && api_body.compare(hsd, 5, "false") == 0) {
@@ -401,6 +420,14 @@ std::string describe_protect_flag_drift(const std::string& api_body) {
     out += "hasSmartDetect=false";
   }
   return out;
+}
+
+bool protect_holds_cleared_license_plate(
+    const std::string& api_body, const std::string& db_smart_detect_types) {
+  const size_t sdt = find_json_key_value(api_body, "smartDetectTypes");
+  return sdt != std::string::npos && api_body[sdt] == '[' &&
+         array_lists_license_plate(api_body, sdt) &&
+         db_smart_detect_types.find(kLicensePlate) == std::string::npos;
 }
 
 }  // namespace onvif

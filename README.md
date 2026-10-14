@@ -176,6 +176,14 @@ Protect 7.2+ set `drop_unclassified_motion` to true (admin page, Detection) and
 leave motion detection on in Protect. Cameras for which Protect shows motion
 detection as misconfigured get no basic motion events with that setting.
 
+**Camera missing from the AI Port pairing list?** Protect only offers cameras without
+licence-plate or face detection, and onvif-recorder marks the cameras it manages as
+licence-plate capable so their detections panel shows. Untick a third-party camera on
+the Camera Health card (admin page): the recorder removes that marker and, if needed,
+restarts Protect about five minutes later so it applies (with
+`--auto_heal_protect=false`, restart Protect yourself). Cameras already paired with an
+AI Port are left alone.
+
 ---
 
 ## Building from source

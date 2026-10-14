@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -194,6 +195,22 @@ absl::StatusOr<std::map<std::string, std::string>>
 read_smart_detect_flags(const std::vector<std::string>& camera_ids,
                         const DbConfig& db = {});
 
+/// IDs of cameras paired with an AI Port.  The AI Port supplies their
+/// smart detections and Protect owns their settings.  Empty on Protect
+/// versions without AI Port support.
+absl::StatusOr<std::set<std::string>> load_ai_port_paired_ids(
+    const DbConfig& db = {});
+
+/// Remove the "licensePlate" entry that enable_smart_detect() adds to
+/// `featureFlags.smartDetectTypes` from the listed third-party cameras that
+/// are not paired with an AI Port.  Protect's AI Port pairing dialog hides
+/// cameras that report licence-plate or face detection (issue #67).
+/// Returns the IDs that changed.
+absl::StatusOr<std::vector<std::string>> clear_license_plate_marker(
+    const std::vector<std::string>& camera_ids,
+    const DbConfig& db = {},
+    CameraChangeLog* log = nullptr);
+
 /// Ensure the listed cameras have at least one smart-detect zone in the
 /// Protect database.  Cameras with an empty `smartDetectZones` array are
 /// updated with a single full-frame Default zone covering person and vehicle
@@ -247,6 +264,8 @@ absl::StatusOr<bool> detect_native_msr_thumbnail_format(
 ///              empty arrays.
 /// @p first_party_ids  Camera IDs from --first_party_cameras (used when scope
 ///                     includes first-party cameras and the log exists).
+///
+/// Cameras paired with an AI Port are skipped.
 ///
 /// Returns the number of cameras updated.
 absl::StatusOr<int> rollback_camera_changes(
