@@ -5,13 +5,17 @@
 set -e
 
 case "$1" in
-    remove|upgrade|deconfigure)
+    upgrade)
+        # Timers keep their enabled state across upgrades (issue #55).
+        systemctl stop onvif-recorder.service 2>/dev/null || true
+        ;;
+    remove|deconfigure)
         systemctl stop onvif-recorder.service 2>/dev/null || true
         systemctl disable --now onvif-recorder-channel.timer 2>/dev/null || true
         systemctl disable --now onvif-recorder-autoupdate.timer 2>/dev/null \
             || true
 
-        # On removal (not upgrade), roll back DB changes + revert patches.
+        # On removal, roll back DB changes + revert patches.
         if [ "$1" = "remove" ]; then
             if [ -x /usr/bin/onvif-recorder ]; then
                 /usr/bin/onvif-recorder --rollback=all 2>&1 | \

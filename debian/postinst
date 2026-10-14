@@ -74,14 +74,9 @@ case "$1" in
         /usr/libexec/onvif-recorder/install-apt-source.sh || true
 
         # ----- Reload systemd + enable units -----
-        # $2 is the previously-installed version on upgrade; empty for
-        # a fresh install.  On a fresh install we enable + start every
-        # unit unconditionally.  On an upgrade we only ensure the
-        # recorder service is running with the new binary — the
-        # autoupdate timer's state is left exactly as the user set it
-        # via the admin Configuration card so a user who explicitly
-        # disabled auto-update doesn't have it re-enabled by every
-        # subsequent `apt-get install --only-upgrade`.
+        # $2 is the previous version on upgrade, empty on a fresh install.
+        # A fresh install enables every unit.  An upgrade keeps the timers'
+        # enabled state, except for the one-time repair below.
         systemctl daemon-reload
         if [ -z "$2" ]; then
             # Fresh install
@@ -89,12 +84,35 @@ case "$1" in
                                     onvif-recorder-channel.timer \
                                     onvif-recorder-autoupdate.timer
         else
-            # Upgrade: keep timer enable/disable as the user left it.
-            # Service is always-on so we still ensure that one.
+            # Upgrade: the service is always on; timer state is kept.
             systemctl enable --now onvif-recorder.service
             # Pick up the new binary if the service was already
             # running, no-op if it was stopped.
             systemctl try-restart onvif-recorder.service || true
+            # prerm before 1.6.28 disabled both timers on every upgrade
+            # (issue #55).  Re-enable the channel timer, and the autoupdate
+            # timer if the old prerm stopped it during this upgrade, or if
+            # the admin Auto-update card (which writes schedule.conf) was
+            # never used and config.json does not turn auto-update off.
+            if dpkg --compare-versions "$2" lt 1.6.28~; then
+                systemctl enable --now onvif-recorder-channel.timer || true
+                dropin=/etc/systemd/system/onvif-recorder-autoupdate.timer.d/schedule.conf
+                if journalctl -q -b --since=-10min -o cat \
+                       -u onvif-recorder-autoupdate.timer 2>/dev/null \
+                       | grep -q '^Stopped' || \
+                   { [ ! -e "$dropin" ] && \
+                     ! grep -Eqs '"autoupdate_enabled"[[:space:]]*:[[:space:]]*"?false' \
+                         /etc/onvif-recorder/config.json; }; then
+                    systemctl enable --now onvif-recorder-autoupdate.timer \
+                        || true
+                else
+                    echo "onvif-recorder: auto-update is off; turn it on under" \
+                         "Auto-update on the admin page if wanted." >&2
+                fi
+            fi
+            # Re-arm running timers so a changed schedule takes effect.
+            systemctl try-restart onvif-recorder-channel.timer \
+                                  onvif-recorder-autoupdate.timer || true
         fi
 
         # Deploy/refresh the persistent recovery layer on /data so the
