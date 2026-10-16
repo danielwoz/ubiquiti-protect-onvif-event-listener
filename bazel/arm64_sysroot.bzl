@@ -1,10 +1,12 @@
 """Repository rule that builds an arm64 sysroot for cross-compilation.
 
-Downloads Ubuntu 20.04 Focal arm64 packages (no root required) and assembles
+Downloads Ubuntu 22.04 Jammy arm64 packages (no root required) and assembles
 a sysroot that clang can use with -target aarch64-linux-gnu.
 
-The resulting binary requires only glibc >= 2.31 at runtime, matching the
-glibc version shipped on Ubuntu 20.04 / Ubiquiti devices.
+The resulting binary requires glibc >= 2.35 at runtime.  Jammy is the oldest
+base whose glibc is >= 2.34, where libpthread was folded into libc; building
+against an older glibc emits a GLIBC_PRIVATE reference against libpthread.so.0
+that cannot be satisfied on glibc >= 2.34 hosts such as UniFi OS 6.x (trixie).
 
 Usage in WORKSPACE:
     load("//bazel:arm64_sysroot.bzl", "arm64_sysroot")
@@ -14,7 +16,7 @@ Usage in WORKSPACE:
 
 # ---------------------------------------------------------------------------
 # Package list: (url, sha256)
-# All packages are Ubuntu 20.04 Focal from ports.ubuntu.com.
+# All packages are Ubuntu 22.04 Jammy from ports.ubuntu.com.
 # Cross packages (_all.deb) are mirrored on ports.ubuntu.com alongside the
 # native arm64 packages, so a single base URL covers everything.
 # ---------------------------------------------------------------------------
@@ -22,91 +24,94 @@ Usage in WORKSPACE:
 _PORTS = "http://ports.ubuntu.com/ubuntu-ports/"
 
 _PACKAGES = [
-    # --- Cross-compilation toolchain (glibc 2.31, gcc-9) -------------------
-    (_PORTS + "pool/main/c/cross-toolchain-base/libc6-dev-arm64-cross_2.31-0ubuntu9.9cross1_all.deb",
-     "fea8e2c2c74360e2ddc53bd4dfefbbbecc089c1def2eaf5a0eb1d5f04b59388c"),
-    (_PORTS + "pool/main/c/cross-toolchain-base/linux-libc-dev-arm64-cross_5.4.0-110.124cross1_all.deb",
-     "fc4ae3b72715906727565d29042bbac08ce4e46ca43b4b3d16a372e3813bf45f"),
-    (_PORTS + "pool/main/c/cross-toolchain-base/libc6-arm64-cross_2.31-0ubuntu9.9cross1_all.deb",
-     "d37029619ca1d94c37e787c4d7f08274dea82f3061f6d2a8239bd14e7371c99f"),
-    (_PORTS + "pool/main/g/gcc-9-cross/libgcc-9-dev-arm64-cross_9.4.0-1ubuntu1~20.04.2cross2_all.deb",
-     "efdab974d7271864bedf5f6cd74cd7236bce02e293174f57c54fbbed19736899"),
-    (_PORTS + "pool/main/g/gcc-10-cross/libgcc-s1-arm64-cross_10.5.0-1ubuntu1~20.04cross1_all.deb",
-     "9065f00c2a8dc8baf4584355f7eb3b18840212e62ea7eff68dab30a0ab250d59"),
-    (_PORTS + "pool/main/g/gcc-9-cross/libstdc++-9-dev-arm64-cross_9.4.0-1ubuntu1~20.04.2cross2_all.deb",
-     "17b0294c70127eeeaa38a334f4fd13971bdf9c6a26a26489f9ea3e049a0fc848"),
+    # --- Cross-compilation toolchain (glibc 2.35, gcc-11) ------------------
+    (_PORTS + "pool/main/c/cross-toolchain-base/libc6-dev-arm64-cross_2.35-0ubuntu1cross3_all.deb",
+     "1c552b83243bc5ac6b1ac01078f2396d0f483e849ec0b577bce28e067f6bd65d"),
+    (_PORTS + "pool/main/c/cross-toolchain-base/linux-libc-dev-arm64-cross_5.15.0-22.22cross3_all.deb",
+     "5f62ce5bee284a4c02ecb68bddcd96334ed71eda7e87c1638fac47e4f58f098d"),
+    (_PORTS + "pool/main/c/cross-toolchain-base/libc6-arm64-cross_2.35-0ubuntu1cross3_all.deb",
+     "32b6264502998dd170d21eff60b6686be8c682012df18e6cc9fdffcf42c5faae"),
+    (_PORTS + "pool/main/g/gcc-11-cross/libgcc-11-dev-arm64-cross_11.4.0-1ubuntu1~22.04.3cross1_all.deb",
+     "bc16d649bfdfdb7fe505ec9ef9853463f4f379dad5459cffa3ff5cdf477c817e"),
+    (_PORTS + "pool/main/g/gcc-12-cross/libgcc-s1-arm64-cross_12.3.0-1ubuntu1~22.04.3cross1_all.deb",
+     "2a62fd8d05a8e1a934f781d4d608a41e6bc12673723c9c2f0e546f30313077c8"),
+    (_PORTS + "pool/main/g/gcc-11-cross/libstdc++-11-dev-arm64-cross_11.4.0-1ubuntu1~22.04.3cross1_all.deb",
+     "ad4547e19f4c5c0a8d1a483db63346a7079ce261371b8ff8c8a896665d1b8ff8"),
     # --- Native arm64 runtime libraries ------------------------------------
-    (_PORTS + "pool/main/libj/libjpeg-turbo/libjpeg-turbo8_2.0.3-0ubuntu1_arm64.deb",
-     "cd6588ac233b9c1385ae6490e1969f15fe87b88b4f554dff0504eb4067edeb63"),
-    (_PORTS + "pool/main/libx/libxml2/libxml2_2.9.10+dfsg-5ubuntu0.20.04.10_arm64.deb",
-     "709c2d78a585c0280296f9d0136c71319ba4dcf06e72ffc18687747771ea2009"),
-    (_PORTS + "pool/main/c/curl/libcurl4_7.68.0-1ubuntu2.25_arm64.deb",
-     "ac1248efbe550c89838ec178ff560b0aabb64071924131a59ea9f54713ee6c35"),
-    (_PORTS + "pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2.24_arm64.deb",
-     "dded4572af8b0a9e0310909f211a519cc6409fda31ea81132a77e268b0ec0f2f"),
-    (_PORTS + "pool/universe/libm/libmicrohttpd/libmicrohttpd12_0.9.66-1_arm64.deb",
-     "00ecf8da0d7595ff15c3f171cc774f08a9b6e28883417529d59b7874b11b01f0"),
-    (_PORTS + "pool/main/p/postgresql-12/libpq5_12.22-0ubuntu0.20.04.4_arm64.deb",
-     "87b2632f4530f5d36a50d9ceea5af84d6500c486dbb4e5a1cf19cab549d70aac"),
-    # libicu66: libxml2 runtime depends on it; also provides unicode/ headers
-    (_PORTS + "pool/main/i/icu/libicu66_66.1-2ubuntu2.1_arm64.deb",
-     "ccfbd8e68fadcf4cc3975cdae42d1786733963f75d0b180f96c13782e185635b"),
+    (_PORTS + "pool/main/libj/libjpeg-turbo/libjpeg-turbo8_2.1.2-0ubuntu1_arm64.deb",
+     "1c47447261097e6a2105f4ae6f0bf2c7b1e8c6b8209c8ea40286c69c20f43818"),
+    (_PORTS + "pool/main/libx/libxml2/libxml2_2.9.13+dfsg-1ubuntu0.12_arm64.deb",
+     "6feb8502740e786e7d6a8d89e3d8d1060aaf6f27ad48bf279cb3c19b451eb16f"),
+    (_PORTS + "pool/main/c/curl/libcurl4_7.81.0-1ubuntu1.27_arm64.deb",
+     "52644a5b5c205d85ef9b61ca1472f2ee7c770c613ef70fc2a6be97353a0d2d4a"),
+    (_PORTS + "pool/main/o/openssl/libssl3_3.0.2-0ubuntu1.29_arm64.deb",
+     "3b25897180b0a84a7c7ad19ba310d6bdb45d5ce89742b478e12f606bed38fafa"),
+    (_PORTS + "pool/universe/libm/libmicrohttpd/libmicrohttpd12_0.9.75-3ubuntu1_arm64.deb",
+     "1f767b443f1b8b84f285611fba8f2757dbd2c96919e22333b0eee85e6f736b32"),
+    (_PORTS + "pool/main/p/postgresql-14/libpq5_14.24-0ubuntu0.22.04.1_arm64.deb",
+     "61950dd6c8ed2e1ec994bcbdb4634cf590549d42a58d28cc40cced60eec52078"),
+    # libicu70: libxml2 runtime depends on it; also provides unicode/ headers
+    (_PORTS + "pool/main/i/icu/libicu70_70.1-2_arm64.deb",
+     "ac68372cf4a976e6a206858fd9b28c68e49d37d650b9b8653270038a6e7bc174"),
     # --- Native arm64 dev packages (headers + stub .so) --------------------
-    (_PORTS + "pool/main/libj/libjpeg-turbo/libjpeg-turbo8-dev_2.0.3-0ubuntu1_arm64.deb",
-     "b2f20f3cc2147e387718ab3e3762833585de172353a9fca7c5f64842ab74304a"),
-    (_PORTS + "pool/main/libx/libxml2/libxml2-dev_2.9.10+dfsg-5ubuntu0.20.04.10_arm64.deb",
-     "0f222bdda6831bfa605b7c0fbbdce26c26bb844d34de1430b177ff9c9a5a9c92"),
-    (_PORTS + "pool/main/c/curl/libcurl4-openssl-dev_7.68.0-1ubuntu2.25_arm64.deb",
-     "499d2a6526765266d79d8f10169078ae4538d9333225afc595d59f9a9b238596"),
-    (_PORTS + "pool/main/o/openssl/libssl-dev_1.1.1f-1ubuntu2.24_arm64.deb",
-     "a664d282a0b19fb687c1b9f5a06abcf879bc5643c6e8be435f13c187d13a5b6a"),
-    (_PORTS + "pool/universe/libm/libmicrohttpd/libmicrohttpd-dev_0.9.66-1_arm64.deb",
-     "f39debe221a2424e3aca23dca099e07c766d5a161aa399c579bb1ef8c186ebd0"),
-    (_PORTS + "pool/main/p/postgresql-12/libpq-dev_12.22-0ubuntu0.20.04.4_arm64.deb",
-     "2790457020356cda2229865c5c54cbbc99e14288bfb58e25d33422e9f9ef51fa"),
+    (_PORTS + "pool/main/libj/libjpeg-turbo/libjpeg-turbo8-dev_2.1.2-0ubuntu1_arm64.deb",
+     "0818819dff2011fd38bd1b4fd9de8238050099993cea41e89f55a818d2ad2db3"),
+    (_PORTS + "pool/main/libx/libxml2/libxml2-dev_2.9.13+dfsg-1ubuntu0.12_arm64.deb",
+     "36703f65108410a97cc86e36cd1e63c5906dbd645becc7f276af963daa83d9fd"),
+    (_PORTS + "pool/main/c/curl/libcurl4-openssl-dev_7.81.0-1ubuntu1.27_arm64.deb",
+     "9dd420eb15ccc5111437200ae747143964b4c8967912ddb185e148f325ba2736"),
+    (_PORTS + "pool/main/o/openssl/libssl-dev_3.0.2-0ubuntu1.29_arm64.deb",
+     "953af13cba07be06f94df64f78ddc60d3e07dc05c8b99053afe9092fe024c944"),
+    (_PORTS + "pool/universe/libm/libmicrohttpd/libmicrohttpd-dev_0.9.75-3ubuntu1_arm64.deb",
+     "cbb4206cc2273e7817abad6c02b5025dc33763900e3bc0131312383d275a8de9"),
+    (_PORTS + "pool/main/p/postgresql-14/libpq-dev_14.24-0ubuntu0.22.04.1_arm64.deb",
+     "a70ad26e28b46aab5eda29ee532fca1f8b2d49d4494676a9da7a718f661c51b0"),
     # libicu-dev: provides unicode/ucnv.h and other ICU headers (libxml2 depends on ICU)
-    (_PORTS + "pool/main/i/icu/libicu-dev_66.1-2ubuntu2.1_arm64.deb",
-     "c19f2637b20756d61f347116cadcac4eb0078922bbcec9d4fddbab1987233178"),
+    (_PORTS + "pool/main/i/icu/libicu-dev_70.1-2_arm64.deb",
+     "5e0609095ce643b4a18e14a2c9852b13fba37e30e7b7e70a2ee2aebaa60008d8"),
     # --- Transitive static deps for libcurl, libxml2, libmicrohttpd, libpq ---
     # libxml2 needs: zlib, lzma (ICU already included above)
-    (_PORTS + "pool/main/z/zlib/zlib1g-dev_1.2.11.dfsg-2ubuntu1.5_arm64.deb",
-     "aca13b896f90ca536831ccbd6d11af35e4205656919e278a24029ddd00ddff3b"),
-    (_PORTS + "pool/main/x/xz-utils/liblzma-dev_5.2.4-1ubuntu1.1_arm64.deb",
-     "2feba24ec96e502cce0c2df217bd92d4739929ce6af2b63d5eca3f83b21ec05b"),
+    (_PORTS + "pool/main/z/zlib/zlib1g-dev_1.2.11.dfsg-2ubuntu9.2_arm64.deb",
+     "9bdd0a80de3b28e35a5cfe59b9d6f6997f0c2d7a16b168be0de9a0b668962189"),
+    (_PORTS + "pool/main/x/xz-utils/liblzma-dev_5.2.5-2ubuntu1.1_arm64.deb",
+     "33821ba76d0fa36d5b98c4ce8d75a4630876e8cb0ad2bf6885d8dae8445706cb"),
     # libcurl needs: nghttp2, idn2, rtmp, ssh, psl, zstd, brotli, ldap
-    (_PORTS + "pool/main/n/nghttp2/libnghttp2-dev_1.40.0-1ubuntu0.3_arm64.deb",
-     "0e2e86dfb67ad02b2b04e6c0d7ec3ef241234d1b8b5a510a0cd706e81dfc2f2f"),
-    (_PORTS + "pool/main/libi/libidn2/libidn2-dev_2.2.0-2_arm64.deb",
-     "7b9434d73d444397035429f5ffed52c15dbc231e7763ca0373de55682ed188ed"),
-    (_PORTS + "pool/main/r/rtmpdump/librtmp-dev_2.4+20151223.gitfa8646d.1-2build1_arm64.deb",
-     "072c77b014aa00e113bbc5b2267b4591725e8a112be709c7c91a27aa95ace881"),
-    (_PORTS + "pool/main/libs/libssh/libssh-dev_0.9.3-2ubuntu2.5_arm64.deb",
-     "962777552bfb4a2ba3a49b80dda3ab4722a809ffd26f18e665190acb2554ed0c"),
-    (_PORTS + "pool/main/libp/libpsl/libpsl-dev_0.21.0-1ubuntu1_arm64.deb",
-     "bde0df0d68cf032df80e69bbad2dbf8d5ec0e2821bd6a6d4055e097e1695a5a9"),
-    (_PORTS + "pool/main/libz/libzstd/libzstd-dev_1.4.4+dfsg-3ubuntu0.1_arm64.deb",
-     "b163aebc48f52ec5f23122f85905b28ff7bc017c6e5b0e271777e17db6fe2007"),
-    (_PORTS + "pool/main/b/brotli/libbrotli-dev_1.0.7-6ubuntu0.1_arm64.deb",
-     "548f7c052e4a77d3bcd17b37fbc29d8ba97c519b2f86440b7d804aa9d8f4a28f"),
-    # Focal uses openldap 2.4 (libldap2-dev, not libldap-dev as in Jammy)
-    (_PORTS + "pool/main/o/openldap/libldap2-dev_2.4.49+dfsg-2ubuntu1.10_arm64.deb",
-     "8214d6c8e8b4c64d92158c652f207816edd62ec1cf827889edef39ca0765cd3f"),
+    (_PORTS + "pool/main/n/nghttp2/libnghttp2-dev_1.43.0-1ubuntu0.4_arm64.deb",
+     "9ebfc6d33c315129cc9b6b770b5b4355735fb92407bff4771072886221c74c19"),
+    (_PORTS + "pool/main/libi/libidn2/libidn2-dev_2.3.2-2build1_arm64.deb",
+     "eafc142b861934b6e44e6b1b22447ce1b2353238b784c472e90c750661f7d7c7"),
+    (_PORTS + "pool/main/r/rtmpdump/librtmp-dev_2.4+20151223.gitfa8646d.1-2build4_arm64.deb",
+     "0fd3a70b05175215e51d97d3b432cc713bc6b66ea09b05909529aa0535fccbf4"),
+    (_PORTS + "pool/main/libs/libssh/libssh-dev_0.9.6-2ubuntu0.22.04.8_arm64.deb",
+     "6c44afa50c9030da5c44914549253b13949ac1de098d56206a1eed1e896f5862"),
+    (_PORTS + "pool/main/libp/libpsl/libpsl-dev_0.21.0-1.2build2_arm64.deb",
+     "1febae141df7f21637e622b169e76c4da4e6251539c49cc5d133fc42fdcf0449"),
+    (_PORTS + "pool/main/libz/libzstd/libzstd-dev_1.4.8+dfsg-3build1_arm64.deb",
+     "5382229c585552619e1c75210ef07ee5d0e4230351bf388552e6511d053a19c7"),
+    (_PORTS + "pool/main/b/brotli/libbrotli-dev_1.0.9-2build6_arm64.deb",
+     "c0bd96256db553ba156a061c7d744833e53209fef2934a2dc47167a93a323f62"),
+    # Jammy renames the openldap 2.5 dev package: libldap-dev, not libldap2-dev.
+    # libldap2-dev still exists in Jammy but is an arch:all transitional stub
+    # that only Depends: libldap-dev -- it ships no headers or libraries, so
+    # using it here silently produces a sysroot that fails at -lldap/-llber.
+    (_PORTS + "pool/main/o/openldap/libldap-dev_2.5.20+dfsg-0ubuntu0.22.04.1_arm64.deb",
+     "ce06ceb2539ffbba7140d656082508e01cc54fd011f482007dd241e2b28c2d58"),
     # libmicrohttpd needs gnutls and its deps: gmp, nettle/hogweed, tasn1, unistring, p11-kit
-    (_PORTS + "pool/main/g/gnutls28/libgnutls28-dev_3.6.13-2ubuntu1.12_arm64.deb",
-     "a37b2f9a0dd4ebfc497eee9b3e0847aeadd5c5e4327f508be096ac0b8577c056"),
-    (_PORTS + "pool/main/g/gmp/libgmp-dev_6.2.0+dfsg-4ubuntu0.1_arm64.deb",
-     "c508e030a0b26557c3d951953df9fe3cc2247386fcd04f4ae81b2fb9f7561fba"),
-    (_PORTS + "pool/main/n/nettle/nettle-dev_3.5.1+really3.5.1-2ubuntu0.2_arm64.deb",
-     "6d960fa201ce74cef58de75817b42d89b2e844c54a89e6511ca2440aef7c1e68"),
-    (_PORTS + "pool/main/libt/libtasn1-6/libtasn1-6-dev_4.16.0-2ubuntu0.1_arm64.deb",
-     "713ba67e1e7ed8993e5e8a2bc64e640a24c58c172c261071c4dc30800a726a7b"),
-    (_PORTS + "pool/main/libu/libunistring/libunistring-dev_0.9.10-2_arm64.deb",
-     "a9af0e7e8fd06f7e2e45ad617ac515b1d2ae2f8a1290ce3522686a89a3f9e648"),
-    (_PORTS + "pool/main/p/p11-kit/libp11-kit-dev_0.23.20-1ubuntu0.1_arm64.deb",
-     "25eeb936316bc0ce61e95afb1461f7ff18af4e74d707203aacd94a4bdf50f8d5"),
+    (_PORTS + "pool/main/g/gnutls28/libgnutls28-dev_3.7.3-4ubuntu1.9_arm64.deb",
+     "ec903794dc386dde11bc80c0e10ad95fcdfc0536b2a63783190ff55b4939863d"),
+    (_PORTS + "pool/main/g/gmp/libgmp-dev_6.2.1+dfsg-3ubuntu1_arm64.deb",
+     "f9c2f51e6d78f899009e61935af2ed3394951863dea78bee9185a695147550f6"),
+    (_PORTS + "pool/main/n/nettle/nettle-dev_3.7.3-1build2_arm64.deb",
+     "4fb0b4babd0df9e13df7d7eae1b1b95cda92d18c2af81cfa1c1da570dfb4eb16"),
+    (_PORTS + "pool/main/libt/libtasn1-6/libtasn1-6-dev_4.18.0-4ubuntu0.2_arm64.deb",
+     "586d2af3db7f19d53a82464294984262fcd24520fb9c26ae0c22beb7c94c705e"),
+    (_PORTS + "pool/main/libu/libunistring/libunistring-dev_1.0-1_arm64.deb",
+     "947eb5a573739f74be75d4eeb7bde2d962605fbb5321cf0495c5c6cf928528da"),
+    (_PORTS + "pool/main/p/p11-kit/libp11-kit-dev_0.24.0-6ubuntu0.1_arm64.deb",
+     "7a5da262c67ec1c936d5ad8561018d07ec2d6cc6dfc6131f3852f8c7bcb2e5e2"),
     # libpq needs pgcommon + pgport (not bundled in libpq.a on arm64)
-    (_PORTS + "pool/universe/p/postgresql-12/postgresql-server-dev-12_12.22-0ubuntu0.20.04.4_arm64.deb",
-     "7a70b2674718a13200dcd00c66d8bdffd23da37e625f0b379ff7de9a5414630b"),
+    (_PORTS + "pool/universe/p/postgresql-14/postgresql-server-dev-14_14.24-0ubuntu0.22.04.1_arm64.deb",
+     "2ef7e74256e1f062a8457f5efe0b008eca5d906750758e626cf29bb543f07ddc"),
 ]
 
 # Shell script that assembles the sysroot from extracted packages.
@@ -156,12 +161,25 @@ if [ -d "$TMP/usr/lib/aarch64-linux-gnu" ]; then
 fi
 
 # 5b. PostgreSQL static libs (libpgcommon.a, libpgport.a) from postgresql-server-dev:
-#     They install to usr/lib/postgresql/12/lib/ — copy into standard lib dir.
-if [ -d "$TMP/usr/lib/postgresql/12/lib" ]; then
+#     They install to usr/lib/postgresql/<major>/lib/ — copy into standard lib
+#     dir.  Glob the major version rather than hardcoding it: the directory is
+#     named after the server release (12 on Focal, 14 on Jammy), and a stale
+#     hardcoded path fails *silently* here and only surfaces much later as
+#     "ld.lld: error: unable to find library -lpgcommon".  Fail loudly instead.
+_pg_found=0
+for _pgdir in "$TMP"/usr/lib/postgresql/*/lib; do
+    [ -d "$_pgdir" ] || continue
     mkdir -p "$SYSROOT/usr/lib/aarch64-linux-gnu"
-    for a in "$TMP/usr/lib/postgresql/12/lib/"*.a; do
-        [ -f "$a" ] && cp -a "$a" "$SYSROOT/usr/lib/aarch64-linux-gnu/"
+    for a in "$_pgdir"/*.a; do
+        [ -f "$a" ] || continue
+        cp -a "$a" "$SYSROOT/usr/lib/aarch64-linux-gnu/"
+        _pg_found=1
     done
+done
+if [ "$_pg_found" -ne 1 ]; then
+    echo "ERROR: no libpg*.a found under $TMP/usr/lib/postgresql/*/lib" >&2
+    echo "       (postgresql-server-dev-* layout changed?)" >&2
+    exit 1
 fi
 
 # 6. Make gcc runtime visible to clang's --gcc-toolchain discovery.
@@ -534,19 +552,19 @@ def _aarch64_toolchain_config_impl(ctx):
         host_system_name       = "x86_64-unknown-linux-gnu",
         target_system_name     = "aarch64-unknown-linux-gnu",
         target_cpu             = "aarch64",
-        target_libc            = "glibc_2.31",
+        target_libc            = "glibc_2.35",
         compiler               = "clang",
         abi_version            = "aarch64",
-        abi_libc_version       = "glibc_2.31",
+        abi_libc_version       = "glibc_2.35",
         tool_paths             = tool_paths,
         features               = [default_flags, link_flags, supports_pic, supports_dynamic_linker],
         # Tell Bazel where system headers live so it tracks them as inputs.
         cxx_builtin_include_directories = [
             sysroot + "/usr/include",
-            sysroot + "/usr/include/c++/9",
-            sysroot + "/usr/include/c++/9/backward",
+            sysroot + "/usr/include/c++/11",
+            sysroot + "/usr/include/c++/11/backward",
             sysroot + "/usr/include/aarch64-linux-gnu",
-            sysroot + "/usr/include/c++/9/aarch64-linux-gnu",
+            sysroot + "/usr/include/c++/11/aarch64-linux-gnu",
             # libxml2 headers are under libxml2/ (included as <libxml/...>)
             sysroot + "/usr/include/libxml2",
             # libpq-fe.h is under a postgresql/ subdirectory
