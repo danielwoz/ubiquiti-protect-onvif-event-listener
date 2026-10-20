@@ -40,12 +40,16 @@ constexpr const char* kRestartCmdMsrWedge = "systemctl restart msr.service";
 // clears the stale in-memory flags in ~90 s.
 constexpr const char* kRestartCmdFlagDrift = "systemctl restart unifi-protect.service";  // NOLINT(whitespace/line_length)
 
+// Patched service.js is read only when the Protect process starts.
+constexpr const char* kRestartCmdPatchReload = "systemctl restart unifi-protect.service";  // NOLINT(whitespace/line_length)
+
 const char* reason_str(WedgeHealer::Reason r) {
   switch (r) {
-    case WedgeHealer::Reason::kDbWedge:   return "DB";
-    case WedgeHealer::Reason::kMsrWedge:  return "MSR";
-    case WedgeHealer::Reason::kFlagDrift: return "featureFlags-drift";
-    default:                              return "none";
+    case WedgeHealer::Reason::kDbWedge:     return "DB";
+    case WedgeHealer::Reason::kMsrWedge:    return "MSR";
+    case WedgeHealer::Reason::kFlagDrift:   return "featureFlags-drift";
+    case WedgeHealer::Reason::kPatchReload: return "patch-reload";
+    default:                                return "none";
   }
 }
 
@@ -200,14 +204,19 @@ WedgeHealer::FireResult WedgeHealer::fire_restart(Reason r) {
   }
 
   const char* cmd_c = kRestartCmdMsrWedge;
-  if (r == Reason::kDbWedge)        cmd_c = kRestartCmdDbWedge;
-  else if (r == Reason::kFlagDrift) cmd_c = kRestartCmdFlagDrift;
+  if (r == Reason::kDbWedge)          cmd_c = kRestartCmdDbWedge;
+  else if (r == Reason::kFlagDrift)   cmd_c = kRestartCmdFlagDrift;
+  else if (r == Reason::kPatchReload) cmd_c = kRestartCmdPatchReload;
   const std::string cmd = cmd_c;
   if (r == Reason::kFlagDrift) {
     LOG(ERROR) << "[healer] " << reason_str(r)
                << ": Protect still reports stale featureFlags "
                << kFlagDriftGraceSec
                << "s after we wrote them -- running: " << cmd;
+  } else if (r == Reason::kPatchReload) {
+    LOG(ERROR) << "[healer] " << reason_str(r)
+               << ": Protect started before service.js was patched and "
+                  "only loads it at start-up -- running: " << cmd;
   } else {
     LOG(ERROR) << "[healer] " << reason_str(r)
                << " wedged for >" << kWindowSec
@@ -301,9 +310,9 @@ WedgeHealer::Reason WedgeHealer::maybe_check_flag_drift(bool force) {
     }
     drift_armed_at_ = std::chrono::steady_clock::now();
   } else if (fr == FireResult::kGaveUp) {
-    // The daily cap does not lift within this process, so re-arming would
-    // reschedule a Postgres query plus one HTTP GET per camera every
-    // kFlagDriftGraceSec, forever, with no possible progress.  Stay
+    // The daily cap lifts only as earlier restarts age out of the 24 h
+    // window, so re-arming would repeat a Postgres query plus one HTTP GET
+    // per camera every kFlagDriftGraceSec for hours with no progress.  Stay
     // disarmed until something arms us again.
     LOG(WARNING) << "[healer] featureFlags drift persists but the restart "
                     "cap is reached; not re-arming. Restart onvif-recorder "
@@ -326,6 +335,44 @@ WedgeHealer::Reason WedgeHealer::check_flag_drift_for_testing() {
   return maybe_check_flag_drift(/*force=*/true);
 }
 
+WedgeHealer::Reason WedgeHealer::maybe_check_patch_reload(bool force) {
+  if (!patch_reload_) return Reason::kNone;
+  const auto now = std::chrono::steady_clock::now();
+  if (now < patch_resume_at_) return Reason::kNone;
+  const bool checked_before =
+      patch_checked_at_ != std::chrono::steady_clock::time_point();
+  if (!force && checked_before &&
+      now - patch_checked_at_ < std::chrono::seconds(kPatchReloadCheckSec)) {
+    return Reason::kNone;
+  }
+  patch_checked_at_ = now;
+  if (!patch_reload_()) {
+    patch_stale_streak_ = 0;
+    return Reason::kNone;
+  }
+  if (++patch_stale_streak_ < 2) return Reason::kNone;
+
+  const FireResult fr = fire_restart(Reason::kPatchReload);
+  if (fr == FireResult::kRan) {
+    patch_stale_streak_ = 0;
+  } else if (fr == FireResult::kGaveUp) {
+    // Pause instead of retrying every minute against a cap that lifts
+    // only as earlier restarts age out of the 24 h window.
+    patch_stale_streak_ = 0;
+    patch_resume_at_ = now + std::chrono::seconds(kPatchReloadBackoffSec);
+    LOG(WARNING) << "[healer] Protect is still running the service.js it "
+                    "loaded before onvif-recorder patched it, but the "
+                    "restart cap is reached; checking again in "
+                 << kPatchReloadBackoffSec / 60
+                 << " min. Restart unifi-protect to load the patch now.";
+  }
+  return Reason::kPatchReload;
+}
+
+WedgeHealer::Reason WedgeHealer::check_patch_reload_for_testing() {
+  return maybe_check_patch_reload(/*force=*/true);
+}
+
 void WedgeHealer::run() {
   // Sleep in 1-second slices so stop() is prompt.  Tick cadence: 10 s.
   constexpr int kTickSec = 10;
@@ -345,7 +392,8 @@ void WedgeHealer::run() {
       fire_restart(r);
       continue;  // one action per tick
     }
-    maybe_check_flag_drift(/*force=*/false);
+    if (maybe_check_flag_drift(/*force=*/false) != Reason::kNone) continue;
+    maybe_check_patch_reload(/*force=*/false);
   }
 }
 

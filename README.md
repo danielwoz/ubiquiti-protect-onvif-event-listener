@@ -55,7 +55,11 @@ event. Service logs land in journald (`journalctl -u onvif-recorder`).
 1. The Protect user ID is **auto-discovered** from the unifi-core database
    and cached to `/var/lib/onvif-recorder/protect-user-id`.
 2. The Protect UI is **live-patched** so third-party cameras appear in the
-   alarm creation picker.
+   alarm creation picker, and Protect's own ONVIF client is patched to send
+   the WS-Addressing headers some cameras (Reolink) require. Protect loads
+   these changes only when it starts, so if it was already running it is
+   restarted about five minutes later. The same happens after a Protect or
+   UniFi OS update.
 3. nginx is patched to expose the admin UI at `https://<device>/onvif/admin/`.
 4. Third-party ONVIF cameras are loaded from the Protect database and smart
    detection flags are enabled for them.
@@ -168,13 +172,23 @@ can appear briefly while either side re-subscribes, until the old one times out
 reject one with errors such as `ter:BlockedThreadUpperLimit`, and Protect then
 shows motion detection as misconfigured for that camera.
 
-**Duplicate motion and "person" events?** From Protect 7.2, Protect subscribes to a
+**Duplicate motion and "person" events?** From Protect 7.1, Protect subscribes to a
 third-party camera's ONVIF motion itself and creates the basic motion events.
 onvif-recorder never writes plain motion events, but by default it records motion
 it cannot classify as a smart detection of `default_object_type` (person). On
-Protect 7.2+ set `drop_unclassified_motion` to true (admin page, Detection) and
+Protect 7.1+ set `drop_unclassified_motion` to true (admin page, Detection) and
 leave motion detection on in Protect. Cameras for which Protect shows motion
 detection as misconfigured get no basic motion events with that setting.
+
+**No native motion from a Reolink camera, or Protect shows its motion detection as
+misconfigured?** From Protect 7.1, Protect subscribes to the camera's ONVIF motion
+events itself, but its requests lack two WS-Addressing headers that Reolink requires,
+so the camera rejects them. On 7.2 and later Protect then shows motion detection as
+misconfigured; on 7.1 it shows it as available but records no motion events.
+onvif-recorder patches Protect to send the headers (`patch_onvif_addressing`, on by
+default) and restarts Protect about five minutes later so the change loads (with
+`--auto_heal_protect=false`, restart Protect yourself). A camera with too few
+subscription slots can show the same status; see above.
 
 **Camera missing from the AI Port pairing list?** Protect only offers cameras without
 licence-plate or face detection, and onvif-recorder marks the cameras it manages as

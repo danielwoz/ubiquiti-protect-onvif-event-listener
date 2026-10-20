@@ -24,6 +24,8 @@
 
 using namespace protect_ui;  // NOLINT(build/namespaces)
 
+#include <fcntl.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,6 +33,7 @@ using namespace protect_ui;  // NOLINT(build/namespaces)
 #include <iostream>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -65,24 +68,27 @@ static bool write_test_file(const std::string& path,
 }
 
 // ---------------------------------------------------------------
-// Test 1: Patch string lengths are consistent
+// Test 1: Patch strings are consistent
 // ---------------------------------------------------------------
 static void test_patch_lengths() {
   for (size_t i = 0; i < kUiPatchCount; ++i) {
     const Patch& p = kUiPatches[i];
-    check(std::strlen(p.original) == p.len,
-          "UI patch original len matches");
-    check(std::strlen(p.replacement) == p.len,
-          "UI patch replacement len matches");
     check(std::strlen(p.original) == std::strlen(p.replacement),
           "UI patch same byte length");
   }
   for (size_t i = 0; i < kBackendPatchCount; ++i) {
     const Patch& p = kBackendPatches[i];
-    check(std::strlen(p.original) == p.len,
-          "Backend patch original len matches");
-    check(std::strlen(p.replacement) == p.len,
-          "Backend patch replacement len matches");
+    check(std::strlen(p.original) == std::strlen(p.replacement),
+          "Backend patch same byte length");
+  }
+  // A replacement that contains its original would be applied again on
+  // every pass.
+  std::vector<Patch> all(kUiPatches, kUiPatches + kUiPatchCount);
+  all.insert(all.end(), kBackendPatches, kBackendPatches + kBackendPatchCount);
+  all.push_back(kBackendPatchWsa);
+  for (const Patch& p : all) {
+    check(std::strstr(p.replacement, p.original) == nullptr,
+          "replacement does not contain its original");
   }
 }
 
@@ -288,7 +294,8 @@ static void test_rebuild_from_pristine_bak() {
       "scope_all_ui_cameras:e=>e.isAdopted&&!e.isThirdPartyCamera,scope_x:1";
   std::string mispatched = original;
   mispatched.replace(mispatched.find(kBackendPatch1.original),
-                     kBackendPatch1.len, kBackendPatch1.replacement);
+                     std::strlen(kBackendPatch1.original),
+                     kBackendPatch1.replacement);
   write_test_file(bak, original);
   write_test_file(path, mispatched);
 
@@ -300,7 +307,8 @@ static void test_rebuild_from_pristine_bak() {
 
   std::string expected = original;
   size_t at = expected.find("e.isAdopted&&!e.isThirdPartyCamera");
-  expected.replace(at + std::strlen("e.isAdopted"), kBackendPatch1.len,
+  expected.replace(at + std::strlen("e.isAdopted"),
+                   std::strlen(kBackendPatch1.original),
                    kBackendPatch1.replacement);
   check(read_test_file(path) == expected,
         "rebuild: validator restored and scope predicate patched");
@@ -310,12 +318,107 @@ static void test_rebuild_from_pristine_bak() {
   std::remove(bak.c_str());
 }
 
+// Protect 7.1 - 7.3's ONVIF client definition with its neighbours.
+static const char kSoapClient[] =
+    "return{body:M,rawText:C.text}};"
+    "t.connSoapRequest=(e,r,o,i,a,n)=>(0,t.soapRequest)({hostname:e.hostname,"
+    "port:e.port,path:r,body:{[o]:{\"@_xmlns\":i,...a}},username:e.username,"
+    "password:e.password,timeShift:e.timeShift,extraHeaders:n}),"
+    "t.soapRequest=async e=>(await(0,t.soapRequestRaw)(e)).body,";
+
+// The WS-Addressing patch rewrites only the ONVIF client definition, is a
+// no-op on the next pass, and is removed again when left out of the set.
+static void test_wsa_patch() {
+  std::string dir = temp_dir();
+  std::string path = dir + "/test_wsa_service.js";
+  std::string bak = path + ".bak";
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+
+  const std::string original = kSoapClient;
+  write_test_file(path, original);
+
+  const Patch with_wsa[] = {kBackendPatch1, kBackendPatchWsa};
+  std::unordered_map<std::string, std::string> empty_md5;
+  check(apply_patches(path, with_wsa, 2, empty_md5) == 1,
+        "wsa: one replacement");
+  const std::string patched = read_test_file(path);
+  check(patched.find("extraHeaders:n})") == std::string::npos,
+        "wsa: original definition replaced");
+  check(patched.find("extraHeaders:/*onvif-recorder:wsa*/") !=
+            std::string::npos,
+        "wsa: headers added to extraHeaders");
+  check(patched.rfind("return{body:M,rawText:C.text}};"
+                      "t.connSoapRequest=(e,r,o,i,a,n)=>", 0) == 0,
+        "wsa: preceding code untouched");
+  const std::string tail =
+      "(n,`http://${e.hostname}${e.port==80?\"\":\":\"+e.port}${r}`,o)}),"
+      "t.soapRequest=async e=>(await(0,t.soapRequestRaw)(e)).body,";
+  check(patched.size() > tail.size() &&
+            patched.compare(patched.size() - tail.size(), tail.size(),
+                            tail) == 0,
+        "wsa: following code untouched");
+  check(read_test_file(bak) == original, "wsa: original backed up");
+  check(apply_patches(path, with_wsa, 2, empty_md5) == 0,
+        "wsa: second run is a no-op");
+  check(read_test_file(path) == patched, "wsa: second run leaves file");
+
+  // Leaving the patch out rebuilds the file from the package original.
+  std::unordered_map<std::string, std::string> md5sums;
+  md5sums[path.substr(1)] = md5_of_file(bak);
+  apply_patches(path, kBackendPatches, kBackendPatchCount, md5sums,
+                &kBackendPatchWsa, 1);
+  check(read_test_file(path) == original, "wsa: disabling restores original");
+
+  // Without a backup dpkg can vouch for, a disabled patch is taken out of
+  // the live file and the existing backup is kept.
+  write_test_file(path, patched);
+  write_test_file(bak, "older backup");
+  apply_patches(path, kBackendPatches, kBackendPatchCount, empty_md5,
+                &kBackendPatchWsa, 1);
+  check(read_test_file(path) == original,
+        "wsa: disabling without a verified backup removes it");
+  check(read_test_file(bak) == "older backup",
+        "wsa: disabling keeps the existing backup");
+
+  // Two definitions no longer identify one client: leave the file alone.
+  const std::string twice = original + original;
+  write_test_file(path, twice);
+  std::remove(bak.c_str());
+  check(apply_patches(path, with_wsa, 2, empty_md5) == 0,
+        "wsa: ambiguous anchor skipped");
+  check(read_test_file(path) == twice, "wsa: ambiguous file unchanged");
+
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+}
+
+// Protect needs a restart only when service.js was written after the
+// running process started.
+static void test_file_newer_than_process() {
+  const std::string path = temp_dir() + "/test_newer_than_process.js";
+  // Let this process age past the clock-tick resolution of its start time.
+  usleep(100 * 1000);
+  write_test_file(path, "x");
+  check(file_newer_than_process(path, getpid()),
+        "newer: file written after the process started");
+
+  const struct timespec y2k[2] = {{946684800, 0}, {946684800, 0}};
+  check(utimensat(AT_FDCWD, path.c_str(), y2k, 0) == 0, "newer: set mtime");
+  check(!file_newer_than_process(path, getpid()),
+        "newer: file older than the process");
+  check(!file_newer_than_process(path + ".missing", getpid()),
+        "newer: missing file");
+  check(!file_newer_than_process(path, 0), "newer: no such process");
+  std::remove(path.c_str());
+}
+
 // ---------------------------------------------------------------
-// Test 6: dpkg md5sum backup logic
+// Test 6: backup logic
 //
-// When md5sums map is non-empty:
-//   - If live file matches dpkg md5 -> overwrite .bak
-//   - If live file does NOT match -> keep existing .bak
+// An unpatched live file is the package's file and becomes the backup,
+// whatever dpkg's md5sums say (they lag behind during an upgrade).  A
+// patched live file never replaces the backup.
 // ---------------------------------------------------------------
 static void test_dpkg_backup_logic() {
   std::string dir = temp_dir();
@@ -327,28 +430,84 @@ static void test_dpkg_backup_logic() {
   std::string content = "prefix_";
   content += kUiPatch1a.original;
   content += "_suffix";
-
   write_test_file(path, content);
+  write_test_file(bak, "old backup content");
 
-  // Simulate a dpkg md5sums map where the live file does NOT match.
-  // This means the file has been modified — should NOT overwrite .bak.
   std::unordered_map<std::string, std::string> md5sums;
-  std::string rel = path.substr(1);  // remove leading /
-  md5sums[rel] = "0000000000000000aaaaaaaaaaaaaaaa";  // wrong md5
-
-  // Pre-create a .bak with different content (simulating old backup).
-  std::string old_bak = "old backup content";
-  write_test_file(bak, old_bak);
-
+  md5sums[path.substr(1)] = "0000000000000000aaaaaaaaaaaaaaaa";  // stale
   int n = apply_patches(path, kUiPatches, kUiPatchCount, md5sums);
   check(n == 1, "dpkg: patch applied");
+  check(read_test_file(bak) == content, "dpkg: unpatched file backed up");
 
-  // .bak should still have the old content (not overwritten).
-  std::string bak_content = read_test_file(bak);
-  check(bak_content == old_bak, "dpkg: existing .bak preserved");
+  // A later pass over the patched file (no md5sums, as on a dev machine)
+  // with an extra patch keeps the backup of the unpatched file.
+  const std::string patched = read_test_file(path);
+  write_test_file(path, patched + ";" + kUiPatch3.original);
+  std::unordered_map<std::string, std::string> empty_md5;
+  check(apply_patches(path, kUiPatches, kUiPatchCount, empty_md5) == 1,
+        "dpkg: extra patch applied");
+  check(read_test_file(bak) == content, "dpkg: patched file not backed up");
 
   std::remove(path.c_str());
   std::remove(bak.c_str());
+}
+
+// A live file that differs from the package original without carrying our
+// patches (damaged, or edited by hand) is rebuilt from the verified .bak,
+// and that .bak is never replaced by it.
+static void test_unpatched_damage_rebuilt_from_bak() {
+  std::string dir = temp_dir();
+  std::string path = dir + "/test_damaged_service.js";
+  std::string bak = path + ".bak";
+  const std::string pristine =
+      "v1;scope_all_ui_cameras:e=>e.isAdopted&&!e.isThirdPartyCamera,scope_x";
+  const std::string damaged = pristine.substr(0, 40);
+  write_test_file(bak, pristine);
+  write_test_file(path, damaged);
+  std::unordered_map<std::string, std::string> md5sums;
+  md5sums[path.substr(1)] = md5_of_file(bak);
+
+  check(apply_patches(path, kBackendPatches, kBackendPatchCount, md5sums) ==
+            1,
+        "damaged: rebuilt and patched");
+  const std::string out = read_test_file(path);
+  check(out.rfind("v1;", 0) == 0 && out.size() == pristine.size() &&
+            out.find(kBackendPatch1.replacement) != std::string::npos,
+        "damaged: original restored and patched");
+  check(read_test_file(bak) == pristine, "damaged: verified .bak kept");
+
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+}
+
+// dpkg marks a package half-installed while it unpacks it.
+static void test_half_installed_status() {
+  check(status_is_half_installed("install ok half-installed"),
+        "status: unpacking");
+  check(status_is_half_installed("install reinstreq half-installed"),
+        "status: failed unpack");
+  check(!status_is_half_installed("install ok installed"), "status: done");
+  check(!status_is_half_installed("install ok unpacked"), "status: unpacked");
+  check(!status_is_half_installed(""), "status: unknown package");
+}
+
+// Files are replaced whole, keeping their mode.
+static void test_replace_file() {
+  const std::string path = temp_dir() + "/test_replace.js";
+  write_test_file(path, "old");
+  chmod(path.c_str(), 0755);
+  check(replace_file(path, "new content"), "replace: succeeds");
+  check(read_test_file(path) == "new content", "replace: content written");
+  struct stat st;
+  check(stat(path.c_str(), &st) == 0 && (st.st_mode & 07777) == 0755,
+        "replace: mode kept");
+  check(read_test_file(path + ".onvif-recorder.tmp").empty(),
+        "replace: no temporary file left");
+  std::remove(path.c_str());
+
+  check(replace_file(path, "fresh"), "replace: creates a missing file");
+  check(read_test_file(path) == "fresh", "replace: new file written");
+  std::remove(path.c_str());
 }
 
 // ---------------------------------------------------------------
@@ -506,7 +665,12 @@ int main() {
   test_ambiguous_anchor_skipped();
   test_patch2_targets_automation_filter();
   test_rebuild_from_pristine_bak();
+  test_wsa_patch();
+  test_file_newer_than_process();
   test_dpkg_backup_logic();
+  test_unpatched_damage_rebuilt_from_bak();
+  test_half_installed_status();
+  test_replace_file();
   test_partial_patch();
   test_revert_byte_for_byte();
   test_nginx_inject_not_nested();

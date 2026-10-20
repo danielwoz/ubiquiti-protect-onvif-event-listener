@@ -26,8 +26,9 @@
 namespace onvif {
 
 // Background thread that watches for wedged Protect state and issues a
-// targeted `systemctl restart` when it fires.  There are two independent
-// wedge signals:
+// targeted `systemctl restart` when it fires.  Besides the featureFlags
+// drift and patch-reload checks below, there are two independent wedge
+// signals:
 //
 //   * DB wedge   -- pg_stats has seen at least one query timeout in the
 //                    last kWindowSec and zero successful queries in the
@@ -81,7 +82,21 @@ class WedgeHealer {
     kDbWedge,
     kMsrWedge,
     kFlagDrift,
+    kPatchReload,
   };
+
+  // How often the patch-reload check runs.  A restart needs two positive
+  // checks in a row, so a service.js written by an installer that restarts
+  // Protect itself straight afterwards is not acted on.
+  static constexpr int kPatchReloadCheckSec = 60;
+  // Pause after the daily cap stops a patch-reload restart; the cap lifts
+  // as earlier restarts age out of the 24 h window.
+  static constexpr int kPatchReloadBackoffSec = 60 * 60;
+
+  // Callback that reports whether Protect is still running code older than
+  // a file we patched (service.js written after Protect started), so only a
+  // restart loads the patch.  Called on the monitor thread.
+  using PatchReloadFn = std::function<bool()>;
 
   // Callback that compares what we wrote into Postgres against what
   // Protect's API reports in memory, for the given camera IDs.  Returns
@@ -104,6 +119,9 @@ class WedgeHealer {
   void set_msr_snapshot_fn(MsrSnapshotFn fn) { msr_snapshot_ = std::move(fn); }
   void set_exec_fn(ExecFn fn) { exec_ = std::move(fn); }
   void set_flag_drift_fn(FlagDriftFn fn) { flag_drift_ = std::move(fn); }
+  void set_patch_reload_fn(PatchReloadFn fn) {
+    patch_reload_ = std::move(fn);
+  }
 
   /// Persist restart timestamps to @p path so the cooldown and the
   /// 24-hour cap survive our own restarts.  Without this both are
@@ -150,6 +168,20 @@ class WedgeHealer {
   // bypassing the grace-period wait.  Returns the reason if it fired.
   Reason check_flag_drift_for_testing();
 
+  // Exposed for unit tests: run the patch-reload check immediately,
+  // bypassing its interval.  Returns kPatchReload when it asked for a
+  // restart, whether or not a safeguard then suppressed it.
+  Reason check_patch_reload_for_testing();
+
+  // Exposed for unit tests: behave as if the warmup period had passed.
+  void end_warmup_for_testing() {
+    boot_ = std::chrono::steady_clock::now() -
+            std::chrono::seconds(kWarmupSec + 1);
+  }
+
+  // Exposed for unit tests: end a patch-reload pause after the daily cap.
+  void end_patch_reload_backoff_for_testing() { patch_resume_at_ = {}; }
+
  private:
   void run();
   Reason decide_wedge(int64_t db_ms_since_success,
@@ -159,20 +191,29 @@ class WedgeHealer {
   // @p force).  Disarms afterwards either way.  Returns kFlagDrift if
   // drift was found and a restart was requested.
   Reason maybe_check_flag_drift(bool force);
+  // Runs the patch-reload check if kPatchReloadCheckSec has passed since
+  // the last one (or @p force).  Returns kPatchReload if it requested a
+  // restart.
+  Reason maybe_check_patch_reload(bool force);
   // Why a restart attempt did or didn't run.  The distinction matters for
-  // the flag-drift path: a time-bounded suppression is worth waiting out
-  // and retrying, but the daily cap never lifts within a process, so
-  // re-arming against it would spin forever.
+  // the flag-drift and patch-reload paths: warmup and cooldown lift within
+  // minutes and are worth retrying, while the daily cap lifts only as
+  // earlier restarts age out of the 24 h window.
   enum class FireResult {
     kRan,          // command executed
     kWaitAndRetry, // warmup or cooldown -- try again later
-    kGaveUp,       // daily cap reached; retrying cannot help
+    kGaveUp,       // daily cap reached; retrying soon cannot help
   };
   FireResult fire_restart(Reason r);
 
   MsrSnapshotFn                     msr_snapshot_;
   ExecFn                            exec_;
   FlagDriftFn                       flag_drift_;
+  // Patch-reload check state; only touched by the monitor thread.
+  PatchReloadFn                     patch_reload_;
+  std::chrono::steady_clock::time_point patch_checked_at_{};
+  int                               patch_stale_streak_ = 0;
+  std::chrono::steady_clock::time_point patch_resume_at_{};
   // Pending one-shot drift check, guarded by drift_mu_.  armed_at_ is
   // default-constructed when nothing is pending.
   mutable std::mutex                drift_mu_;

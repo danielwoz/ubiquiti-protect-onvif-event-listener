@@ -69,7 +69,7 @@ const std::vector<Entry>& Schema() {
      "events (Person/Vehicle/Pet), per-camera overrides and momentary topics "
      "such as line crossing are unaffected.  Cuts false-positive clutter from "
      "AI cameras (e.g. Reolink) that also emit noisy basic-motion events.  "
-     "Recommended on Protect 7.2+, which records basic motion for "
+     "Recommended on Protect 7.1+, which records basic motion for "
      "third-party cameras itself.",
      "Detection"},
     {"momentary_event_sec", Type::Int,
@@ -187,6 +187,16 @@ const std::vector<Entry>& Schema() {
     {"thumbnail_hook_timeout_sec", Type::Int,
      "Seconds to wait for thumbnail_hook_url before using the built-in "
      "thumbnail.",
+     "Cameras"},
+    {"patch_onvif_addressing", Type::Bool,
+     "Make Protect's own ONVIF client (Protect 7.1+) send the "
+     "WS-Addressing To and Action headers with its event requests, as "
+     "onvif-recorder does.  Cameras that require them (e.g. Reolink) "
+     "otherwise reject those requests, so Protect gets no native motion "
+     "events from them.  Protect loads the change when it starts, so "
+     "changing this setting restarts Protect about five minutes later "
+     "(not with --auto_heal_protect=false in the service flags).  "
+     "Default on.",
      "Cameras"},
     {"camera_snapshot_via_protect", Type::String,
      "Comma-separated list of camera IPs whose thumbnails should be "

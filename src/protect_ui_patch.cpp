@@ -15,11 +15,17 @@
 #include "protect_ui_patch.hpp"
 
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -33,8 +39,11 @@
 namespace protect_ui {
 
 // ---------------------------------------------------------------
-// Patch table.  Each entry is {original, replacement} where both
-// strings MUST be the same byte length so file offsets are preserved.
+// Patch table.  Each entry is {original, replacement}.  Replacements that
+// only disable code keep the original byte length so file offsets are
+// preserved; a replacement that adds code changes the length.  A
+// replacement must never contain its original, or every pass would apply
+// it again.
 //
 // A patch is applied only when `original` occurs exactly once in its
 // search range.  Minified bundles reuse short expressions in unrelated
@@ -53,7 +62,6 @@ namespace protect_ui {
 struct Patch {
   const char* original;
   const char* replacement;
-  size_t len;
   const char* region_begin = nullptr;
   const char* region_end = nullptr;
 };
@@ -64,27 +72,27 @@ struct Patch {
 // cameras.
 static const Patch kUiPatch1a = {
 "!e.isThirdPartyCamera||e.isPairedWithAiPort",
-"!0/*sThirdPartyCamera||isPairedWithAiPort*/", 43};
+"!0/*sThirdPartyCamera||isPairedWithAiPort*/"};
 
 // 1b. Camera picker filter (UI bundle 7.0.57, shipped in Protect 7.0.107):
-// new exclusion filter. (40 bytes)
+// new exclusion filter.
 static const Patch kUiPatch1b = {
 "!e.isThirdPartyCamera&&!v.includes(e.id)",
-"!0/*hirdPartyCamera&&!v.includes(e.id)*/", 40};
+"!0/*hirdPartyCamera&&!v.includes(e.id)*/"};
 
 // 2. Automation camera list filter
 //    !(… e.nvrMac!==… || e.isThirdPartyCamera&&!e.isPairedWithAiPort)
 // (Protect 6.x - 7.2.x; gone in 7.3).  Anchored on the surrounding "||" and
 // ")" because later bundles use the bare expression for the microphone
-// capability check and the ONVIF profile settings form. (46 bytes)
+// capability check and the ONVIF profile settings form.
 static const Patch kUiPatch2 = {
 "||e.isThirdPartyCamera&&!e.isPairedWithAiPort)",
-"||!1/*ThirdPartyCamera&&!isPairedWithAiPort*/)", 46};
+"||!1/*ThirdPartyCamera&&!isPairedWithAiPort*/)"};
 
-// 3. hasFullFeatureSet getter: always true. (55 bytes)
+// 3. hasFullFeatureSet getter: always true.
 static const Patch kUiPatch3 = {
 "return!this.isThirdPartyCamera||this.isPairedWithAiPort",
-"return!0/*isThirdPartyCamera||this.isPairedWithAiPort*/", 55};
+"return!0/*isThirdPartyCamera||this.isPairedWithAiPort*/"};
 
 static const Patch kUiPatches[] = {
 kUiPatch1a, kUiPatch1b, kUiPatch2, kUiPatch3};
@@ -92,16 +100,53 @@ static constexpr size_t kUiPatchCount = 4;
 
 // --- Backend patches (service.js) ---
 
-// 4. scope_all_ui_cameras: remove third-party exclusion. (23 bytes)
+// 4. scope_all_ui_cameras: remove third-party exclusion.
 // The same fragment also guards the ONVIF stream-settings validator, so
 // the search is confined to the scope predicate's own definition.
 static const Patch kBackendPatch1 = {
 "&&!e.isThirdPartyCamera",
-"/*isThirdPartyCamera */", 23,
+"/*isThirdPartyCamera */",
 "scope_all_ui_cameras:e=>", ",scope_"};
 
 static const Patch kBackendPatches[] = {kBackendPatch1};
 static constexpr size_t kBackendPatchCount = 1;
+
+// Prefix of the marker comment in code this program injects.
+static const char kInjectedMarker[] = "/*onvif-recorder:";
+
+// 5. ONVIF client (Protect 7.1+): add the WS-Addressing To and Action
+// headers to PullMessages, Renew and Unsubscribe.  Protect sends neither,
+// and cameras whose SOAP stack requires them (Reolink) answer every pull
+// with HTTP 400, so Protect's own motion detection for them keeps failing
+// (#58).  The headers are the ones onvif-recorder sends to every camera:
+// To is the URL Protect posts to (without the default port 80), Action the
+// standard URI for the operation.  A request whose ReferenceParameters
+// already carry To or Action is left alone.  The definition is identical
+// in 7.1.87, 7.2.105 and 7.3.70; 7.0 and earlier have no ONVIF event
+// client.
+//
+// Code this program injects carries an "/*onvif-recorder:" marker so a
+// file patched by any version is recognised.  If this replacement text
+// ever changes, the old text must stay in the removed list so it is taken
+// out before the new one goes in.
+static const Patch kBackendPatchWsa = {
+"t.connSoapRequest=(e,r,o,i,a,n)=>(0,t.soapRequest)({hostname:e.hostname,"
+"port:e.port,path:r,body:{[o]:{\"@_xmlns\":i,...a}},username:e.username,"
+"password:e.password,timeShift:e.timeShift,extraHeaders:n})",
+"t.connSoapRequest=(e,r,o,i,a,n)=>(0,t.soapRequest)({hostname:e.hostname,"
+"port:e.port,path:r,body:{[o]:{\"@_xmlns\":i,...a}},username:e.username,"
+"password:e.password,timeShift:e.timeShift,extraHeaders:"
+"/*onvif-recorder:wsa*/((h,u,c)=>{const w=c===\"PullMessages\"?"
+"\"http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/"
+"PullMessagesRequest\":c===\"Renew\"?\"http://docs.oasis-open.org/wsn/"
+"bw-2/SubscriptionManager/RenewRequest\":c===\"Unsubscribe\"?"
+"\"http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/"
+"UnsubscribeRequest\":\"\";if(!w||Object.keys(h||{}).some(k=>"
+"/(^|:)(To|Action)$/.test(k)))return h;"
+"const x=\"http://www.w3.org/2005/08/addressing\";"
+"return{...h,\"wsa:To\":{\"@_xmlns:wsa\":x,\"#text\":u},"
+"\"wsa:Action\":{\"@_xmlns:wsa\":x,\"#text\":w}}})"
+"(n,`http://${e.hostname}${e.port==80?\"\":\":\"+e.port}${r}`,o)})"};
 
 // ---------------------------------------------------------------
 // Paths
@@ -125,6 +170,48 @@ static bool write_file(const std::string& path, const std::string& data) {
   if (!f) return false;
   f.write(data.data(), static_cast<std::streamsize>(data.size()));
   return f.good();
+}
+
+// Replace @p path with @p data through a temporary file and rename(), so a
+// failed write never leaves a truncated file behind.  Keeps an existing
+// file's mode and, where permitted, its owner; a new file gets mode 0644.  A
+// symlink is written through in place.
+static bool replace_file(const std::string& path, const std::string& data) {
+  struct stat st;
+  if (lstat(path.c_str(), &st) == 0) {
+    if (S_ISLNK(st.st_mode)) return write_file(path, data);
+  } else {
+    st = {};
+    st.st_mode = 0644;
+    st.st_uid = geteuid();
+    st.st_gid = getegid();
+  }
+  const std::string tmp = path + ".onvif-recorder.tmp";
+  const int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                      st.st_mode & 07777);
+  if (fd < 0) return false;
+  bool ok = true;
+  size_t off = 0;
+  while (ok && off < data.size()) {
+    const ssize_t n = write(fd, data.data() + off, data.size() - off);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      ok = false;
+    } else {
+      off += static_cast<size_t>(n);
+    }
+  }
+  ok = ok && fchmod(fd, st.st_mode & 07777) == 0;
+  // Only root can hand the file back to another owner; tests run as the
+  // file's own owner, where this is a no-op.
+  if (ok && fchown(fd, st.st_uid, st.st_gid) != 0 && geteuid() == 0) {
+    ok = false;
+  }
+  ok = ok && fsync(fd) == 0;
+  ok = close(fd) == 0 && ok;
+  ok = ok && std::rename(tmp.c_str(), path.c_str()) == 0;
+  if (!ok) unlink(tmp.c_str());
+  return ok;
 }
 
 // ---------------------------------------------------------------
@@ -262,23 +349,54 @@ static bool file_md5_is(const std::string& path, const std::string& md5) {
   return !md5.empty() && md5_of_file(path) == md5;
 }
 
+// Whether @p content holds code this program patched in, by any version.
+static bool has_known_patch(const std::string& content) {
+  if (content.find(kInjectedMarker) != std::string::npos) return true;
+  for (const Patch& p : kUiPatches) {
+    if (content.find(p.replacement) != std::string::npos) return true;
+  }
+  for (const Patch& p : kBackendPatches) {
+    if (content.find(p.replacement) != std::string::npos) return true;
+  }
+  return false;
+}
+
+// Put back the original of @p p where its replacement occurs exactly once in
+// its search range.  Returns true if the content changed.
+static bool unapply_patch(std::string* content, const Patch& p) {
+  size_t pos = 0;
+  if (classify_patch(*content, p, &pos) != PatchState::kAlreadyApplied) {
+    return false;
+  }
+  size_t begin = 0;
+  size_t end = 0;
+  resolve_region(*content, p, &begin, &end);
+  pos = content->find(p.replacement, begin);
+  content->replace(pos, std::strlen(p.replacement), p.original);
+  return true;
+}
+
 // ---------------------------------------------------------------
 // Apply patches to a single file.
 // Returns number of patches applied, or -1 if file not readable.
+// Patches in @p removed that are present in the file are taken out again.
 //
-// The patched file is always derived from the unmodified package original
-// when one is available, so a file patched by an older, less precise rule
-// set is rebuilt correctly rather than patched on top of:
-//   - live file matches its dpkg md5 -> it is the original; refresh .bak.
-//   - live file differs and .bak matches dpkg md5 -> start from .bak.
-//   - neither matches -> start from the live file and keep the existing
-//     .bak (we would otherwise back up a modified file).
-//   - no dpkg md5sums (dev machine) -> start from the live file and back
-//     it up before the first modification.
+// The source the patches are applied to:
+//   - live matches its dpkg md5 -> it is the package original: patch it and
+//     make it the new .bak.
+//   - live differs and .bak matches the dpkg md5 -> rebuild from .bak, so a
+//     file patched by an older rule set, damaged or edited by hand is
+//     corrected.
+//   - otherwise (no md5 on record, or neither matches) -> patch the live
+//     file.  It becomes the new .bak only if it carries none of our
+//     patches, so a patched file never replaces the backup.
+// While dpkg unpacks a new Protect its md5sums still describe the old
+// files, so patch_alarm_picker() does not run then.
 // ---------------------------------------------------------------
 static int apply_patches(
     const std::string& path, const Patch* patches, size_t count,
-    const std::unordered_map<std::string, std::string>& md5sums) {
+    const std::unordered_map<std::string, std::string>& md5sums,
+    const Patch* removed = nullptr, size_t removed_count = 0) {
   const std::string live = read_file(path);
   if (live.empty()) return -1;
 
@@ -296,13 +414,17 @@ static int apply_patches(
   }
 
   std::string result = source;
+  int unapplied = 0;
+  for (size_t i = 0; i < removed_count; ++i) {
+    if (unapply_patch(&result, removed[i])) ++unapplied;
+  }
   int applied = 0;
   for (size_t i = 0; i < count; ++i) {
     const Patch& p = patches[i];
     size_t pos = 0;
     switch (classify_patch(result, p, &pos)) {
       case PatchState::kApply:
-        result.replace(pos, p.len, p.replacement);
+        result.replace(pos, std::strlen(p.original), p.replacement);
         ++applied;
         break;
       case PatchState::kAmbiguous:
@@ -320,36 +442,58 @@ static int apply_patches(
     return 0;
   }
 
-  if (!source_is_bak) {
-    if (md5sums.empty() || live_is_original) {
-      if (!write_file(bak_path, live)) {
-        LOG(ERROR) << "[ui_patch] failed to write backup: " << bak_path;
-        return 0;
-      }
-    } else {
-      LOG(INFO) << "[ui_patch] " << path
-                << " already modified -- keeping existing .bak";
-    }
-  } else {
+  if (source_is_bak) {
     LOG(WARNING) << "[ui_patch] " << path
                  << " differs from the patch set for this version -- "
                     "rebuilding from " << bak_path;
+  } else if (live_is_original || !has_known_patch(live)) {
+    if (!replace_file(bak_path, live)) {
+      LOG(ERROR) << "[ui_patch] failed to write backup: " << bak_path;
+      return 0;
+    }
+  } else {
+    LOG(INFO) << "[ui_patch] " << path
+              << " already modified -- keeping existing .bak";
   }
 
-  if (!write_file(path, result)) {
+  if (!replace_file(path, result)) {
     LOG(ERROR) << "[ui_patch] failed to write: " << path;
     return 0;
   }
 
-  LOG(INFO) << "[ui_patch] patched " << path
-            << " (" << applied << " replacement(s))";
+  LOG(INFO) << "[ui_patch] patched " << path << " (" << applied
+            << " replacement(s), " << unapplied << " removed)";
   return applied;
+}
+
+// Whether a dpkg status string says the package is part-way through being
+// unpacked, when its files may be newer than the md5sums on record.
+static bool status_is_half_installed(const std::string& status) {
+  return status.find("half-installed") != std::string::npos;
+}
+
+static bool protect_unpack_in_progress() {
+  std::FILE* p = popen("dpkg-query -W -f='${Status}' unifi-protect "
+                       "2>/dev/null", "r");  // NOLINT
+  if (!p) return false;
+  char buf[128] = {};
+  const char* ok = std::fgets(buf, sizeof(buf), p);
+  pclose(p);
+  return ok && status_is_half_installed(buf);
 }
 
 // ---------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------
-absl::Status patch_alarm_picker() {
+absl::Status patch_alarm_picker(bool onvif_addressing) {
+  // dpkg's trigger restarts onvif-recorder once the unpack has finished,
+  // and that start-up patches the new files.
+  if (protect_unpack_in_progress()) {
+    LOG(INFO) << "[ui_patch] unifi-protect is being unpacked -- patching "
+                 "after dpkg finishes";
+    return absl::OkStatus();
+  }
+
   // Log the detected Protect firmware so a journal capture from a user
   // running a brand-new firmware makes the version visible up-front.
   // Fast popen path; failure is silent (we still proceed with patching).
@@ -396,10 +540,15 @@ absl::Status patch_alarm_picker() {
     }
   }
 
-  // Patch service.js (backend scope filter).
+  // Patch service.js (backend scope filter, ONVIF WS-Addressing).  A
+  // disabled WS-Addressing patch is taken out again.
   {
-    int n = apply_patches(kServicePath, kBackendPatches, kBackendPatchCount,
-                          md5sums);
+    std::vector<Patch> backend(kBackendPatches,
+                               kBackendPatches + kBackendPatchCount);
+    std::vector<Patch> removed;
+    (onvif_addressing ? backend : removed).push_back(kBackendPatchWsa);
+    int n = apply_patches(kServicePath, backend.data(), backend.size(),
+                          md5sums, removed.data(), removed.size());
     if (n >= 0) {
       ++files_found;
       total += n;
@@ -449,7 +598,7 @@ absl::Status revert_alarm_picker_in(const std::string& ui_dir,
       }
     }
 
-    if (!write_file(path, content)) {
+    if (!replace_file(path, content)) {
       LOG(ERROR) << "[ui_patch] failed to restore " << path;
       return;
     }
@@ -478,6 +627,68 @@ absl::Status revert_alarm_picker_in(const std::string& ui_dir,
 
 absl::Status revert_alarm_picker() {
   return revert_alarm_picker_in(kUiDir, kServicePath);
+}
+
+// ---------------------------------------------------------------
+// Protect restart check
+// ---------------------------------------------------------------
+
+// Seconds since process @p pid started, from its start time in
+// /proc/<pid>/stat and the system uptime.  Negative if unknown.
+static double process_age_sec(pid_t pid) {
+  std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
+  std::string line;
+  if (!std::getline(stat_file, line)) return -1;
+  // The command name (field 2) may contain spaces; count fields after it.
+  const size_t rp = line.rfind(')');
+  if (rp == std::string::npos) return -1;
+  std::istringstream rest(line.substr(rp + 1));
+  std::string field;
+  unsigned long long start_ticks = 0;  // NOLINT(runtime/int)
+  for (int i = 3; i <= 22; ++i) {
+    if (!(rest >> field)) return -1;
+    if (i == 22) start_ticks = std::strtoull(field.c_str(), nullptr, 10);
+  }
+  std::ifstream uptime_file("/proc/uptime");
+  double uptime = -1;
+  if (!(uptime_file >> uptime)) return -1;
+  const long hz = sysconf(_SC_CLK_TCK);  // NOLINT(runtime/int)
+  if (hz <= 0) return -1;
+  return uptime - static_cast<double>(start_ticks) / static_cast<double>(hz);
+}
+
+// Whether @p path was last written after process @p pid started.
+static bool file_newer_than_process(const std::string& path, pid_t pid) {
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) return false;
+  struct timespec now;
+  if (clock_gettime(CLOCK_REALTIME, &now) != 0) return false;
+  const double file_age =
+      static_cast<double>(now.tv_sec - st.st_mtim.tv_sec) +
+      static_cast<double>(now.tv_nsec - st.st_mtim.tv_nsec) / 1e9;
+  const double proc_age = process_age_sec(pid);
+  // A modification time in the future (clock stepped back) proves nothing.
+  if (file_age < 0 || proc_age < 0) return false;
+  return file_age < proc_age;
+}
+
+// unifi-protect's MainPID, or 0 when it is not running.
+static pid_t protect_main_pid() {
+  std::FILE* p = popen(
+      "systemctl show unifi-protect --property=MainPID --value 2>/dev/null",
+      "r");
+  if (!p) return 0;
+  char buf[32] = {};
+  const char* ok = std::fgets(buf, sizeof(buf), p);
+  pclose(p);
+  if (!ok) return 0;
+  const long pid = std::strtol(buf, nullptr, 10);  // NOLINT(runtime/int)
+  return pid > 0 ? static_cast<pid_t>(pid) : 0;
+}
+
+bool protect_predates_service_js() {
+  const pid_t pid = protect_main_pid();
+  return pid > 0 && file_newer_than_process(kServicePath, pid);
 }
 
 // ---------------------------------------------------------------

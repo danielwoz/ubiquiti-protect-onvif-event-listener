@@ -28,15 +28,30 @@ namespace protect_ui {
 ///   t.filter(e => !e.isThirdPartyCamera || e.isPairedWithAiPort)
 ///
 /// This function replaces that predicate with a constant `true` (same byte
-/// length) so all cameras pass through.  A .bak copy of the unpatched file is
-/// always written before modifying, so it tracks the current firmware version.
+/// length) so all cameras pass through, and removes the matching exclusion
+/// from the backend's camera scope in service.js.  With @p onvif_addressing
+/// it also makes Protect's own ONVIF client send the WS-Addressing To and
+/// Action headers with its event requests (Protect 7.1+), which some cameras
+/// (Reolink) require.  Without it that change is removed again.  Changes to
+/// service.js load at Protect's next start.
 ///
-/// Returns OK if the patch was applied or was already present.
-/// Returns NotFoundError if swai.js does not exist.
-/// Returns InternalError on I/O failures.
-/// Returns FailedPreconditionError if the expected pattern is not found
-/// (firmware changed the code layout).
-absl::Status patch_alarm_picker();
+/// Each patch is applied only where its target code occurs exactly once.  A
+/// file that differs from the package original is rebuilt from its .bak when
+/// dpkg confirms the .bak is that original; otherwise an unpatched file is
+/// backed up to .bak first.  Files are replaced via rename(), so a failed
+/// write leaves the old one.  Nothing is patched while dpkg is unpacking
+/// unifi-protect.
+///
+/// Returns OK if the files were patched or already patched, including when
+/// no patch matches this Protect version.
+/// Returns NotFoundError if none of the Protect files exist.
+absl::Status patch_alarm_picker(bool onvif_addressing);
+
+/// Whether the running unifi-protect process started before service.js was
+/// last written, so it is still running the code it loaded at start-up and
+/// only a restart loads the patched file.  False when Protect is not running
+/// or the times cannot be read.
+bool protect_predates_service_js();
 
 /// Revert all alarm-picker patches by restoring .bak files.
 ///

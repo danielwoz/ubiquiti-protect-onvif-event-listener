@@ -366,10 +366,13 @@ ABSL_FLAG(int32_t, poll_interval_sec, 10,
 ABSL_FLAG(bool, auto_heal_protect, true,
     "When Protect's Postgres or MSR stops responding for more than 60 s "
     "continuously, automatically run 'systemctl restart' on the affected "
-    "service(s). Two independent triggers: DB wedge (>=1 pg query timeout "
-    "in the window AND no successful queries in the same window) restarts "
+    "service(s). Triggers: DB wedge (>=1 pg query timeout in the window "
+    "AND no successful queries in the same window) restarts "
     "msp+msr+unifi-protect; MSR wedge (MSR StoreSnapshots failing "
-    "continuously) restarts msr only. Safeguards: no restart in the first "
+    "continuously) restarts msr only; Protect still reporting stale camera "
+    "featureFlags 60 s after we wrote them, or Protect having started "
+    "before we last patched service.js, restarts unifi-protect only. "
+    "Safeguards: no restart in the first "
     "5 min after start, 5 min cooldown between restarts, hard cap of 4 "
     "restarts per 24 h. Every restart is logged at ERROR level and "
     "surfaced on the admin page's Recent errors card. Set to false to "
@@ -414,7 +417,18 @@ ABSL_FLAG(bool, patch_alarm_picker, true,
     "Live-patch the Protect UI (swai.js) to allow third-party cameras "
     "in the alarm creation picker. The patch is idempotent and re-applied "
     "on every startup so it survives firmware updates. The original file "
-    "is backed up to swai.js.bak before each patch.");
+    "is backed up to swai.js.bak before each patch. Set to false to stop "
+    "patching Protect files, including --patch_onvif_addressing; patches "
+    "already applied stay until Protect is updated or --rollback runs.");
+ABSL_FLAG(bool, patch_onvif_addressing, true,
+    "Patch Protect's own ONVIF client (Protect 7.1+) to send the "
+    "WS-Addressing To and Action headers with PullMessages, Renew and "
+    "Unsubscribe, as onvif-recorder does. Cameras that require them "
+    "(e.g. Reolink) otherwise reject Protect's event requests, so "
+    "Protect gets no native motion events from them. Protect loads the "
+    "change when it next starts; with --auto_heal_protect it is restarted "
+    "for that automatically. Setting this to false removes the change "
+    "again. Needs --patch_alarm_picker.");
 ABSL_FLAG(uint16_t, log_port, 7890,
     "TCP port for the in-memory log viewer (loopback only). "
     "Served via nginx at /onvif/events/log with Protect auth.");
@@ -687,13 +701,22 @@ int main(int argc, char* argv[]) {
 
   onvif::global_init();
 
-  // Patch the Protect UI alarm picker to include third-party cameras.
-  if (absl::GetFlag(FLAGS_patch_alarm_picker)) {
-    auto s = protect_ui::patch_alarm_picker();
+  // Patch the Protect UI alarm picker to include third-party cameras, and
+  // Protect's ONVIF client to send WS-Addressing headers.
+  const bool patch_protect = absl::GetFlag(FLAGS_patch_alarm_picker);
+  const bool onvif_addressing = absl::GetFlag(FLAGS_patch_onvif_addressing);
+  if (patch_protect) {
+    auto s = protect_ui::patch_alarm_picker(onvif_addressing);
     if (s.ok()) {
       LOG(INFO) << "[ui_patch] success";
     } else {
       LOG(WARNING) << "[ui_patch] " << s.message();
+    }
+    if (!absl::GetFlag(FLAGS_auto_heal_protect) &&
+        protect_ui::protect_predates_service_js()) {
+      LOG(WARNING) << "[ui_patch] unifi-protect started before service.js "
+                      "was patched; restart it (systemctl restart "
+                      "unifi-protect) to load the patch";
     }
   }
 
@@ -772,7 +795,7 @@ int main(int argc, char* argv[]) {
   // covers the non-dpkg case.)  Re-runs are idempotent: each patch
   // detects "already patched" and no-ops.
   std::unique_ptr<protect_ui::PatchWatcher> patch_watcher;
-  if (absl::GetFlag(FLAGS_patch_alarm_picker)) {
+  if (patch_protect) {
     std::vector<protect_ui::WatchSpec> specs = {
       {"/usr/share/unifi-protect/app/node_modules/@ubnt/"
            "unifi-protect-ui-internal/dist",
@@ -789,8 +812,8 @@ int main(int argc, char* argv[]) {
     };
     patch_watcher = std::make_unique<protect_ui::PatchWatcher>(
         std::move(specs),
-        [log_port, admin_port]() {
-          auto sp = protect_ui::patch_alarm_picker();
+        [log_port, admin_port, onvif_addressing]() {
+          auto sp = protect_ui::patch_alarm_picker(onvif_addressing);
           if (!sp.ok())
             LOG(WARNING) << "[patch_watcher] alarm picker: " << sp.message();
           auto sl = protect_ui::patch_nginx_log_proxy(log_port);
@@ -1511,6 +1534,11 @@ int main(int argc, char* argv[]) {
       }
       return drifted;
     });
+    // Protect reads service.js only when it starts, so a patch written
+    // while it runs (first install, a Protect upgrade, a changed setting)
+    // takes effect only after a restart.
+    if (patch_protect)
+      healer->set_patch_reload_fn(&protect_ui::protect_predates_service_js);
     healer->start();
     LOG(INFO) << "[healer] auto-heal enabled (window="
               << onvif::WedgeHealer::kWindowSec << "s, warmup="

@@ -10,14 +10,25 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 
+#include <unistd.h>
+
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <vector>
 
 #include "wedge_healer.hpp"
+
+// A file under the test's private temp directory, so concurrent runs of
+// this test do not share state files.
+static std::string temp_path(const char* name) {
+  const char* dir = std::getenv("TEST_TMPDIR");
+  return std::string(dir ? dir : "/tmp") + "/" + name + "." +
+         std::to_string(getpid());
+}
 
 int main() {
   using onvif::WedgeHealer;
@@ -226,7 +237,7 @@ int main() {
   // so a process-local counter meant every config save reset the cap --
   // which would let a restart loop drive unbounded Protect restarts.
   {
-    const std::string path = "/tmp/healer_restarts_test";
+    const std::string path = temp_path("healer_restarts");
     std::remove(path.c_str());
     // Pretend a previous process already used the whole budget just now.
     {
@@ -257,6 +268,108 @@ int main() {
     WedgeHealer h2;
     h2.set_state_path(path);
     assert(h2.restart_count() == 0);
+    std::remove(path.c_str());
+  }
+
+  // ---------------------------------------------------------------
+  // Patch reload: Protect started before service.js was patched (#58)
+  // ---------------------------------------------------------------
+
+  // Case 13: no callback, or Protect already running the patched file ->
+  // no restart.
+  {
+    WedgeHealer h;
+    std::vector<std::string> cmds;
+    h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
+    h.end_warmup_for_testing();
+    assert(h.check_patch_reload_for_testing() == WedgeHealer::Reason::kNone);
+    int calls = 0;
+    h.set_patch_reload_fn([&] { ++calls; return false; });
+    assert(h.check_patch_reload_for_testing() == WedgeHealer::Reason::kNone);
+    assert(h.check_patch_reload_for_testing() == WedgeHealer::Reason::kNone);
+    assert(calls == 2);
+    assert(cmds.empty());
+  }
+
+  // Case 14: one stale reading is not enough, because an installer that
+  // just wrote service.js may be about to restart Protect itself.  The
+  // second reading in a row restarts Protect only; a fresh reading in
+  // between starts the count again.
+  {
+    WedgeHealer h;
+    std::vector<std::string> cmds;
+    h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
+    h.end_warmup_for_testing();
+    bool stale = true;
+    h.set_patch_reload_fn([&] { return stale; });
+    assert(h.check_patch_reload_for_testing() == WedgeHealer::Reason::kNone);
+    stale = false;
+    assert(h.check_patch_reload_for_testing() == WedgeHealer::Reason::kNone);
+    stale = true;
+    assert(h.check_patch_reload_for_testing() == WedgeHealer::Reason::kNone);
+    assert(cmds.empty());
+    assert(h.check_patch_reload_for_testing() ==
+           WedgeHealer::Reason::kPatchReload);
+    assert(cmds.size() == 1);
+    assert(cmds[0] == "systemctl restart unifi-protect.service");
+
+    // Still stale right after the restart: the cooldown holds the next
+    // one back, and the check keeps running so it can fire later.
+    assert(h.check_patch_reload_for_testing() == WedgeHealer::Reason::kNone);
+    assert(h.check_patch_reload_for_testing() ==
+           WedgeHealer::Reason::kPatchReload);
+    assert(cmds.size() == 1);
+    assert(h.check_patch_reload_for_testing() ==
+           WedgeHealer::Reason::kPatchReload);
+    assert(cmds.size() == 1);
+  }
+
+  // Case 15: warmup holds the restart back without giving up.
+  {
+    WedgeHealer h;
+    std::vector<std::string> cmds;
+    int calls = 0;
+    h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
+    h.set_patch_reload_fn([&] { ++calls; return true; });
+    h.check_patch_reload_for_testing();
+    assert(h.check_patch_reload_for_testing() ==
+           WedgeHealer::Reason::kPatchReload);
+    assert(cmds.empty());
+    h.end_warmup_for_testing();
+    assert(h.check_patch_reload_for_testing() ==
+           WedgeHealer::Reason::kPatchReload);
+    assert(cmds.size() == 1);
+    assert(calls == 3);
+  }
+
+  // Case 16: once the daily cap is reached the check pauses, so a restart
+  // that cannot happen yet is not retried and logged every minute, and it
+  // resumes after the pause.
+  {
+    const std::string path = temp_path("healer_restarts_patch");
+    {
+      std::ofstream f(path, std::ios::trunc);
+      const int64_t now = static_cast<int64_t>(std::time(nullptr));
+      for (int i = 0; i < WedgeHealer::kMaxPerDay; ++i) {
+        f << (now - WedgeHealer::kCooldownSec - 10) << "\n";
+      }
+    }
+    WedgeHealer h;
+    std::vector<std::string> cmds;
+    int calls = 0;
+    h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
+    h.set_state_path(path);
+    h.end_warmup_for_testing();
+    h.set_patch_reload_fn([&] { ++calls; return true; });
+    h.check_patch_reload_for_testing();
+    assert(h.check_patch_reload_for_testing() ==
+           WedgeHealer::Reason::kPatchReload);
+    assert(cmds.empty());
+    assert(h.check_patch_reload_for_testing() == WedgeHealer::Reason::kNone);
+    assert(calls == 2);
+    h.end_patch_reload_backoff_for_testing();
+    h.check_patch_reload_for_testing();
+    assert(calls == 3);
     std::remove(path.c_str());
   }
 
