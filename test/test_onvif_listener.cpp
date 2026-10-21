@@ -16,6 +16,8 @@
 #include <condition_variable>
 #include <functional>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -557,48 +559,63 @@ static void test_both_cameras(const std::string& hikvision_jsonl,
 }
 
 // ============================================================
-// Test: hot-add a camera while run() is already executing
+// Test: hot-add cameras while run() is already executing.  One camera
+// is registered before run() and two are hot-added, so the listener's
+// camera list grows (and reallocates) under running workers; every
+// camera must keep delivering events.
 // ============================================================
 static void test_hot_add(const std::string& jsonl) {
-  HikvisionCompatibleEmulator emu(jsonl);
-  emu.start();
-
-  onvif::CameraConfig cfg;
-  cfg.ip                 = emu.local_address();
-  cfg.user               = "admin";
-  cfg.password           = "eW6iO01l";
-  cfg.retry_interval_sec = 1;
+  constexpr int kCams = 3;
+  std::vector<std::unique_ptr<HikvisionCompatibleEmulator>> emus;
+  std::vector<onvif::CameraConfig> cfgs;
+  for (int i = 0; i < kCams; ++i) {
+    emus.push_back(std::make_unique<HikvisionCompatibleEmulator>(jsonl));
+    emus.back()->start();
+    onvif::CameraConfig cfg;
+    cfg.ip                 = emus.back()->local_address();
+    cfg.user               = "admin";
+    cfg.password           = "eW6iO01l";
+    cfg.retry_interval_sec = 1;
+    cfgs.push_back(cfg);
+  }
 
   onvif::OnvifListener listener;
-  // Intentionally no add_camera() before run() -- zero workers at start.
+  listener.add_camera(cfgs[0]);
 
   std::mutex mu;
   std::condition_variable cv;
-  std::vector<onvif::OnvifEvent> evs;
+  std::map<std::string, int> per_cam;
+  auto all_seen = [&] {
+    for (const auto& c : cfgs)
+      if (per_cam[c.ip] < 3) return false;
+    return true;
+  };
 
   std::thread t([&] {
     listener.run([&](const onvif::OnvifEvent& ev) {
       std::lock_guard<std::mutex> lk(mu);
-      evs.push_back(ev);
-      if (evs.size() >= 3) cv.notify_one();
+      ++per_cam[ev.camera_ip];
+      if (all_seen()) cv.notify_one();
     });
   });
 
-  // Give run() a beat to enter its supervisor loop with zero workers.
+  // Give run() a beat to start the first worker before hot-adding.
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  listener.add_camera_live(cfg);
+  for (int i = 1; i < kCams; ++i) listener.add_camera_live(cfgs[i]);
 
   bool ok;
   {
     std::unique_lock<std::mutex> lk(mu);
-    ok = cv.wait_for(lk, std::chrono::seconds(30),
-                     [&] { return evs.size() >= 3; });
+    ok = cv.wait_for(lk, std::chrono::seconds(30), all_seen);
   }
 
   listener.stop();
   t.join();
 
-  CHECK(ok, "hot-added camera did not produce events");
+  std::string counts;
+  for (const auto& c : cfgs)
+    counts += " " + c.ip + "=" + std::to_string(per_cam[c.ip]);
+  CHECK(ok, "not every camera produced >= 3 events:" + counts);
 }
 
 // ============================================================

@@ -441,12 +441,15 @@ class CameraWorker {
  public:
   using PublishHealthFn = std::function<void(const CameraHealth&)>;
 
-  CameraWorker(const CameraConfig& cfg,
-               const EventCallback& cb,
+  // cfg and cb are copied: a worker can outlive both the caller's camera
+  // list (hot-added cameras, cameras_ reallocation) and run() itself (a
+  // thread detached at shutdown).
+  CameraWorker(CameraConfig cfg,
+               EventCallback cb,
                const std::atomic<bool>& running,
                PublishHealthFn publish_health = {})
     : publish_health_(std::move(publish_health)),
-      cfg_(cfg), cb_(cb), running_(running) {}
+      cfg_(std::move(cfg)), cb_(std::move(cb)), running_(running) {}
 
   void run() {
     LOG(INFO) << '[' << cfg_.ip << "] started";
@@ -1020,8 +1023,8 @@ class CameraWorker {
     return out;
   }
 
-  const CameraConfig&       cfg_;
-  const EventCallback&      cb_;
+  const CameraConfig        cfg_;
+  const EventCallback       cb_;
   const std::atomic<bool>&  running_;
 };
 
@@ -1136,6 +1139,9 @@ void OnvifListener::run(EventCallback cb) {
                  << "] thread did not stop within " << kJoinTimeoutSec
                  << "s -- detaching";
       threads[i].detach();
+      // The detached thread still runs on this worker, so it is leaked
+      // rather than destroyed when run() returns.
+      static_cast<void>(workers[i].release());
     }
   }
 }
