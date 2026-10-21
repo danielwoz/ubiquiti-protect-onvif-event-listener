@@ -19,12 +19,15 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "absl/status/status.h"
 #include "absl/synchronization/mutex.h"
 #include "jpeg_crop.hpp"
+#include "upstream_event.hpp"
 
 namespace onvif {
 
@@ -136,6 +139,16 @@ struct CameraConfig {
     ///< overlapped and starved curl into timing out.
     int retry_backoff_base_sec{30};
     int retry_backoff_max_sec{300};
+    /// Seconds between Renew requests on a live subscription.
+    int renew_interval_sec{90};
+    /// Seconds between the "alive:" log lines of a live subscription.
+    int heartbeat_interval_sec{60};
+    /// Protect's event subscription for this camera is served from this
+    /// camera's subscription.  Enables the listener's taps, delivers events
+    /// to the callback from a separate thread, resubscribes on a failed
+    /// Renew, and keeps the subscription across restarts when a resume path
+    /// is set.
+    bool event_proxy{false};
 };
 
 // Pure helper visible for testing.  Given the backoff just slept, return the
@@ -145,6 +158,10 @@ struct CameraConfig {
 int next_backoff_sec(int current_sec, int base_sec, int max_sec);
 
 using EventCallback = std::function<void(const OnvifEvent&)>;
+
+namespace detail {
+struct WorkerControl;  // per-worker wake / resubscribe flags (listener .cpp)
+}  // namespace detail
 
 // ---------------------------------------------------------------
 // Library lifecycle -- call once from main() around all listeners
@@ -189,6 +206,21 @@ struct CameraHealth {
 
 class OnvifListener {
  public:
+    /// Called with the body of every HTTP-200 PullMessages response, before
+    /// the events in it are parsed and delivered.
+    using RawResponseTap =
+        std::function<void(const CameraConfig&, const std::string& xml)>;
+    /// Called as the camera subscription's state moves on (see
+    /// UpstreamEvent), including after every pull.  @p http_status is 0 for
+    /// transport errors and for events without an HTTP exchange.  For a
+    /// failed Create or Renew, @p detail is the SOAP fault's codes and
+    /// reason, or the first 300 bytes of a reply that holds no fault.
+    using UpstreamStateTap = std::function<void(
+        const CameraConfig&, UpstreamEvent, int http_status,
+        const std::string& detail)>;
+    /// Returns text appended to the camera's periodic "alive:" log line.
+    using HeartbeatSuffixFn = std::function<std::string(const CameraConfig&)>;
+
     OnvifListener();
     ~OnvifListener();
 
@@ -229,6 +261,40 @@ class OnvifListener {
     /// any thread (typically the admin-server HTTP handler thread).
     std::vector<CameraHealth> healths() const;
 
+    // The taps and the heartbeat suffix fire only for cameras with
+    // CameraConfig::event_proxy set, from the camera's own thread.  Set them
+    // before run(); an unset one costs nothing.
+    void set_raw_response_tap(RawResponseTap tap);
+    void set_upstream_state_tap(UpstreamStateTap tap);
+    void set_heartbeat_suffix_fn(HeartbeatSuffixFn fn);
+
+    /// Wake the camera's retry/backoff sleep and reset its backoff to base.
+    /// Safe to call from any thread; a camera that is not running is
+    /// ignored.
+    void nudge(const std::string& ip);
+    /// Drop the camera's subscription and create a new one.  Safe to call
+    /// from any thread.
+    void resubscribe(const std::string& ip);
+
+    /// Keep event_proxy cameras' subscriptions across restarts.  run()
+    /// loads @p path once at start (and deletes it); a camera found there
+    /// takes its subscription over instead of creating one, and asks the
+    /// camera to send its current state again (SetSynchronizationPoint).
+    /// When run() returns, healthy event_proxy subscriptions are renewed and
+    /// saved to @p path instead of being unsubscribed.  A saved
+    /// subscription that no camera takes is unsubscribed, with the
+    /// credentials of the matching camera in @p credentials (or of this
+    /// listener's cameras), as is a kept one that cannot be saved.  Set
+    /// before run().
+    void set_resume_path(const std::string& path,
+                         std::vector<CameraConfig> credentials = {});
+
+    /// Unsubscribe every subscription saved at @p path, then delete it.
+    /// Credentials come from @p cams (matched by MAC, then ip).  A missing
+    /// file is OK.
+    static absl::Status release_saved_subscriptions(
+        const std::string& path, const std::vector<CameraConfig>& cams);
+
  private:
     std::atomic<bool>         running_{false};
     // Set by stop().  Survives a stop() that arrives before run() starts,
@@ -250,6 +316,24 @@ class OnvifListener {
 
     // Called by CameraWorker to push its latest snapshot into healths_.
     void publish_health(const CameraHealth& h);
+
+    RawResponseTap    raw_tap_;
+    UpstreamStateTap  state_tap_;
+    HeartbeatSuffixFn heartbeat_suffix_fn_;
+    std::string       resume_path_;
+    // Cameras whose credentials release saved subscriptions no camera of
+    // this listener takes.
+    std::vector<CameraConfig> resume_creds_;
+
+    // Control blocks of the workers run() started, for nudge() and
+    // resubscribe().  Shared with the workers so a worker that outlives
+    // run() (detached at shutdown) never touches freed memory.
+    absl::Mutex controls_mutex_;
+    std::vector<std::shared_ptr<detail::WorkerControl>>
+        controls_ ABSL_GUARDED_BY(controls_mutex_);
+
+    std::vector<std::shared_ptr<detail::WorkerControl>> controls_for(
+        const std::string& ip);
 };
 
 }  // namespace onvif

@@ -20,6 +20,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -58,12 +60,19 @@ namespace protect_ui {
 // the UI bundle version (swai-7.0.57.js) differs from the package version
 // (7.0.107), and a pattern can survive across many releases.  Checked
 // against Protect 6.2.88, 7.0.88, 7.0.107, 7.1.87, 7.2.105 and 7.3.70.
+//
+// `refuse` optionally vets the single occurrence of `original` at `pos`
+// before it is replaced: it returns nullptr to go ahead, or the reason the
+// patch must not be applied to this file.
 // ---------------------------------------------------------------
+using RefuseFn = const char* (*)(const std::string& content, size_t pos);
+
 struct Patch {
   const char* original;
   const char* replacement;
   const char* region_begin = nullptr;
   const char* region_end = nullptr;
+  RefuseFn refuse = nullptr;
 };
 
 // --- Frontend patches (swai*.js, vantage*.js) ---
@@ -147,6 +156,69 @@ static const Patch kBackendPatchWsa = {
 "return{...h,\"wsa:To\":{\"@_xmlns:wsa\":x,\"#text\":u},"
 "\"wsa:Action\":{\"@_xmlns:wsa\":x,\"#text\":w}}})"
 "(n,`http://${e.hostname}${e.port==80?\"\":\":\"+e.port}${r}`,o)})"};
+
+static const char* route_patch_refusal(const std::string& content,
+                                       size_t pos);
+
+// 6. ONVIF SOAP transport (Protect 7.1+): share a camera's event
+// subscription with onvif-recorder.  Every SOAP request Protect sends goes
+// through t.soapRequestRaw; the injected prologue changes three of them and
+// leaves the rest to the original body:
+//   - CreatePullPointSubscription is first offered to the recorder's
+//     PullPoint service at 127.0.0.1:7892, under
+//     /onvif-recorder/pullpoint/<hostname>/<port><event service path>.  When
+//     that fails, refuses or takes longer than 4 s the request goes to the
+//     camera as before.
+//   - Requests whose path starts with /onvif-recorder/pullpoint/ (Pull,
+//     Renew and Unsubscribe on a subscription the recorder created) go to
+//     the recorder, also limited to 4 s, or 1 s for Unsubscribe, whose
+//     result Protect ignores.
+//   - For 500 ms after a request to the recorder times out, further
+//     requests to it fail at once.  One Protect poll can chain several of
+//     them (a Renew, then the Create that replaces the subscription, then
+//     an Unsubscribe), so a recorder that has stopped answering holds a
+//     poll for about 4 s, not 4 s per request; the next poll, at least
+//     about 1 s later, waits the full 4 s again.  The window is measured
+//     on performance.now(), which wall-clock changes do not move.
+//   - A Renew of a subscription held directly on the camera first asks the
+//     recorder's /status whether it serves that camera now; if so the Renew
+//     fails, so Protect creates its next subscription through the recorder.
+// Requests the prologue re-sends carry a second argument, so they run the
+// original body unchanged.  The function becomes a named function
+// expression so the prologue can call itself by name: inside the body `t`
+// is the body's own `const t`, not yet initialised where the prologue runs.
+// route_patch_refusal() makes sure the body does not depend on arrow
+// function semantics.  Identical anchor in 7.1.87, 7.2.105 and 7.3.70; 7.0
+// and earlier have no ONVIF event client.
+//
+// If this replacement text ever changes, the old text must stay in the
+// removed list so it is taken out before the new one goes in.
+static const Patch kBackendPatchRoute = {
+"t.soapRequestRaw=async e=>{const t=`${e.hostname}:${e.port}`;",
+"t.soapRequestRaw=async function __onvrSoapRaw(e,__onvrRouted){"
+"/*onvif-recorder:pullpoint*/if(!__onvrRouted&&e&&\"string\"==typeof e.path){"
+"const __onvrP=\"/onvif-recorder/pullpoint/\","
+"__onvrO={...e,hostname:\"127.0.0.1\",port:7892},__onvrB=e.body||{},"
+"__onvrK=__onvrP+encodeURIComponent(e.hostname)+\"/\"+"
+"encodeURIComponent(e.port),"
+"__onvrR=(q,l)=>{const n=Error(\"onvif-recorder: no answer\");"
+"if(performance.now()<(__onvrSoapRaw.d||0))return Promise.reject(n);"
+"let h;return Promise.race([__onvrSoapRaw(q,1),new Promise((_,j)=>{"
+"h=setTimeout(()=>{__onvrSoapRaw.d=performance.now()+500;j(n)},l||4e3)"
+"})]).finally(()=>clearTimeout(h))};"
+"if(e.path.startsWith(__onvrP))"
+"return __onvrR(__onvrO,__onvrB.Unsubscribe?1e3:0);"
+"if(__onvrB.CreatePullPointSubscription)try{"
+"return await __onvrR({...__onvrO,path:__onvrK+e.path})}catch(x){}"
+"if(__onvrB.Renew){let m=0;try{await __onvrR({...__onvrO,"
+"path:__onvrK+\"/status\",body:{GetServiceCapabilities:"
+"{\"@_xmlns\":\"http://www.onvif.org/ver10/events/wsdl\"}}});m=1}catch(x){}"
+"if(m)throw Error(\"onvif-recorder: moving subscription to proxy\")}}"
+"const t=`${e.hostname}:${e.port}`;",
+nullptr, nullptr, route_patch_refusal};
+
+// Prefix of every name kBackendPatchRoute injects.
+static const char kRouteNamePrefix[] = "__onvr";
 
 // ---------------------------------------------------------------
 // Paths
@@ -325,6 +397,208 @@ static bool resolve_region(const std::string& content, const Patch& p,
   return true;
 }
 
+// Whether @p p's replacement occurs in its search range of @p content.
+static bool patch_present(const std::string& content, const Patch& p) {
+  size_t begin = 0;
+  size_t end = 0;
+  return resolve_region(content, p, &begin, &end) &&
+         count_in(content, p.replacement, begin, end) > 0;
+}
+
+// ---------------------------------------------------------------
+// JavaScript block scanner.
+// ---------------------------------------------------------------
+// Longest block scan_js_block() follows before giving up.
+static constexpr size_t kMaxScanBytes = 256 * 1024;
+
+struct JsBlockScan {
+  size_t end = std::string::npos;  // offset of the closing '}', or npos
+  bool uses_this_or_arguments = false;
+};
+
+static bool is_ident_char(char c) {
+  return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+}
+
+// Whether a '/' starts a regular expression literal rather than a division,
+// given the previous significant character @p prev ('\0' at the start) and,
+// when that token was an identifier or keyword, its text @p word.  A ')'
+// counts as the end of an operand, so `if(x)/re/` is read as a division.
+static bool slash_starts_regex(char prev, const std::string& word) {
+  static const char* const kKeywords[] = {
+      "return", "typeof", "case", "do", "else", "in", "of", "new",
+      "delete", "void", "throw", "instanceof", "yield", "await"};
+  if (!word.empty()) {
+    for (const char* k : kKeywords) {
+      if (word == k) return true;
+    }
+    return false;
+  }
+  return prev == '\0' || std::strchr("(,=:[!&|?{};+-*%<>~^", prev) != nullptr;
+}
+
+// Find the '}' that closes the '{' at @p open in JavaScript source @p s,
+// skipping string literals, template literals (including nested ${...}),
+// comments and regular expression literals.  Also reports whether the
+// block's code uses `this` or `arguments` other than as a property name.
+// end is npos when the block does not close within kMaxScanBytes or a
+// literal or comment in it is not terminated.
+static JsBlockScan scan_js_block(const std::string& s, size_t open) {
+  JsBlockScan r;
+  if (open >= s.size() || s[open] != '{') return r;
+  const size_t limit = std::min(s.size(), open + kMaxScanBytes);
+  // 'b': brace of a block or object, 'e': ${ of a template substitution,
+  // 't': text of a template literal.
+  std::vector<char> stack = {'b'};
+  char prev = '{';   // last significant character
+  std::string word;  // the last token, when it was a keyword or identifier
+  size_t i = open + 1;
+  while (i < limit) {
+    const char c = s[i];
+    if (stack.back() == 't') {
+      if (c == '\\') {
+        i += 2;
+      } else if (c == '`') {
+        stack.pop_back();
+        prev = '`';
+        word.clear();
+        ++i;
+      } else if (c == '$' && i + 1 < limit && s[i + 1] == '{') {
+        stack.push_back('e');
+        prev = '{';
+        word.clear();
+        i += 2;
+      } else {
+        ++i;
+      }
+      continue;
+    }
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+      ++i;
+      continue;
+    }
+    const char next = i + 1 < limit ? s[i + 1] : '\0';
+    if (c == '"' || c == '\'') {
+      size_t j = i + 1;
+      while (j < limit && s[j] != c) {
+        if (s[j] == '\n') return r;
+        j += s[j] == '\\' ? 2 : 1;
+      }
+      if (j >= limit) return r;
+      prev = c;
+      word.clear();
+      i = j + 1;
+    } else if (c == '`') {
+      stack.push_back('t');
+      ++i;
+    } else if (c == '/' && next == '/') {
+      const size_t nl = s.find('\n', i);
+      if (nl == std::string::npos || nl >= limit) return r;
+      i = nl + 1;
+    } else if (c == '/' && next == '*') {
+      const size_t close = s.find("*/", i + 2);
+      if (close == std::string::npos || close + 2 > limit) return r;
+      i = close + 2;
+    } else if (c == '/' && slash_starts_regex(prev, word)) {
+      size_t j = i + 1;
+      bool in_class = false;
+      while (j < limit) {
+        const char d = s[j];
+        if (d == '\n') return r;
+        if (d == '\\') {
+          j += 2;
+          continue;
+        }
+        if (d == '[') {
+          in_class = true;
+        } else if (d == ']') {
+          in_class = false;
+        } else if (d == '/' && !in_class) {
+          break;
+        }
+        ++j;
+      }
+      if (j >= limit) return r;
+      // The literal is an operand: a '/' after it (or its flags) divides.
+      prev = ')';
+      word.clear();
+      i = j + 1;
+    } else if (c == '{') {
+      stack.push_back('b');
+      prev = c;
+      word.clear();
+      ++i;
+    } else if (c == '}') {
+      // Closing a ${ substitution resumes its template literal's text.
+      stack.pop_back();
+      if (stack.empty()) {
+        r.end = i;
+        return r;
+      }
+      prev = c;
+      word.clear();
+      ++i;
+    } else if (is_ident_char(c)) {
+      size_t j = i;
+      while (j < limit && is_ident_char(s[j])) ++j;
+      const std::string w = s.substr(i, j - i);
+      // After a '.' the token is a property name, never `this`, `arguments`
+      // or a keyword.
+      const bool property = prev == '.';
+      if (!property && (w == "this" || w == "arguments")) {
+        r.uses_this_or_arguments = true;
+      }
+      word = property ? std::string() : w;
+      prev = s[j - 1];
+      i = j;
+    } else if (c == '.' && next == '.' && i + 2 < limit && s[i + 2] == '.') {
+      // Spread or rest: an operand follows.
+      prev = ',';
+      word.clear();
+      i += 3;
+    } else if ((c == '+' || c == '-') && next == c) {
+      // A '/' right after `++` or `--` divides (`i++/2`); a regular
+      // expression there would only be valid as `++/re/.lastIndex`.
+      prev = ')';
+      word.clear();
+      i += 2;
+    } else {
+      prev = c;
+      word.clear();
+      ++i;
+    }
+  }
+  return r;
+}
+
+// Why kBackendPatchRoute must not replace its anchor at @p pos of
+// @p content, or nullptr when it may.  The patch turns an arrow function
+// into a named function expression and injects names that start with
+// kRouteNamePrefix, so it is refused when the function's end cannot be
+// found, when its body uses `this` or `arguments` (whose meaning would
+// change), or when the file uses that prefix outside the patch itself.
+static const char* route_patch_refusal(const std::string& content,
+                                       size_t pos) {
+  const std::string replacement = kBackendPatchRoute.replacement;
+  const size_t ours =
+      count_in(replacement, kRouteNamePrefix, 0, replacement.size()) *
+      count_in(content, kBackendPatchRoute.replacement, 0, content.size());
+  if (count_in(content, kRouteNamePrefix, 0, content.size()) > ours) {
+    return "service.js already uses names starting with __onvr";
+  }
+  const char* anchor = kBackendPatchRoute.original;
+  const size_t open =
+      pos + static_cast<size_t>(std::strchr(anchor, '{') - anchor);
+  const JsBlockScan scan = scan_js_block(content, open);
+  if (scan.end == std::string::npos) {
+    return "the end of soapRequestRaw was not found";
+  }
+  if (scan.uses_this_or_arguments) {
+    return "soapRequestRaw uses this or arguments";
+  }
+  return nullptr;
+}
+
 enum class PatchState { kApply, kAlreadyApplied, kNotApplicable, kAmbiguous };
 
 static PatchState classify_patch(const std::string& content, const Patch& p,
@@ -392,11 +666,17 @@ static bool unapply_patch(std::string* content, const Patch& p) {
 //     patches, so a patched file never replaces the backup.
 // While dpkg unpacks a new Protect its md5sums still describe the old
 // files, so patch_alarm_picker() does not run then.
+//
+// @p outcomes and @p removed_outcomes, when set, receive what happened to
+// each entry of @p patches and @p removed; they are left alone when the
+// file cannot be read.
 // ---------------------------------------------------------------
 static int apply_patches(
     const std::string& path, const Patch* patches, size_t count,
     const std::unordered_map<std::string, std::string>& md5sums,
-    const Patch* removed = nullptr, size_t removed_count = 0) {
+    const Patch* removed = nullptr, size_t removed_count = 0,
+    PatchOutcome* outcomes = nullptr,
+    PatchOutcome* removed_outcomes = nullptr) {
   const std::string live = read_file(path);
   if (live.empty()) return -1;
 
@@ -419,10 +699,19 @@ static int apply_patches(
     if (unapply_patch(&result, removed[i])) ++unapplied;
   }
   int applied = 0;
+  std::vector<PatchState> states(count, PatchState::kNotApplicable);
   for (size_t i = 0; i < count; ++i) {
     const Patch& p = patches[i];
     size_t pos = 0;
-    switch (classify_patch(result, p, &pos)) {
+    states[i] = classify_patch(result, p, &pos);
+    if (states[i] == PatchState::kApply && p.refuse != nullptr) {
+      if (const char* why = p.refuse(result, pos)) {
+        LOG_FIRST_N(WARNING, 1) << "[ui_patch] " << path << ": pattern \""
+                                << p.original << "\" not patched: " << why;
+        states[i] = PatchState::kNotApplicable;
+      }
+    }
+    switch (states[i]) {
       case PatchState::kApply:
         result.replace(pos, std::strlen(p.original), p.replacement);
         ++applied;
@@ -437,8 +726,42 @@ static int apply_patches(
     }
   }
 
+  // Outcomes compare the file before this call with the file after it:
+  // @p written says whether it now holds `result` or still `live`.
+  auto report = [&](bool written) {
+    const std::string& now = written ? result : live;
+    for (size_t i = 0; outcomes != nullptr && i < count; ++i) {
+      const Patch& p = patches[i];
+      PatchOutcome o = PatchOutcome::kNotRun;
+      if (states[i] == PatchState::kNotApplicable) {
+        o = PatchOutcome::kNotApplicable;
+      } else if (states[i] == PatchState::kAmbiguous) {
+        o = PatchOutcome::kAmbiguous;
+      } else if (patch_present(now, p)) {
+        o = patch_present(live, p) ? PatchOutcome::kAlready
+                                   : PatchOutcome::kApplied;
+      }
+      outcomes[i] = o;
+    }
+    for (size_t i = 0; removed_outcomes != nullptr && i < removed_count;
+         ++i) {
+      const Patch& p = removed[i];
+      PatchOutcome o = PatchOutcome::kAbsent;
+      if (patch_present(live, p)) {
+        if (!patch_present(now, p)) {
+          o = PatchOutcome::kRemoved;
+        } else {
+          // Still there after a write: it was not unique, so not removed.
+          o = written ? PatchOutcome::kAmbiguous : PatchOutcome::kNotRun;
+        }
+      }
+      removed_outcomes[i] = o;
+    }
+  };
+
   if (result == live) {
     LOG(INFO) << "[ui_patch] " << path << " already patched";
+    report(true);
     return 0;
   }
 
@@ -449,6 +772,7 @@ static int apply_patches(
   } else if (live_is_original || !has_known_patch(live)) {
     if (!replace_file(bak_path, live)) {
       LOG(ERROR) << "[ui_patch] failed to write backup: " << bak_path;
+      report(false);
       return 0;
     }
   } else {
@@ -458,8 +782,10 @@ static int apply_patches(
 
   if (!replace_file(path, result)) {
     LOG(ERROR) << "[ui_patch] failed to write: " << path;
+    report(false);
     return 0;
   }
+  report(true);
 
   LOG(INFO) << "[ui_patch] patched " << path << " (" << applied
             << " replacement(s), " << unapplied << " removed)";
@@ -470,6 +796,36 @@ static int apply_patches(
 // unpacked, when its files may be newer than the md5sums on record.
 static bool status_is_half_installed(const std::string& status) {
   return status.find("half-installed") != std::string::npos;
+}
+
+// Patch the service.js at @p path: the backend scope filter always, and the
+// optional patches of @p opts, each of which is taken out again when off.
+// Sets both outcomes in @p rep (kNotRun when the file cannot be read).
+// Returns the number of patches applied, or -1 if the file is not readable.
+static int patch_service_js(
+    const std::string& path, const PatchOptions& opts,
+    const std::unordered_map<std::string, std::string>& md5sums,
+    PatchReport* rep) {
+  std::vector<Patch> backend(kBackendPatches,
+                             kBackendPatches + kBackendPatchCount);
+  std::vector<Patch> removed;
+  auto add = [&](const Patch& p, bool enabled) {
+    std::vector<Patch>& list = enabled ? backend : removed;
+    list.push_back(p);
+    return list.size() - 1;
+  };
+  const size_t wsa = add(kBackendPatchWsa, opts.onvif_addressing);
+  const size_t route = add(kBackendPatchRoute, opts.event_proxy);
+  std::vector<PatchOutcome> outcomes(backend.size(), PatchOutcome::kNotRun);
+  std::vector<PatchOutcome> removed_outcomes(removed.size(),
+                                             PatchOutcome::kNotRun);
+  const int n = apply_patches(path, backend.data(), backend.size(), md5sums,
+                              removed.data(), removed.size(), outcomes.data(),
+                              removed_outcomes.data());
+  rep->onvif_addressing =
+      (opts.onvif_addressing ? outcomes : removed_outcomes)[wsa];
+  rep->event_proxy = (opts.event_proxy ? outcomes : removed_outcomes)[route];
+  return n;
 }
 
 static bool protect_unpack_in_progress() {
@@ -485,7 +841,32 @@ static bool protect_unpack_in_progress() {
 // ---------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------
-absl::Status patch_alarm_picker(bool onvif_addressing) {
+const char* patch_outcome_name(PatchOutcome outcome) {
+  switch (outcome) {
+    case PatchOutcome::kNotRun:
+      return "not_run";
+    case PatchOutcome::kApplied:
+      return "applied";
+    case PatchOutcome::kAlready:
+      return "already";
+    case PatchOutcome::kRemoved:
+      return "removed";
+    case PatchOutcome::kAbsent:
+      return "absent";
+    case PatchOutcome::kNotApplicable:
+      return "not_applicable";
+    case PatchOutcome::kAmbiguous:
+      return "ambiguous";
+  }
+  return "not_run";
+}
+
+absl::Status patch_alarm_picker(const PatchOptions& opts,
+                                PatchReport* report) {
+  PatchReport local_report;
+  PatchReport* rep = report != nullptr ? report : &local_report;
+  *rep = PatchReport();
+
   // dpkg's trigger restarts onvif-recorder once the unpack has finished,
   // and that start-up patches the new files.
   if (protect_unpack_in_progress()) {
@@ -540,20 +921,16 @@ absl::Status patch_alarm_picker(bool onvif_addressing) {
     }
   }
 
-  // Patch service.js (backend scope filter, ONVIF WS-Addressing).  A
-  // disabled WS-Addressing patch is taken out again.
-  {
-    std::vector<Patch> backend(kBackendPatches,
-                               kBackendPatches + kBackendPatchCount);
-    std::vector<Patch> removed;
-    (onvif_addressing ? backend : removed).push_back(kBackendPatchWsa);
-    int n = apply_patches(kServicePath, backend.data(), backend.size(),
-                          md5sums, removed.data(), removed.size());
-    if (n >= 0) {
-      ++files_found;
-      total += n;
-    }
+  // Patch service.js (backend scope filter, ONVIF WS-Addressing, event
+  // sharing route).
+  const int n = patch_service_js(kServicePath, opts, md5sums, rep);
+  if (n >= 0) {
+    ++files_found;
+    total += n;
   }
+  LOG(INFO) << "[ui_patch] service.js: onvif_addressing="
+            << patch_outcome_name(rep->onvif_addressing)
+            << " event_proxy=" << patch_outcome_name(rep->event_proxy);
 
   if (files_found == 0) {
     return absl::NotFoundError(
@@ -672,8 +1049,7 @@ static bool file_newer_than_process(const std::string& path, pid_t pid) {
   return file_age < proc_age;
 }
 
-// unifi-protect's MainPID, or 0 when it is not running.
-static pid_t protect_main_pid() {
+pid_t protect_main_pid() {
   std::FILE* p = popen(
       "systemctl show unifi-protect --property=MainPID --value 2>/dev/null",
       "r");

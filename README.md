@@ -136,6 +136,62 @@ Admin UI -> Detection -> camera_object_types
 By default, object detection notifications will arrive with no thumbnail attached. In order to receive thumbnails as well, you'll need  to enable the global alarm manager.
 Details on how to do this and the associated limitations are in [`THUMBNAILS.md`](THUMBNAILS.md)
 
+## Sharing a camera's events with Protect
+
+From Protect 7.1, Protect subscribes to each third-party camera's ONVIF events itself,
+alongside onvif-recorder's own subscription. Most cameras accept both. Some, such as
+certain PTZ cameras, accept only one event subscriber, so the two take turns: Protect
+shows the camera's motion detection as misconfigured and logs `ter:BlockedThreadUpperLimit`
+errors, and onvif-recorder misses events while Protect holds the camera's only slot.
+
+Event sharing is meant for those cameras. For a shared camera, onvif-recorder keeps the
+only event subscription to the camera and passes the events it receives on to Protect, so
+the camera should see a single subscriber. Sharing is off by default and is turned on per
+camera.
+
+**Turning it on.** On the admin page (`https://<device>/onvif/admin/`), tick
+**Share with Protect** for the camera on the **Camera health** card and click
+**Save sharing changes**. Without the admin page, set `protect_event_proxy_cameras` to the
+cameras' MAC addresses, comma-separated (case and `:` or `-` separators don't matter); see
+[`FLAGS.md`](FLAGS.md).
+
+**What happens:**
+
+- Protect reads the change only when it starts, so onvif-recorder restarts Protect about
+  five minutes after the first camera is turned on, and again about five minutes after the
+  last one is turned off. Turning other cameras on or off in between restarts only
+  onvif-recorder. With `--auto_heal_protect=false`, restart Protect yourself.
+- When Protect subscribes to a shared camera's events, it asks onvif-recorder first. If
+  onvif-recorder is not running, declines, or does not answer within a few seconds, Protect
+  subscribes to the camera itself, as it does without sharing.
+- Only the event subscription goes through onvif-recorder. Protect's other requests to the
+  camera (video, snapshots, PTZ, its check of the camera's event support) still go to the
+  camera.
+- When onvif-recorder restarts for a settings change or a package update, it keeps its
+  subscription to the camera, so in most cases Protect should see no gap in events.
+- The Camera health card shows a short status under each ticked camera, such as
+  `via onvif-recorder` once Protect gets the camera's events that way, or
+  `Protect restart pending`. Log lines about sharing start with `[event_proxy]`
+  (`journalctl -u onvif-recorder`).
+
+**Limitations:**
+
+- Needs Protect 7.1 or later and `patch_alarm_picker` (on by default), because sharing works
+  by patching Protect. If a Protect version doesn't match what onvif-recorder expects,
+  sharing is not applied, the admin page says this Protect version can't share events, and
+  Protect keeps subscribing to the camera directly.
+- onvif-recorder must be able to subscribe to the camera itself, since its subscription is
+  where the shared events come from. Cameras that are excluded on the Camera health card or
+  paired with an AI Port can't be shared.
+- If onvif-recorder can't get events from the camera for a while (from a few minutes up to
+  about half an hour, depending on how it fails), it hands the camera back to Protect, which
+  then subscribes to the camera directly again. The status shows `handed back: …` and the
+  log has a warning. onvif-recorder should take the camera back once its own subscription
+  has worked again for about five minutes; a restart of onvif-recorder does not reset this.
+- Turning sharing off for one camera while others stay shared puts that camera back to how
+  it was before, including the subscriber conflict on a single-subscriber camera.
+- onvif-recorder serves Protect on port 7892 of the loopback address only. If another
+  program already uses that port, sharing stays off and the admin page says so.
 
 ## Troubleshooting
 
@@ -171,6 +227,14 @@ can appear briefly while either side re-subscribes, until the old one times out
 (about 60 s). Some cameras have too few subscription slots for both clients; they
 reject one with errors such as `ter:BlockedThreadUpperLimit`, and Protect then
 shows motion detection as misconfigured for that camera.
+
+**`ter:BlockedThreadUpperLimit` errors, or motion detection shown as misconfigured, on a
+camera that allows only one event subscriber?** Protect and onvif-recorder are competing
+for the camera's only subscription slot, and onvif-recorder may miss events too. Tick
+**Share with Protect** for that camera on the Camera health card (admin page), so
+onvif-recorder holds the only subscription and passes the events on to Protect; see
+[Sharing a camera's events with Protect](#sharing-a-cameras-events-with-protect). A Reolink
+camera can show the same status for a different reason; see below.
 
 **Duplicate motion and "person" events?** From Protect 7.1, Protect subscribes to a
 third-party camera's ONVIF motion itself and creates the basic motion events.

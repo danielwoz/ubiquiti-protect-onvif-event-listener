@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>  // NOLINT(build/c++11)
 #include <string>
 #include <vector>
 
@@ -67,6 +68,17 @@ class AdminServer {
   /// The ring must outlive the AdminServer.
   void set_log_ring(const LogRing* ring) { log_ring_ = ring; }
 
+  /// Returns the Protect event-sharing status as a JSON object
+  /// (mode, port, bound, patch, protect_restart_pending, hub, and
+  /// "bind_failed":true when the event-sharing port could not be bound).
+  using EventProxyStatusFn = std::function<std::string()>;
+
+  /// Set the source of GET /api/event_proxy and of event_proxy.json in
+  /// the diagnostic dump.  Without one, or when it returns an empty
+  /// string, both report {"mode":"off"}.  Callable before or after
+  /// start(), from any thread.
+  void set_event_proxy_status_fn(EventProxyStatusFn fn);
+
   /// Return the port the server is listening on. Only meaningful after a
   /// successful start().  Useful when start() was called with port=0.
   uint16_t port() const { return port_; }
@@ -81,6 +93,9 @@ class AdminServer {
   AdminServer& operator=(const AdminServer&) = delete;
 
  private:
+  // The provider's JSON, or an empty string without one.
+  std::string event_proxy_status() const;
+
   ::MHD_Daemon* daemon_{nullptr};
   // State the request handler reads; set while the daemon runs.
   std::shared_ptr<void> ctx_;
@@ -93,8 +108,18 @@ class AdminServer {
   ProtectUserIdProvider* protect_user_id_provider_{nullptr};
   std::string event_log_path_;
   GetOnvifHealthsFn get_onvif_healths_;
+  mutable std::mutex event_proxy_mu_;
+  EventProxyStatusFn event_proxy_fn_;  // guarded by event_proxy_mu_
   uint16_t port_{0};
 };
+
+/// Body of GET /api/camera_health for @p rows.  Each camera's tickbox
+/// state (via Protect, Enabled, Share with Protect) comes from the
+/// config file at @p config_path; a missing file leaves every box at its
+/// default.
+std::string camera_health_json(const std::vector<unifi::CameraHealth>& rows,
+                               const std::string& config_path,
+                               uint64_t now_ms);
 
 /// Replace the query string of each named URL-valued key in a flat JSON
 /// object with "?[REDACTED]".  Used on config.json in the diagnostic dump.

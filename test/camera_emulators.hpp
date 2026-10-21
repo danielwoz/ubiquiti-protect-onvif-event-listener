@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <map>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -253,7 +255,8 @@ class ReolinkCameraEmulator : public OnvifCameraEmulator {
 // ReplayCameraEmulator -- generic JSONL session replay.
 //
 // Clamps CreatePullPointSubscription/Renew at their last recorded
-// response and cycles PullMessages forever.  That is all a captured
+// response, cycles PullMessages forever and answers
+// SetSynchronizationPoint with 200.  That is all a captured
 // field session needs, so both cameras added from user dumps share it
 // rather than each getting a byte-identical subclass:
 //
@@ -281,6 +284,74 @@ class ReplayCameraEmulator : public OnvifCameraEmulator {
   std::size_t     pull_idx_{0};
   std::size_t     renew_idx_{0};
   std::mutex      mu_;
+};
+
+// ============================================================
+// SlotLimitedCameraEmulator -- camera with a fixed number of event
+// subscription slots, like the Dahua DH-SD4A425DB-HNY PTZ (one slot).
+//
+// At most `slots` subscriptions are live at once; a further Create gets the
+// capture's ter:BlockedThreadUpperLimit fault (its recorded HTTP status and
+// body).  A slot is freed by Unsubscribe or when the subscription's
+// termination time (InitialTerminationTime / Renew TerminationTime, PTnS or
+// PTnM, default 60 s) passes.  Each subscription has its own address;
+// PullMessages on a live one replays the capture's pulls in a cycle,
+// SetSynchronizationPoint on a live one is answered 200, and requests for a
+// subscription that is not live get a fault (HTTP 400).
+// ============================================================
+class SlotLimitedCameraEmulator : public OnvifCameraEmulator {
+ public:
+  SlotLimitedCameraEmulator(const std::string& jsonl_path, int slots);
+
+  /// Subscriptions live now (expired ones are not counted).
+  int live_subscriptions() const;
+  /// Every CreatePullPointSubscription received, accepted or refused.
+  int creates_total() const;
+  /// Creates answered with the slot fault.
+  int creates_refused() const;
+  /// Every Unsubscribe received, for any address.
+  int unsubscribes_total() const;
+  /// Every Renew received, for any address.
+  int renews_total() const;
+  /// PullMessages answered 200.
+  int pulls_total() const;
+  /// SetSynchronizationPoint answered 200.
+  int sync_points_total() const;
+
+  /// While set, Renew on a live subscription gets a fault (HTTP 400) and
+  /// leaves its termination time alone; pulls keep working.
+  void set_fail_renews(bool fail);
+  /// Change the number of slots; live subscriptions above it stay live.
+  void set_slots(int slots);
+
+ protected:
+  std::pair<int, std::string> handle(
+    const std::string& path,
+    const std::string& soap_action,
+    const std::string& body) override;
+
+ private:
+  using Clock = std::chrono::steady_clock;
+
+  void expire_locked();
+  std::string create_response(const std::string& path) const;
+
+  RecordedSession             session_;
+  int                         fault_status_{400};
+  std::string                 fault_body_;
+  std::string                 create_template_;
+  std::size_t                 pull_idx_{0};
+  int                         slots_;
+  int                         next_id_{1};
+  std::map<std::string, Clock::time_point> live_;  // path -> termination
+  int                         creates_total_{0};
+  int                         creates_refused_{0};
+  int                         unsubscribes_total_{0};
+  int                         renews_total_{0};
+  int                         pulls_total_{0};
+  int                         sync_points_total_{0};
+  bool                        fail_renews_{false};
+  mutable std::mutex          mu_;
 };
 
 // ============================================================

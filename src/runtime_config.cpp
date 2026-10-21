@@ -205,6 +205,19 @@ const std::vector<Entry>& Schema() {
      "concurrent-HTTP-session limits (many Amcrest / Dahua firmwares) "
      "that sporadically 5xx while RTSP is streaming.",
      "Cameras"},
+    {"protect_event_proxy_cameras", Type::String,
+     "Comma-separated MAC addresses of third-party cameras whose motion "
+     "events Protect gets through onvif-recorder instead of subscribing to "
+     "the camera itself, so the camera has a single event subscriber.  Use "
+     "the Share with Protect tickboxes on the Camera Health card above to "
+     "manage this.  Meant for cameras that allow only one event subscriber "
+     "(some PTZ cameras), where Protect and onvif-recorder otherwise keep "
+     "taking that one slot from each other and both miss events.  Turning "
+     "on the first camera, or off the last one, restarts Protect about "
+     "five minutes later (not with --auto_heal_protect=false in the "
+     "service flags).  Whenever onvif-recorder isn't running, Protect goes "
+     "back to the camera by itself.  Empty turns sharing off.",
+     "Cameras"},
 
     // ---- MSR forwarding ----
     {"msr_url", Type::String,

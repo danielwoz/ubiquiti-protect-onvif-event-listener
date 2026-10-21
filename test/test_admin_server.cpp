@@ -32,6 +32,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "admin_server.hpp"
 
@@ -91,7 +92,96 @@ static std::string http_exchange(uint16_t port, const std::string& request) {
   return resp;
 }
 
+static std::string http_get(uint16_t port, const std::string& path) {
+  return http_exchange(port,
+                       "GET " + path + " HTTP/1.1\r\n"
+                       "Host: localhost\r\n"
+                       "Connection: close\r\n\r\n");
+}
+
+// The body of a raw HTTP response (everything after the blank line).
+static std::string http_body(const std::string& resp) {
+  const size_t p = resp.find("\r\n\r\n");
+  return p == std::string::npos ? std::string() : resp.substr(p + 4);
+}
+
+static bool write_text(const std::string& path, const std::string& content) {
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  if (!f.is_open()) return false;
+  f << content;
+  return f.good();
+}
+
+// The JSON object of the camera with id @p id in a camera_health body.
+static std::string camera_object(const std::string& json,
+                                 const std::string& id) {
+  const size_t p = json.find("{\"id\":\"" + id + "\"");
+  if (p == std::string::npos) return {};
+  const size_t e = json.find('}', p);
+  return e == std::string::npos ? std::string() : json.substr(p, e - p + 1);
+}
+
+static unifi::CameraHealth health_row(const std::string& id,
+                                      const std::string& host,
+                                      const std::string& mac,
+                                      bool third_party) {
+  unifi::CameraHealth r;
+  r.id = id;
+  r.name = "cam-" + id;
+  r.host = host;
+  r.mac = mac;
+  r.is_third_party = third_party;
+  return r;
+}
+
+// camera_health_json: the Share with Protect state comes from the saved
+// protect_event_proxy_cameras, matched on normalised MACs, and is only
+// reported for third-party cameras.
+static void test_camera_health_event_proxy() {
+  const std::string cfg = temp_dir() + "/admin_server_test_event_proxy.json";
+  check(write_text(cfg,
+                   "{\"protect_event_proxy_cameras\":"
+                   "\"f0-00-00-fd-ae-d9, 112233445566\","
+                   "\"excluded_cameras\":\"aabbccddeeff\"}"),
+        "write event proxy config");
+  const std::vector<unifi::CameraHealth> rows = {
+      health_row("ptz", "192.168.1.109", "F0:00:00:FD:AE:D9", true),
+      health_row("door", "192.168.1.108", "AABBCCDDEEFF", true),
+      health_row("g4", "192.168.1.20", "112233445566", false),
+      health_row("nomac", "192.168.1.50", "", true),
+  };
+  const std::string j = onvif::camera_health_json(rows, cfg, 42);
+  check(j.find("{\"now_ms\":42,\"cameras\":[") == 0,
+        "camera_health_json starts with now_ms and cameras");
+
+  const std::string ptz = camera_object(j, "ptz");
+  check(ptz.find("\"event_proxy\":true") != std::string::npos,
+        "listed third-party camera is shared (MAC normalised)");
+  const std::string door = camera_object(j, "door");
+  check(door.find("\"event_proxy\":false") != std::string::npos,
+        "unlisted third-party camera is not shared");
+  check(door.find("\"excluded\":true") != std::string::npos,
+        "excluded_cameras still reported next to event_proxy");
+  const std::string g4 = camera_object(j, "g4");
+  check(!g4.empty() && g4.find("event_proxy") == std::string::npos,
+        "first-party camera has no event_proxy key even when listed");
+  const std::string nomac = camera_object(j, "nomac");
+  check(nomac.find("\"event_proxy\":false") != std::string::npos,
+        "third-party camera without a MAC is never shared");
+
+  const std::string missing = onvif::camera_health_json(
+      rows, temp_dir() + "/admin_server_test_no_such_config.json", 1);
+  check(camera_object(missing, "ptz").find("\"event_proxy\":false") !=
+            std::string::npos,
+        "missing config file shares nothing");
+  check(onvif::camera_health_json({}, cfg, 7) == "{\"now_ms\":7,\"cameras\":[]}",
+        "no rows gives an empty cameras array");
+  ::unlink(cfg.c_str());
+}
+
 int main() {
+  test_camera_health_event_proxy();
+
   // Set up a channel file so /api/status has something to read.
   const std::string channel_path = temp_dir() + "/admin_server_test_channel";
   {
@@ -195,6 +285,71 @@ int main() {
           "camera_health returns empty array when DB absent");
     check(resp.find("\"now_ms\":") != std::string::npos,
           "camera_health includes now_ms timestamp");
+  }
+
+  // The page has the Share with Protect column, and the generic config
+  // form leaves protect_event_proxy_cameras to its tickboxes.
+  {
+    const std::string page = http_body(http_get(port, "/"));
+    check(page.find(">Share with Protect<") != std::string::npos,
+          "camera health card has a Share with Protect column");
+    check(page.find("if (e.name === 'protect_event_proxy_cameras') continue;") !=
+              std::string::npos,
+          "config form skips protect_event_proxy_cameras");
+    check(page.find("colspan=\"8\"") == std::string::npos,
+          "no camera health row still spans the old column count");
+  }
+
+  // GET /api/event_proxy without a status provider reports sharing off.
+  {
+    const std::string resp = http_get(port, "/api/event_proxy");
+    check(resp.find("HTTP/1.1 200") != std::string::npos,
+          "GET /api/event_proxy returns 200 without a provider");
+    check(resp.find("application/json") != std::string::npos,
+          "GET /api/event_proxy advertises application/json");
+    check(http_body(resp) == "{\"mode\":\"off\"}",
+          "event_proxy without a provider is {\"mode\":\"off\"}");
+  }
+
+  // A provider set after start() is served as-is; an empty reply from it
+  // still reads as off.
+  const std::string proxy_json =
+      "{\"mode\":\"serve\",\"port\":7892,\"bound\":true,"
+      "\"patch\":\"applied\",\"protect_restart_pending\":false,"
+      "\"hub\":{\"ready\":true,\"cameras\":[{\"key\":\"192.168.1.109\","
+      "\"ip\":\"192.168.1.109\",\"mac\":\"F00000FDAED9\",\"proxied\":true,"
+      "\"accepting\":true,\"pull_points\":[]}]}}";
+  server.set_event_proxy_status_fn([] { return std::string(); });
+  check(http_body(http_get(port, "/api/event_proxy")) == "{\"mode\":\"off\"}",
+        "empty provider reply reads as {\"mode\":\"off\"}");
+  server.set_event_proxy_status_fn([proxy_json] { return proxy_json; });
+  check(http_body(http_get(port, "/api/event_proxy")) == proxy_json,
+        "event_proxy returns the provider's JSON");
+
+  // The diagnostic dump carries event_proxy.json, sanitised like the
+  // other files.
+  {
+    const std::string resp = http_get(port, "/api/diagnostic_dump");
+    check(resp.find("HTTP/1.1 200") != std::string::npos,
+          "GET /api/diagnostic_dump returns 200");
+    const std::string tgz = temp_dir() + "/admin_server_test_dump.tar.gz";
+    check(write_text(tgz, http_body(resp)), "write dump archive");
+    std::string ep;
+    FILE* p = ::popen(("tar -xzOf " + tgz + " ./event_proxy.json 2>/dev/null")
+                          .c_str(), "r");
+    if (p != nullptr) {
+      char buf[4096];
+      size_t n;
+      while ((n = std::fread(buf, 1, sizeof(buf), p)) > 0) ep.append(buf, n);
+      ::pclose(p);
+    }
+    check(ep.find("\"mode\":\"serve\"") != std::string::npos,
+          "dump contains event_proxy.json with the provider's status");
+    check(ep.find("192.168.1.109") == std::string::npos,
+          "dump's event_proxy.json has camera addresses redacted");
+    check(ep.find("F00000FDAED9") == std::string::npos,
+          "dump's event_proxy.json has camera MACs redacted");
+    ::unlink(tgz.c_str());
   }
 
   server.stop();

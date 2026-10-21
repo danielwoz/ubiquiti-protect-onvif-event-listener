@@ -93,6 +93,18 @@ src/
                                     over HTTP/2 cleartext on 127.0.0.1:7700)
   camera_change_log.hpp/.cpp    — Cameras-table change log and rollback support
   protect_ui_patch.hpp/.cpp     — Live-patch Protect UI alarm picker for third-party cameras
+                                    (and service.js: WS-Addressing, event-sharing route)
+  upstream_event.hpp            — State changes of the recorder's own camera subscriptions,
+                                    reported by OnvifListener to the event-sharing hub
+  notification_fragments.hpp/.cpp — Split PullMessages responses into self-contained
+                                    NotificationMessage fragments
+  pullpoint_hub.hpp/.cpp        — Event sharing ("event proxy") state: per-camera fan-out to
+                                    Protect's pull points, current-state cache, hand-back
+  pullpoint_server.hpp/.cpp     — Loopback ONVIF PullPoint service (127.0.0.1:7892) answering
+                                    Protect's event subscriptions from the hub
+  pullpoint_soap.hpp/.cpp       — PullPoint request parsing, SOAP 1.2 responses and faults
+  event_proxy_mode.hpp/.cpp     — Event-sharing mode (serve / drain / off) from the setting,
+                                    the state files and Protect's PID; /api/event_proxy JSON
   ubv_thumbnail.hpp/.cpp        — UBV container encode/decode (thumbnail storage)
   jpeg_crop.hpp/.cpp            — JPEG decode/crop/re-encode via libjpeg
   object_detect.hpp/.cpp        — NanoDet-M on-device object detection via NCNN
@@ -113,7 +125,7 @@ third_party/
 
 test/
   onvif_camera_emulator.hpp/.cpp  — libmicrohttpd fake camera base class
-  camera_emulators.hpp/.cpp       — Camera 108 / 109 concrete emulators
+  camera_emulators.hpp/.cpp       — Camera 108 / 109 and slot-limited concrete emulators
   test_onvif_listener.cpp         — Listener integration test
   test_detection_recorder.cpp     — Detection recorder e2e test
   test_ubv_thumbnail.cpp          — UBV round-trip test
@@ -122,6 +134,12 @@ test/
   test_unifi_camera_config.cpp   — DB connection string / JSON / PG array helper tests
   test_motion_poller.cpp          — Smart detect type / SDR payload helper tests
   test_msr_client.cpp             — MSR gRPC wire-format encode/decode tests
+  test_notification_fragments.cpp — Fragment extraction over the JSONL captures
+  test_pullpoint_hub.cpp          — Event-sharing hub state machine tests (fake clock)
+  test_pullpoint_server.cpp       — PullPoint SOAP service tests (libcurl client)
+  test_pullpoint_e2e.cpp          — Emulated camera → listener → hub → PullPoint service
+  test_event_proxy_mode.cpp       — Event-sharing mode table and state-file tests
+  test_debian_scripts.sh          — prerm / postinst upgrade-path checks
   bench_onvif_listener.cpp        — ONVIF parsing throughput benchmark
   bench_jpeg_crop.cpp             — JPEG crop throughput benchmark
   bench_object_detect.cpp         — NanoDet-M inference latency benchmark
@@ -172,6 +190,14 @@ Optionally, per-camera UBV thumbnail files are also written to `ONVIF_UBV_DIR` i
   - `--detect_override`: always NanoDet-M → full image (ONVIF bbox discarded)
 - NCNN is built from source via `rules_foreign_cc` cmake(); model files are downloaded
   by Bazel `http_file` rules (`nanodet_m_param`, `nanodet_m_bin`).
+- Protect event sharing (`--protect_event_proxy_cameras`; empty = off, nothing bound or
+  tapped). At start `event_proxy::decide_mode()` picks serve / drain / off from the setting,
+  `<state_dir>/event-proxy-{active,drain}` and Protect's MainPID; drain keeps serving the
+  cameras a Protect that loaded the route patch may still send here, until its PID changes.
+  The PullPoint service binds 127.0.0.1:7892 before service.js is patched, and the route
+  patch is applied only in serve mode with the port bound. Shutdown: listener, then
+  `hub->stop()`, `server->stop()`, `global_cleanup()`; fatal start-up paths stop the hub
+  and server before `global_cleanup()` too.
 
 ## Pre-push checklist
 
@@ -652,6 +678,7 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--patch_alarm_picker` | `true` | Live-patch the Protect UI to allow third-party cameras in the alarm creation picker. Re-applied on every startup so it survives firmware updates. `false` stops patching Protect files; patches already applied stay until Protect is updated or `--rollback` runs. |
 | `--patch_onvif_addressing` | `true` | Patch Protect's own ONVIF client (7.1+) to send WS-Addressing `To`/`Action` with PullMessages, Renew and Unsubscribe, which Reolink requires for Protect's native motion detection. `false` removes it again. Needs `--patch_alarm_picker`. Protect loads service.js changes only at start, so `--auto_heal_protect` restarts it after any service.js change made while it runs. |
 | `--auto_heal_protect` | `true` | Restart Protect services on a DB wedge (msp+msr+unifi-protect), an MSR wedge (msr), stale camera featureFlags, or a service.js patched after Protect started (unifi-protect). No restart in the first 5 min, 5 min cooldown, 4 per 24 h (persisted in `<state_dir>/healer-restarts`). |
+| `--protect_event_proxy_cameras` | _(empty)_ | Comma-separated MACs (case-insensitive; `:`, `-` and spaces ignored) of third-party cameras whose ONVIF event subscription Protect (7.1+) gets from the recorder's PullPoint service on `127.0.0.1:7892`, fed from the recorder's own camera subscription, for cameras that allow one subscriber (`ter:BlockedThreadUpperLimit`). Empty = off: 7892 not bound, route patch removed from service.js. Needs `--patch_alarm_picker`. Adding the first / removing the last MAC changes service.js, so `--auto_heal_protect` restarts Protect. Protect falls back to the camera when the recorder declines, is down or does not answer within 4 s; only CreatePullPointSubscription and the resulting Pull/Renew/Unsubscribe are routed. Edited via the Camera health card's "Share with Protect" tickboxes. State in `<state_dir>/event-proxy-*` and `<state_dir>/upstream-subscriptions.json`. |
 
 Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default is `kError`.
 `enable_verbose_logging()` has been removed from `OnvifListener`; set log level via absl before calling `run()`.

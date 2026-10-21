@@ -1,13 +1,17 @@
 #!/bin/sh
 # Pre-remove script for onvif-recorder.
-# Stops the service, rolls back cameras-table changes, reverts UI and nginx
-# patches before the binary is deleted from disk.
+# On removal, stops the service, rolls back cameras-table changes, reverts UI
+# and nginx patches before the binary is deleted from disk.  On upgrade the
+# service keeps running.
 set -e
 
 case "$1" in
     upgrade)
+        # The running recorder keeps serving while dpkg unpacks the new
+        # files, and postinst restarts it with the new binary.  Stopping it
+        # here would leave Protect without events for the whole unpack on
+        # cameras whose events are shared through the recorder.
         # Timers keep their enabled state across upgrades (issue #55).
-        systemctl stop onvif-recorder.service 2>/dev/null || true
         ;;
     remove|deconfigure)
         systemctl stop onvif-recorder.service 2>/dev/null || true

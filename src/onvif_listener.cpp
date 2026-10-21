@@ -21,26 +21,37 @@
 #include "onvif_listener.hpp"
 
 #include <curl/curl.h>
+#include <fcntl.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include <libxml/xpath.h>
 #include <libxml/xpathInternals.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <zstd.h>
 
+#include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -82,6 +93,24 @@ void global_cleanup() {
   curl_global_cleanup();
   xmlCleanupParser();
 }
+
+namespace detail {
+
+// Requests another thread makes of one CameraWorker (nudge, resubscribe).
+// Shared by the worker and the listener's registry, so it stays valid for
+// a worker that outlives run().
+struct WorkerControl {
+  explicit WorkerControl(std::string camera_ip) : ip(std::move(camera_ip)) {}
+
+  const std::string       ip;
+  std::mutex              mu;
+  std::condition_variable cv;
+  bool wake{false};           // end the current (or next) interruptible sleep
+  bool reset_backoff{false};  // the next pause uses the base backoff
+  bool resubscribe{false};    // drop the subscription and create a new one
+};
+
+}  // namespace detail
 
 // ============================================================
 // Internal helpers (all anonymous-namespace / file-local)
@@ -401,6 +430,513 @@ static std::string url_path(const std::string& url) {
   return (slash == std::string::npos) ? "/" : url.substr(slash);
 }
 
+// Short description of a failed SOAP exchange for logs and the state tap:
+// the fault's code values and reason ("SOAP-ENV:Sender
+// ter:BlockedThreadUpperLimit: text") when @p body is a SOAP fault, else
+// the first 300 bytes of @p body.  Fault envelopes often spend their first
+// few kilobytes on namespace declarations, so a plain prefix would hide
+// the fault code.
+std::string failure_detail(const std::string& body) {
+  constexpr size_t kMaxDetail = 300;
+  auto doc_or = XmlDoc::Create(body);
+  if (doc_or.ok()) {
+    std::string codes;
+    std::set<std::string> seen;
+    auto values = doc_or->xpath(
+        "//*[local-name()='Fault']//*[local-name()='Value' or "
+        "local-name()='faultcode']");
+    if (values && values->type == XPATH_NODESET && values->nodesetval) {
+      for (int i = 0; i < values->nodesetval->nodeNr; ++i) {
+        xmlChar* c = xmlNodeGetContent(values->nodesetval->nodeTab[i]);
+        if (!c) continue;
+        const std::string v = XmlDoc::trim(reinterpret_cast<char*>(c));
+        xmlFree(c);
+        if (v.empty() || !seen.insert(v).second) continue;
+        if (!codes.empty()) codes += ' ';
+        codes += v;
+      }
+    }
+    const std::string reason = XmlDoc::trim(doc_or->text(
+        "//*[local-name()='Fault']/*[local-name()='Reason']"
+        "/*[local-name()='Text'] | "
+        "//*[local-name()='Fault']/*[local-name()='faultstring']"));
+    if (!codes.empty() || !reason.empty()) {
+      std::string out = codes;
+      if (!reason.empty()) out += (out.empty() ? "" : ": ") + reason;
+      return out.substr(0, kMaxDetail);
+    }
+  }
+  return body.substr(0, kMaxDetail);
+}
+
+// Upper case without separators: "f0:00:00:fd:ae:d9" -> "F00000FDAED9".
+std::string normalize_mac(const std::string& mac) {
+  std::string out;
+  for (char c : mac) {
+    if (c == ':' || c == '-' || c == ' ') continue;
+    out += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return out;
+}
+
+// -------------------------------------------------------
+// Subscriptions kept across a restart (event_proxy cameras)
+// -------------------------------------------------------
+struct SavedSubscription {
+  std::string mac;
+  std::string ip;
+  std::string url;
+  std::string ref_params;
+  std::string alarm_url;
+  int64_t     expires_ms{0};  // Unix ms when the camera drops it
+};
+
+// Subscriptions handed over by workers that stopped while healthy.
+struct ResumeCollector {
+  std::mutex                     mu;
+  bool                           closed{false};  // later hand-overs are refused
+  std::vector<SavedSubscription> entries;
+};
+
+// A saved subscription belongs to @p cam when both carry a MAC and the MACs
+// agree, or, when either has none, when the ips agree.
+bool saved_matches(const SavedSubscription& s, const CameraConfig& cam) {
+  const std::string a = normalize_mac(s.mac);
+  const std::string b = normalize_mac(cam.mac);
+  if (!a.empty() && !b.empty()) return a == b;
+  return !s.ip.empty() && s.ip == cam.ip;
+}
+
+std::string saved_subscriptions_json(
+    const std::vector<SavedSubscription>& subs) {
+  std::string out = "{\"subscriptions\":[";
+  for (size_t i = 0; i < subs.size(); ++i) {
+    const SavedSubscription& s = subs[i];
+    if (i) out += ',';
+    out += "{\"mac\":" + util::json_str(s.mac) +
+           ",\"ip\":" + util::json_str(s.ip) +
+           ",\"url\":" + util::json_str(s.url) +
+           ",\"ref_params\":" + util::json_str(s.ref_params) +
+           ",\"alarm_url\":" + util::json_str(s.alarm_url) +
+           ",\"expires_ms\":" + std::to_string(s.expires_ms) + "}";
+  }
+  out += "]}\n";
+  return out;
+}
+
+// Reader for the file saved_subscriptions_json() writes: an object whose
+// "subscriptions" member is an array of flat objects.  Members it does not
+// know are skipped whatever their type.
+class SavedSubscriptionsReader {
+ public:
+  explicit SavedSubscriptionsReader(const std::string& text) : s_(text) {}
+
+  bool read(std::vector<SavedSubscription>* out) {
+    ws();
+    if (!eat('{')) return false;
+    ws();
+    if (eat('}')) return true;
+    for (;;) {
+      std::string key;
+      ws();
+      if (!read_string(&key)) return false;
+      ws();
+      if (!eat(':')) return false;
+      ws();
+      if (key == "subscriptions") {
+        if (!read_entries(out)) return false;
+      } else if (!skip_value(0)) {
+        return false;
+      }
+      ws();
+      if (eat(',')) continue;
+      return eat('}');
+    }
+  }
+
+ private:
+  bool read_entries(std::vector<SavedSubscription>* out) {
+    if (!eat('[')) return false;
+    ws();
+    if (eat(']')) return true;
+    for (;;) {
+      SavedSubscription e;
+      ws();
+      if (!read_entry(&e)) return false;
+      if (!e.url.empty()) out->push_back(std::move(e));
+      ws();
+      if (eat(',')) continue;
+      return eat(']');
+    }
+  }
+
+  bool read_entry(SavedSubscription* e) {
+    if (!eat('{')) return false;
+    ws();
+    if (eat('}')) return true;
+    for (;;) {
+      std::string key;
+      ws();
+      if (!read_string(&key)) return false;
+      ws();
+      if (!eat(':')) return false;
+      ws();
+      std::string* field = key == "mac"        ? &e->mac
+                         : key == "ip"         ? &e->ip
+                         : key == "url"        ? &e->url
+                         : key == "ref_params" ? &e->ref_params
+                         : key == "alarm_url"  ? &e->alarm_url
+                                               : nullptr;
+      if (field) {
+        if (!read_string(field)) return false;
+      } else if (key == "expires_ms") {
+        if (!read_integer(&e->expires_ms)) return false;
+      } else if (!skip_value(0)) {
+        return false;
+      }
+      ws();
+      if (eat(',')) continue;
+      return eat('}');
+    }
+  }
+
+  bool read_string(std::string* out) {
+    if (!eat('"')) return false;
+    out->clear();
+    while (p_ < s_.size()) {
+      const char c = s_[p_++];
+      if (c == '"') return true;
+      if (c != '\\') {
+        out->push_back(c);
+        continue;
+      }
+      if (p_ >= s_.size()) return false;
+      const char esc = s_[p_++];
+      switch (esc) {
+        case '"': case '\\': case '/': out->push_back(esc); break;
+        case 'b': out->push_back('\b'); break;
+        case 'f': out->push_back('\f'); break;
+        case 'n': out->push_back('\n'); break;
+        case 'r': out->push_back('\r'); break;
+        case 't': out->push_back('\t'); break;
+        case 'u': {
+          if (p_ + 4 > s_.size()) return false;
+          unsigned cp = 0;
+          for (int i = 0; i < 4; ++i) {
+            const char h = s_[p_++];
+            cp <<= 4;
+            if (h >= '0' && h <= '9')      cp |= static_cast<unsigned>(h - '0');
+            else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
+            else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
+            else
+              return false;
+          }
+          append_utf8(cp, out);
+          break;
+        }
+        default:
+          return false;
+      }
+    }
+    return false;
+  }
+
+  bool read_integer(int64_t* v) {
+    const size_t start = p_;
+    if (p_ < s_.size() && s_[p_] == '-') ++p_;
+    while (p_ < s_.size() && std::isdigit(static_cast<unsigned char>(s_[p_])))
+      ++p_;
+    if (p_ == start) return false;
+    *v = std::strtoll(s_.substr(start, p_ - start).c_str(), nullptr, 10);
+    return true;
+  }
+
+  bool skip_value(int depth) {
+    if (depth > 32 || p_ >= s_.size()) return false;
+    const char c = s_[p_];
+    if (c == '"') {
+      std::string ignored;
+      return read_string(&ignored);
+    }
+    if (c == '{' || c == '[') {
+      const char close = c == '{' ? '}' : ']';
+      ++p_;
+      ws();
+      if (eat(close)) return true;
+      for (;;) {
+        ws();
+        if (c == '{') {
+          std::string key;
+          if (!read_string(&key)) return false;
+          ws();
+          if (!eat(':')) return false;
+          ws();
+        }
+        if (!skip_value(depth + 1)) return false;
+        ws();
+        if (eat(',')) continue;
+        return eat(close);
+      }
+    }
+    const size_t start = p_;
+    while (p_ < s_.size() &&
+           (std::isalnum(static_cast<unsigned char>(s_[p_])) ||
+            s_[p_] == '-' || s_[p_] == '+' || s_[p_] == '.'))
+      ++p_;
+    return p_ > start;
+  }
+
+  static void append_utf8(unsigned cp, std::string* out) {
+    if (cp < 0x80) {
+      out->push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+      out->push_back(static_cast<char>(0xC0 | (cp >> 6)));
+      out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+      out->push_back(static_cast<char>(0xE0 | (cp >> 12)));
+      out->push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out->push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+  }
+
+  void ws() {
+    while (p_ < s_.size() &&
+           std::isspace(static_cast<unsigned char>(s_[p_])))
+      ++p_;
+  }
+  bool eat(char c) {
+    if (p_ < s_.size() && s_[p_] == c) {
+      ++p_;
+      return true;
+    }
+    return false;
+  }
+
+  const std::string& s_;
+  size_t             p_{0};
+};
+
+// Whole file into @p out.  False when it cannot be opened.
+bool read_whole_file(const std::string& path, std::string* out) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f.is_open()) return false;
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  *out = ss.str();
+  return true;
+}
+
+// Replace @p path with @p data (mode 0600) through a temporary file that
+// is fsync'ed before the rename, so a crash leaves the old file or the new
+// one, never a partial one.
+bool write_file_atomic(const std::string& path, const std::string& data) {
+  const std::string tmp = path + ".tmp";
+  const int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                      0600);
+  if (fd < 0) return false;
+  bool ok = fchmod(fd, 0600) == 0;
+  size_t off = 0;
+  while (ok && off < data.size()) {
+    const ssize_t n = write(fd, data.data() + off, data.size() - off);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      ok = false;
+    } else {
+      off += static_cast<size_t>(n);
+    }
+  }
+  ok = ok && fsync(fd) == 0;
+  ok = close(fd) == 0 && ok;
+  ok = ok && std::rename(tmp.c_str(), path.c_str()) == 0;
+  if (!ok) {
+    unlink(tmp.c_str());
+    return false;
+  }
+  // Persist the rename itself (best effort).
+  const auto slash = path.rfind('/');
+  const std::string dir = slash == std::string::npos ? "."
+                        : slash == 0 ? "/" : path.substr(0, slash);
+  const int dfd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (dfd >= 0) {
+    fsync(dfd);
+    close(dfd);
+  }
+  return true;
+}
+
+// Load and delete the subscriptions file the previous run() wrote.  A
+// missing or unreadable file yields nothing.
+std::vector<SavedSubscription> take_saved_subscriptions(
+    const std::string& path) {
+  std::vector<SavedSubscription> subs;
+  std::string text;
+  if (!read_whole_file(path, &text)) return subs;
+  if (!SavedSubscriptionsReader(text).read(&subs)) {
+    LOG(WARNING) << "[onvif] ignoring unreadable saved subscriptions file "
+                 << path;
+    subs.clear();
+  } else {
+    LOG(INFO) << "[onvif] loaded " << subs.size()
+              << " saved subscription(s) from " << path;
+  }
+  if (std::remove(path.c_str()) != 0 && errno != ENOENT)
+    LOG(WARNING) << "[onvif] cannot delete " << path << ": "
+                 << std::strerror(errno);
+  return subs;
+}
+
+// Write @p subs to @p path, or remove @p path when there are none.
+// Returns false when @p subs could not be written.
+bool store_saved_subscriptions(const std::string& path,
+                               const std::vector<SavedSubscription>& subs) {
+  if (subs.empty()) {
+    if (std::remove(path.c_str()) != 0 && errno != ENOENT)
+      LOG(WARNING) << "[onvif] cannot delete " << path << ": "
+                   << std::strerror(errno);
+    return true;
+  }
+  if (!write_file_atomic(path, saved_subscriptions_json(subs))) {
+    LOG(WARNING) << "[onvif] cannot save " << subs.size()
+                 << " subscription(s) to " << path << ": "
+                 << std::strerror(errno);
+    return false;
+  }
+  LOG(INFO) << "[onvif] saved " << subs.size() << " subscription(s) to "
+            << path;
+  return true;
+}
+
+// Unsubscribe @p url with @p cam's credentials.  Returns the HTTP status,
+// or an error when the request did not complete.
+absl::StatusOr<int64_t> send_unsubscribe(const CameraConfig& cam,
+                                         const std::string& url,
+                                         const std::string& ref_params,
+                                         int timeout_sec) {
+  static const char* ACTION =
+    "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/"
+    "UnsubscribeRequest";
+  const std::string body = "    <wsnt:Unsubscribe/>\n";
+  const std::string soap = build_soap(cam.user, cam.password, body, url,
+                                      ACTION, ref_params);
+  auto resp_or = soap_post(url, soap, ACTION, timeout_sec);
+  if (!resp_or.ok()) return resp_or.status();
+  RawSink::instance().record(cam.ip, url, ACTION, soap,
+                             resp_or->status_code, resp_or->body);
+  return resp_or->status_code;
+}
+
+// Unsubscribe @p s, best effort, with the credentials of the camera in
+// @p cams it belongs to (a MAC match wins over an ip one), or none.
+void release_saved_subscription(const SavedSubscription& s,
+                                const std::vector<CameraConfig>& cams) {
+  const CameraConfig* cam = nullptr;
+  for (const auto& c : cams) {
+    if (!saved_matches(s, c)) continue;
+    if (!cam || (!normalize_mac(c.mac).empty() &&
+                 !normalize_mac(s.mac).empty()))
+      cam = &c;
+  }
+  CameraConfig creds;
+  if (cam) creds = *cam;
+  if (creds.ip.empty()) creds.ip = s.ip;
+  auto status_or = send_unsubscribe(creds, s.url, s.ref_params, 5);
+  LOG(INFO) << '[' << creds.ip << "] released saved subscription " << s.url
+            << ": "
+            << (status_or.ok() ? "HTTP " + std::to_string(*status_or)
+                               : std::string(status_or.status().message()));
+}
+
+// -------------------------------------------------------
+// AsyncDelivery -- one camera's events to the callback from a thread of
+// its own, so a slow callback (snapshot fetch, detection, DB) never delays
+// the camera's next pull.  Order is kept; when kMaxQueued events are
+// waiting the oldest is dropped.
+// -------------------------------------------------------
+class AsyncDelivery {
+ public:
+  static constexpr size_t kMaxQueued = 1000;
+
+  AsyncDelivery(std::string ip, EventCallback cb)
+    : ip_(std::move(ip)), cb_(std::move(cb)), thread_([this] { loop(); }) {}
+
+  ~AsyncDelivery() { finish(std::chrono::milliseconds(0)); }
+
+  AsyncDelivery(const AsyncDelivery&)            = delete;
+  AsyncDelivery& operator=(const AsyncDelivery&) = delete;
+
+  void push(OnvifEvent ev) {
+    uint64_t dropped = 0;
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (q_.size() >= kMaxQueued) {
+        q_.pop_front();
+        ++dropped_;
+        const auto now = std::chrono::steady_clock::now();
+        if (!warned_ || now - last_warn_ >= std::chrono::minutes(1)) {
+          warned_    = true;
+          last_warn_ = now;
+          dropped    = dropped_;
+          dropped_   = 0;
+        }
+      }
+      q_.push_back(std::move(ev));
+    }
+    cv_.notify_one();
+    if (dropped) {
+      LOG(WARNING) << '[' << ip_ << "] event queue full (" << kMaxQueued
+                   << "): dropped the " << dropped << " oldest event(s)";
+    }
+  }
+
+  // Deliver what is still queued for at most @p drain, then stop the
+  // delivery thread and wait for it.  Idempotent.
+  void finish(std::chrono::milliseconds drain) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!stopping_) {
+        stopping_       = true;
+        drain_deadline_ = std::chrono::steady_clock::now() + drain;
+      }
+    }
+    cv_.notify_one();
+    if (thread_.joinable()) thread_.join();
+  }
+
+ private:
+  void loop() {
+    for (;;) {
+      OnvifEvent ev;
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this] { return stopping_ || !q_.empty(); });
+        if (q_.empty()) return;
+        if (stopping_ &&
+            std::chrono::steady_clock::now() >= drain_deadline_) {
+          LOG(WARNING) << '[' << ip_ << "] discarding " << q_.size()
+                       << " undelivered event(s) at shutdown";
+          q_.clear();
+          return;
+        }
+        ev = std::move(q_.front());
+        q_.pop_front();
+      }
+      cb_(ev);
+    }
+  }
+
+  const std::string                     ip_;
+  const EventCallback                   cb_;
+  std::mutex                            mu_;
+  std::condition_variable               cv_;
+  std::deque<OnvifEvent>                q_;
+  bool                                  stopping_{false};
+  std::chrono::steady_clock::time_point drain_deadline_{};
+  uint64_t                              dropped_{0};  // since the last warning
+  bool                                  warned_{false};
+  std::chrono::steady_clock::time_point last_warn_{};
+  std::thread                           thread_;  // last: starts in the ctor
+};
+
 // -------------------------------------------------------
 // Pair of URLs discovered via GetServices
 // -------------------------------------------------------
@@ -437,101 +973,163 @@ struct Notification {
 // -------------------------------------------------------
 // CameraWorker -- manages one camera's PullPoint lifecycle
 // -------------------------------------------------------
+// What a CameraWorker shares with its listener besides the camera and the
+// event callback.
+struct WorkerHooks {
+  std::function<void(const CameraHealth&)> publish_health;
+  OnvifListener::RawResponseTap            raw_tap;
+  OnvifListener::UpstreamStateTap          state_tap;
+  OnvifListener::HeartbeatSuffixFn         heartbeat_suffix;
+  std::shared_ptr<detail::WorkerControl>   control;
+  // Set when the listener keeps event_proxy subscriptions across restarts.
+  std::shared_ptr<ResumeCollector>         resume_out;
+  // Subscription this camera held when the previous run() stopped.
+  std::optional<SavedSubscription>         resume_in;
+};
+
 class CameraWorker {
  public:
-  using PublishHealthFn = std::function<void(const CameraHealth&)>;
-
-  // cfg and cb are copied: a worker can outlive both the caller's camera
-  // list (hot-added cameras, cameras_ reallocation) and run() itself (a
-  // thread detached at shutdown).
+  // cfg, cb and hooks are copied: a worker can outlive both the caller's
+  // camera list (hot-added cameras, cameras_ reallocation) and run() itself
+  // (a thread detached at shutdown).
   CameraWorker(CameraConfig cfg,
                EventCallback cb,
                const std::atomic<bool>& running,
-               PublishHealthFn publish_health = {})
-    : publish_health_(std::move(publish_health)),
-      cfg_(std::move(cfg)), cb_(std::move(cb)), running_(running) {}
+               WorkerHooks hooks = {})
+    : hooks_(std::move(hooks)),
+      cfg_(std::move(cfg)), cb_(std::move(cb)), running_(running) {
+    if (!hooks_.control)
+      hooks_.control = std::make_shared<detail::WorkerControl>(cfg_.ip);
+  }
 
   void run() {
     LOG(INFO) << '[' << cfg_.ip << "] started";
+    if (cfg_.event_proxy)
+      async_ = std::make_unique<AsyncDelivery>(cfg_.ip, cb_);
     const int max_failures = cfg_.max_consecutive_failures;  // 0 = unlimited
     int consecutive_failures = 0;
-    int backoff_sec = next_backoff_sec(0, cfg_.retry_backoff_base_sec,
-                                       cfg_.retry_backoff_max_sec);
+    int backoff_sec = base_backoff_sec();
+    std::optional<SavedSubscription> saved = std::move(hooks_.resume_in);
+    hooks_.resume_in.reset();
 
     while (running_) {
-      // Discover event and alarm service URLs via GetServices (IncludeCapability=true).
-      // Re-runs on every outer loop iteration so a camera restart is handled cleanly.
-      const DiscoveredServices sv = discover_services();
-
-      auto sub_or = create_subscription(sv.event_url);
-      if (!sub_or.ok()) {
-        ++consecutive_failures;
-        if (max_failures > 0 && consecutive_failures >= max_failures) {
-          pause_and_reset(&consecutive_failures, &backoff_sec,
-              std::string("[") + cfg_.ip +
-              "] camera unreachable after " +
-              std::to_string(consecutive_failures) +
-              " consecutive failures -- pausing before retry"
-              " (last error: " + std::string(sub_or.status().message()) + ")");
-          continue;
-        }
-        LOG(ERROR) << '[' << cfg_.ip << "] error: "
-                   << sub_or.status().message()
-                   << ", reconnecting in " << cfg_.retry_interval_sec << "s"
-                   << (max_failures > 0
-                         ? " (" + std::to_string(consecutive_failures) +
-                           "/" + std::to_string(max_failures) + ")"
-                         : "");
-        sleep_interruptible(cfg_.retry_interval_sec);
-        continue;
+      Subscription sub;
+      std::string  alarm_url;
+      bool resumed = false;
+      if (saved) {
+        // A subscription taken over from here on satisfies any pending
+        // resubscribe() request.
+        take_resubscribe();
+        resumed = try_resume(*saved, &sub, &alarm_url);
+        saved.reset();
+        if (!resumed && !running_) break;
       }
 
-      const Subscription& sub = *sub_or;
-      if (sub.url.empty()) {
-        ++consecutive_failures;
-        if (max_failures > 0 && consecutive_failures >= max_failures) {
-          pause_and_reset(&consecutive_failures, &backoff_sec,
-              std::string("[") + cfg_.ip +
-              "] failed to get subscription URL after " +
-              std::to_string(consecutive_failures) +
-              " consecutive attempts -- pausing before retry");
+      if (!resumed) {
+        // Discover event and alarm service URLs via GetServices
+        // (IncludeCapability=true).  Re-runs on every outer loop iteration
+        // so a camera restart is handled cleanly.
+        const DiscoveredServices sv = discover_services();
+        alarm_url = sv.alarm_url;
+
+        // A subscription created from here on satisfies any pending
+        // resubscribe() request.
+        take_resubscribe();
+        auto sub_or = create_subscription(sv.event_url);
+        if (!sub_or.ok()) {
+          ++consecutive_failures;
+          if (max_failures > 0 && consecutive_failures >= max_failures) {
+            pause_and_reset(&consecutive_failures, &backoff_sec,
+                std::string("[") + cfg_.ip +
+                "] camera unreachable after " +
+                std::to_string(consecutive_failures) +
+                " consecutive failures -- pausing before retry"
+                " (last error: " + std::string(sub_or.status().message()) + ")");
+            continue;
+          }
+          LOG(ERROR) << '[' << cfg_.ip << "] error: "
+                     << sub_or.status().message()
+                     << ", reconnecting in " << cfg_.retry_interval_sec << "s"
+                     << (max_failures > 0
+                           ? " (" + std::to_string(consecutive_failures) +
+                             "/" + std::to_string(max_failures) + ")"
+                           : "");
+          sleep_interruptible(cfg_.retry_interval_sec);
           continue;
         }
-        LOG_FIRST_N(ERROR, 1) << '[' << cfg_.ip
-                             << "] failed to get subscription URL"
-                             << ", retrying in " << cfg_.retry_interval_sec
-                             << "s"
-                             << (max_failures > 0
-                                   ? " (" + std::to_string(consecutive_failures) +
-                                     "/" + std::to_string(max_failures) + ")"
-                                   : "");
-        sleep_interruptible(cfg_.retry_interval_sec);
-        continue;
+
+        sub = *sub_or;
+        if (sub.url.empty()) {
+          ++consecutive_failures;
+          if (max_failures > 0 && consecutive_failures >= max_failures) {
+            pause_and_reset(&consecutive_failures, &backoff_sec,
+                std::string("[") + cfg_.ip +
+                "] failed to get subscription URL after " +
+                std::to_string(consecutive_failures) +
+                " consecutive attempts -- pausing before retry");
+            continue;
+          }
+          LOG_FIRST_N(ERROR, 1) << '[' << cfg_.ip
+                               << "] failed to get subscription URL"
+                               << ", retrying in " << cfg_.retry_interval_sec
+                               << "s"
+                               << (max_failures > 0
+                                     ? " (" + std::to_string(consecutive_failures) +
+                                       "/" + std::to_string(max_failures) + ")"
+                                     : "");
+          sleep_interruptible(cfg_.retry_interval_sec);
+          continue;
+        }
       }
 
       // Successful subscription -- reset the failure counter and the backoff.
       consecutive_failures = 0;
-      backoff_sec = next_backoff_sec(0, cfg_.retry_backoff_base_sec,
-                                     cfg_.retry_backoff_max_sec);
-      LOG(INFO) << '[' << cfg_.ip << "] subscription -> " << sub.url;
+      backoff_sec = base_backoff_sec();
+      if (resumed) {
+        emit(UpstreamEvent::kResumed, 200, sub.url);
+        // The resumed subscription carries on from the old stream, so ask
+        // the camera for its current state, as after a new subscription.
+        set_synchronization_point(sub.url, sub.ref_params);
+      } else {
+        LOG(INFO) << '[' << cfg_.ip << "] subscription -> " << sub.url;
+        emit(UpstreamEvent::kSubscribed, 200, sub.url);
+      }
       subscribed_at_ms_.store(util::now_ms());
       last_renew_ms_.store(util::now_ms());
 
       auto renew_at =
-        std::chrono::steady_clock::now() + std::chrono::seconds(90);
+        std::chrono::steady_clock::now() + renew_interval();
       auto heartbeat_at =
-        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        std::chrono::steady_clock::now() + heartbeat_interval();
 
-      bool inner_ok = true;
-      while (running_ && inner_ok) {
+      // Why the inner loop ended.
+      enum class End { kStopped, kResubscribe, kRenewFailed, kPullFailed };
+      End end = End::kStopped;
+      while (running_) {
+        if (take_resubscribe()) {
+          LOG(INFO) << '[' << cfg_.ip << "] resubscribing on request";
+          end = End::kResubscribe;
+          break;
+        }
         if (std::chrono::steady_clock::now() >= renew_at) {
-          absl::Status rs = renew(sub.url, sub.ref_params);
-          if (!rs.ok())
-            LOG(WARNING) << '[' << cfg_.ip << "] renew error: " << rs.message();
-          else
+          int         renew_status = 0;
+          std::string renew_detail;
+          absl::Status rs = renew(sub.url, sub.ref_params, 15,
+                                  &renew_status, &renew_detail);
+          if (rs.ok()) {
             last_renew_ms_.store(util::now_ms());
-          renew_at = std::chrono::steady_clock::now()
-                     + std::chrono::seconds(90);
+          } else {
+            warn_renew_failed(rs);
+            // A subscription the camera no longer renews can keep answering
+            // pulls with empty 200s; for a shared camera that would starve
+            // Protect without any error, so start over.
+            if (cfg_.event_proxy) {
+              emit(UpstreamEvent::kRenewFailed, renew_status, renew_detail);
+              end = End::kRenewFailed;
+              break;
+            }
+          }
+          renew_at = std::chrono::steady_clock::now() + renew_interval();
         }
         if (std::chrono::steady_clock::now() >= heartbeat_at) {
           const uint64_t now = util::now_ms();
@@ -542,17 +1140,25 @@ class CameraWorker {
                     << " renew_age=" << (lr ? (now - lr) / 1000 : 0) << "s"
                     << " last_event="
                     << (le ? std::to_string((now - le) / 1000) + "s"
-                           : std::string("never"));
+                           : std::string("never"))
+                    << heartbeat_suffix();
           heartbeat_at = std::chrono::steady_clock::now()
-                       + std::chrono::seconds(60);
+                       + heartbeat_interval();
         }
         if (!running_) break;
         const uint64_t events_before = events_received_total_.load();
         auto pull_started = std::chrono::steady_clock::now();
-        absl::Status ps = pull(sub.url, sub.ref_params, sv.alarm_url);
+        int pull_status = 0;
+        absl::Status ps = pull(sub.url, sub.ref_params, alarm_url,
+                               &pull_status);
         auto pull_dur = std::chrono::steady_clock::now() - pull_started;
         const bool got_events =
             events_received_total_.load() > events_before;
+        if (ps.ok())
+          emit(UpstreamEvent::kPullOk, pull_status, "");
+        else
+          emit(UpstreamEvent::kPullFailed, pull_status,
+               std::string(ps.message()));
 
         // Post-pull rate limit.  ONVIF PullMessages carries an upper-bound
         // timeout (we request PT5S), NOT a lower bound -- a camera whose
@@ -570,15 +1176,18 @@ class CameraWorker {
         // the long-poll open (they cross the 4 s threshold and get
         // polled again immediately when their turn ends).  Capped so a
         // very slow-but-still-empty response can't stall us for
-        // minutes.
+        // minutes; a shared camera's cap is short because Protect sees
+        // its events only as fast as we pull them.
         constexpr auto kLongPollHonored = std::chrono::milliseconds(4000);
-        constexpr auto kMaxIdleSleep    = std::chrono::milliseconds(30000);
+        const auto max_idle_sleep = cfg_.event_proxy
+                                      ? std::chrono::milliseconds(1000)
+                                      : std::chrono::milliseconds(30000);
         if (ps.ok() && !got_events && pull_dur < kLongPollHonored) {
           auto sleep_dur = pull_dur * 3;
-          if (sleep_dur > kMaxIdleSleep) sleep_dur = kMaxIdleSleep;
+          if (sleep_dur > max_idle_sleep) sleep_dur = max_idle_sleep;
           sleep_interruptible_ms(
               std::chrono::duration_cast<std::chrono::milliseconds>(
-                  sleep_dur).count());
+                  sleep_dur).count(), /*idle=*/true);
         }
         // Publish health after every pull tick so the admin UI sees
         // backoff changes on its next refresh.
@@ -605,16 +1214,31 @@ class CameraWorker {
                                         : "");
             sleep_interruptible(cfg_.retry_interval_sec);
           }
-          inner_ok = false;
+          end = End::kPullFailed;
+          break;
         }
       }
       // Inner loop exited (subscription dropped); reflect that in health.
       // Release the subscription so the camera doesn't hold it until its
       // termination time lapses.  Covers both the stop() path and a
       // resubscribe after an error, which is where the leaks accumulate.
-      unsubscribe(sub.url, sub.ref_params);
+      // A shared camera stopped while healthy keeps its subscription
+      // instead, for the next run() to take over.
+      const bool kept = end == End::kStopped && keep_for_restart(sub, alarm_url);
+      if (!kept) unsubscribe(sub.url, sub.ref_params);
       subscribed_at_ms_.store(0);
+      emit(UpstreamEvent::kUnsubscribed, 0,
+           kept                       ? "kept for restart"
+           : end == End::kResubscribe ? "resubscribe requested"
+           : end == End::kRenewFailed ? "renew failed"
+           : end == End::kPullFailed  ? "pull failed"
+                                      : "stopped");
     }
+    // Never tried (stop() came first): leave it for the next run().
+    if (saved) hand_over(*saved);
+    // Delivery drains for at most 5 s and is joined before finished_ is
+    // set, so run() never destroys a worker whose delivery thread runs.
+    if (async_) async_->finish(std::chrono::seconds(5));
     LOG(INFO) << '[' << cfg_.ip << "] stopped";
     finished_ = true;
   }
@@ -633,42 +1257,203 @@ class CameraWorker {
   }
 
  private:
+  // A saved subscription is taken over only with at least this long left.
+  static constexpr int64_t kResumeMinLeftMs = 15000;
+  // Termination time asked for when a subscription is kept for restart.
+  static constexpr int64_t kKeepForRestartMs = 120000;
+
   std::atomic<bool>     finished_{false};
   std::atomic<uint64_t> events_received_total_{0};
   std::atomic<uint64_t> last_event_ms_{0};
   std::atomic<uint64_t> last_renew_ms_{0};
   std::atomic<uint64_t> subscribed_at_ms_{0};
-  PublishHealthFn       publish_health_;
+  WorkerHooks           hooks_;
+  std::unique_ptr<AsyncDelivery> async_;  // event_proxy cameras only
+  // Renew warnings are logged at most once per kRenewWarnInterval.
+  std::chrono::steady_clock::time_point last_renew_warn_{};
+  bool                  renew_warned_{false};
+  uint64_t              renew_warn_suppressed_{0};
 
   void publish_current_health() {
-    if (publish_health_) publish_health_(health());
+    if (hooks_.publish_health) hooks_.publish_health(health());
+  }
+
+  // True when emit() reaches a state tap.
+  bool state_tapped() const {
+    return cfg_.event_proxy && hooks_.state_tap != nullptr;
+  }
+
+  void emit(UpstreamEvent ev, int http_status, const std::string& detail) {
+    if (state_tapped()) hooks_.state_tap(cfg_, ev, http_status, detail);
+  }
+
+  std::string heartbeat_suffix() const {
+    if (cfg_.event_proxy && hooks_.heartbeat_suffix)
+      return hooks_.heartbeat_suffix(cfg_);
+    return {};
+  }
+
+  std::chrono::seconds renew_interval() const {
+    return std::chrono::seconds(cfg_.renew_interval_sec > 0
+                                    ? cfg_.renew_interval_sec : 90);
+  }
+
+  std::chrono::seconds heartbeat_interval() const {
+    return std::chrono::seconds(cfg_.heartbeat_interval_sec > 0
+                                    ? cfg_.heartbeat_interval_sec : 60);
+  }
+
+  int base_backoff_sec() const {
+    return next_backoff_sec(0, cfg_.retry_backoff_base_sec,
+                            cfg_.retry_backoff_max_sec);
+  }
+
+  void warn_renew_failed(const absl::Status& st) {
+    constexpr auto kRenewWarnInterval = std::chrono::minutes(10);
+    const auto now = std::chrono::steady_clock::now();
+    if (renew_warned_ && now - last_renew_warn_ < kRenewWarnInterval) {
+      ++renew_warn_suppressed_;
+      return;
+    }
+    LOG(WARNING) << '[' << cfg_.ip << "] renew error: " << st.message()
+                 << (renew_warn_suppressed_
+                       ? " (" + std::to_string(renew_warn_suppressed_) +
+                         " more since the last warning)"
+                       : "")
+                 << (cfg_.event_proxy ? " -- resubscribing" : "");
+    renew_warned_          = true;
+    last_renew_warn_       = now;
+    renew_warn_suppressed_ = 0;
+  }
+
+  bool take_resubscribe() {
+    detail::WorkerControl& c = *hooks_.control;
+    std::lock_guard<std::mutex> lk(c.mu);
+    const bool requested = c.resubscribe;
+    c.resubscribe = false;
+    return requested;
+  }
+
+  bool take_reset_backoff() {
+    detail::WorkerControl& c = *hooks_.control;
+    std::lock_guard<std::mutex> lk(c.mu);
+    const bool requested = c.reset_backoff;
+    c.reset_backoff = false;
+    return requested;
   }
 
   void sleep_interruptible(int secs) {
-    for (int i = 0; i < secs && running_; ++i)
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (secs > 0) sleep_interruptible_ms(static_cast<uint64_t>(secs) * 1000);
   }
-  // Sleep for @p ms milliseconds in 250 ms slices so a stop() during a
-  // long backoff returns promptly.
-  void sleep_interruptible_ms(uint64_t ms) {
-    constexpr uint64_t kSliceMs = 250;
-    for (uint64_t elapsed = 0; elapsed < ms && running_; elapsed += kSliceMs) {
-      const uint64_t remaining = ms - elapsed;
-      const uint64_t slice = remaining < kSliceMs ? remaining : kSliceMs;
-      std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+  // Sleep for @p ms milliseconds, waking every 250 ms so a stop() during a
+  // long backoff returns promptly.  A nudge() ends the sleep at once, and
+  // so does a resubscribe() when @p idle (the subscription is live).
+  void sleep_interruptible_ms(uint64_t ms, bool idle = false) {
+    constexpr auto kSlice = std::chrono::milliseconds(250);
+    detail::WorkerControl& c = *hooks_.control;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    std::unique_lock<std::mutex> lk(c.mu);
+    while (running_ && !c.wake && !(idle && c.resubscribe)) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) break;
+      const auto left = deadline - now;
+      c.cv.wait_for(lk, left < kSlice ? left : kSlice);
     }
+    c.wake = false;
   }
 
   // Log msg, sleep for the current backoff, then double it (clamped) and
   // reset *failures so the next attempt starts a fresh streak.  The caller
-  // resets *backoff_sec to the base on a successful subscription.
+  // resets *backoff_sec to the base on a successful subscription; a
+  // nudge() resets it too.
   void pause_and_reset(int* failures, int* backoff_sec, const std::string& msg) {
+    if (take_reset_backoff()) *backoff_sec = base_backoff_sec();
     LOG(WARNING) << msg << " (retry in " << *backoff_sec << "s)";
     sleep_interruptible(*backoff_sec);
-    *backoff_sec = next_backoff_sec(*backoff_sec,
-                                    cfg_.retry_backoff_base_sec,
-                                    cfg_.retry_backoff_max_sec);
+    *backoff_sec = take_reset_backoff()
+                     ? base_backoff_sec()
+                     : next_backoff_sec(*backoff_sec,
+                                        cfg_.retry_backoff_base_sec,
+                                        cfg_.retry_backoff_max_sec);
     *failures = 0;
+  }
+
+  // Give @p saved to the listener to write out at the end of run().  False
+  // when the listener keeps nothing (no resume path, or run() already
+  // wrote the file because this worker was detached).
+  bool hand_over(const SavedSubscription& saved) {
+    if (!hooks_.resume_out) return false;
+    std::lock_guard<std::mutex> lk(hooks_.resume_out->mu);
+    if (hooks_.resume_out->closed) return false;
+    hooks_.resume_out->entries.push_back(saved);
+    return true;
+  }
+
+  // Renew a healthy shared subscription so it outlives the restart, and
+  // hand it over instead of unsubscribing.  False when it must be
+  // released as usual.
+  bool keep_for_restart(const Subscription& sub, const std::string& alarm_url) {
+    if (!cfg_.event_proxy || !hooks_.resume_out || sub.url.empty())
+      return false;
+    const int64_t asked_at = static_cast<int64_t>(util::now_ms());
+    int         status = 0;
+    std::string detail;
+    absl::Status rs = renew(sub.url, sub.ref_params, 5, &status, &detail);
+    if (!rs.ok()) {
+      LOG(INFO) << '[' << cfg_.ip << "] cannot keep subscription for restart ("
+                << rs.message() << ")";
+      return false;
+    }
+    SavedSubscription saved;
+    saved.mac        = cfg_.mac;
+    saved.ip         = cfg_.ip;
+    saved.url        = sub.url;
+    saved.ref_params = sub.ref_params;
+    saved.alarm_url  = alarm_url;
+    saved.expires_ms = asked_at + kKeepForRestartMs;
+    if (!hand_over(saved)) return false;
+    LOG(INFO) << '[' << cfg_.ip << "] subscription kept for restart: "
+              << sub.url;
+    return true;
+  }
+
+  // Take over the subscription saved at the last stop: renew it and, when
+  // the camera accepts, use it as if just created.  Otherwise release it
+  // (best effort) and return false so the caller subscribes afresh.
+  bool try_resume(const SavedSubscription& saved, Subscription* sub,
+                  std::string* alarm_url) {
+    if (!cfg_.event_proxy) {
+      LOG(INFO) << '[' << cfg_.ip
+                << "] releasing subscription kept at the last stop";
+      unsubscribe(saved.url, saved.ref_params);
+      return false;
+    }
+    const int64_t left_ms =
+        saved.expires_ms - static_cast<int64_t>(util::now_ms());
+    if (left_ms < kResumeMinLeftMs) {
+      LOG(INFO) << '[' << cfg_.ip << "] saved subscription "
+                << (left_ms > 0 ? "expires in " + std::to_string(left_ms / 1000) +
+                                      "s"
+                                : std::string("has expired"))
+                << " -- subscribing afresh";
+      unsubscribe(saved.url, saved.ref_params);
+      return false;
+    }
+    int         status = 0;
+    std::string detail;
+    absl::Status rs = renew(saved.url, saved.ref_params, 10, &status, &detail);
+    if (!rs.ok()) {
+      LOG(INFO) << '[' << cfg_.ip << "] cannot resume saved subscription ("
+                << rs.message() << ") -- subscribing afresh";
+      unsubscribe(saved.url, saved.ref_params);
+      return false;
+    }
+    sub->url        = saved.url;
+    sub->ref_params = saved.ref_params;
+    *alarm_url      = saved.alarm_url;
+    LOG(INFO) << '[' << cfg_.ip << "] resumed subscription " << saved.url;
+    return true;
   }
 
   std::string event_url() const {
@@ -762,7 +1547,8 @@ class CameraWorker {
 
   // CreatePullPointSubscription -> Subscription{url, ref_params}
   // url is empty string on HTTP error; ref_params may be empty when the camera
-  // does not include WS-Addressing ReferenceParameters.
+  // does not include WS-Addressing ReferenceParameters.  Every failed attempt
+  // is reported as kCreateFailed.
   absl::StatusOr<Subscription> create_subscription(const std::string& ev_url) {
     static const char* ACTION =
       "http://www.onvif.org/ver10/events/wsdl/EventPortType/"
@@ -775,10 +1561,17 @@ class CameraWorker {
 
     auto soap = build_soap(cfg_.user, cfg_.password, body, ev_url, ACTION);
     auto resp_or = soap_post_r(ev_url, soap, ACTION, 20);
-    if (!resp_or.ok()) return resp_or.status();
+    if (!resp_or.ok()) {
+      emit(UpstreamEvent::kCreateFailed, 0,
+           std::string(resp_or.status().message()));
+      return resp_or.status();
+    }
 
     const HttpResponse& resp = *resp_or;
     if (resp.status_code != 200) {
+      if (state_tapped())
+        emit(UpstreamEvent::kCreateFailed, static_cast<int>(resp.status_code),
+             failure_detail(resp.body));
       LOG_FIRST_N(INFO, 1) << '[' << cfg_.ip
                            << "] CreatePullPointSubscription HTTP "
                            << resp.status_code << ": "
@@ -821,6 +1614,7 @@ class CameraWorker {
     if (!doc_or.ok()) {
       LOG(ERROR) << '[' << cfg_.ip << "] parse sub URL: "
                  << doc_or.status().message();
+      emit(UpstreamEvent::kCreateFailed, 200, "no SubscriptionReference");
       return Subscription{};
     }
 
@@ -831,6 +1625,8 @@ class CameraWorker {
     sub.ref_params = doc_or->inner_xml(
       "//*[local-name()='SubscriptionReference']"
       "/*[local-name()='ReferenceParameters']");
+    if (sub.url.empty())
+      emit(UpstreamEvent::kCreateFailed, 200, "no SubscriptionReference");
     if (!sub.ref_params.empty())
       LOG(INFO) << '[' << cfg_.ip << "] subscription has ReferenceParameters";
     // Successful subscription -- whatever auth we used here works.
@@ -840,7 +1636,11 @@ class CameraWorker {
     return sub;
   }
 
-  absl::Status renew(const std::string& sub_url, const std::string& ref_params) {
+  // Renew for another 120 s.  Any answer but HTTP 200 is an error; the
+  // HTTP status (0 for a transport error) and a short description of the
+  // failure go to @p http_status and @p detail.  The caller logs failures.
+  absl::Status renew(const std::string& sub_url, const std::string& ref_params,
+                     int timeout_sec, int* http_status, std::string* detail) {
     static const char* ACTION =
       "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest";
 
@@ -851,14 +1651,50 @@ class CameraWorker {
 
     auto soap = build_soap(cfg_.user, cfg_.password, body, sub_url, ACTION,
                            ref_params);
-    auto resp_or = soap_post_r(sub_url, soap, ACTION, 15);
-    if (!resp_or.ok()) return resp_or.status();
-    if (resp_or->status_code == 200)
-      LOG(INFO) << '[' << cfg_.ip << "] subscription renewed";
-    else
-      LOG_FIRST_N(WARNING, 1) << '[' << cfg_.ip << "] renew HTTP "
-                              << resp_or->status_code;
+    auto resp_or = soap_post_r(sub_url, soap, ACTION, timeout_sec);
+    if (!resp_or.ok()) {
+      *http_status = 0;
+      *detail = std::string(resp_or.status().message());
+      return resp_or.status();
+    }
+    *http_status = static_cast<int>(resp_or->status_code);
+    if (resp_or->status_code != 200) {
+      *detail = failure_detail(resp_or->body);
+      return absl::InternalError("Renew HTTP " +
+                                 std::to_string(resp_or->status_code) + ": " +
+                                 *detail);
+    }
+    detail->clear();
+    LOG(INFO) << '[' << cfg_.ip << "] subscription renewed";
     return absl::OkStatus();
+  }
+
+  // SetSynchronizationPoint: the camera queues its current property state
+  // as Initialized messages for the next pull.  Best effort: a camera that
+  // refuses sends each property again only when it next changes.
+  void set_synchronization_point(const std::string& sub_url,
+                                 const std::string& ref_params) {
+    static const char* ACTION =
+      "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/"
+      "SetSynchronizationPointRequest";
+
+    const std::string body = "    <tev:SetSynchronizationPoint/>\n";
+
+    auto soap = build_soap(cfg_.user, cfg_.password, body, sub_url, ACTION,
+                           ref_params);
+    auto resp_or = soap_post_r(sub_url, soap, ACTION, 5);
+    if (!resp_or.ok()) {
+      LOG(INFO) << '[' << cfg_.ip << "] SetSynchronizationPoint failed: "
+                << resp_or.status().message();
+      return;
+    }
+    if (resp_or->status_code != 200) {
+      LOG(INFO) << '[' << cfg_.ip << "] SetSynchronizationPoint HTTP "
+                << resp_or->status_code << ": "
+                << failure_detail(resp_or->body);
+      return;
+    }
+    LOG(INFO) << '[' << cfg_.ip << "] synchronization point set";
   }
 
   // Politely tear the PullPoint subscription down.  Without this we just
@@ -874,30 +1710,23 @@ class CameraWorker {
   // it doesn't land, behaviour is exactly what it was before.
   void unsubscribe(const std::string& sub_url, const std::string& ref_params) {
     if (sub_url.empty()) return;
-    static const char* ACTION =
-      "http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/"
-      "UnsubscribeRequest";
-
-    const std::string body =
-      "    <wsnt:Unsubscribe/>\n";
-
-    auto soap = build_soap(cfg_.user, cfg_.password, body, sub_url, ACTION,
-                           ref_params);
-    auto resp_or = soap_post_r(sub_url, soap, ACTION, 5);
-    if (!resp_or.ok()) {
+    auto status_or = send_unsubscribe(cfg_, sub_url, ref_params, 5);
+    if (!status_or.ok()) {
       LOG(INFO) << '[' << cfg_.ip << "] unsubscribe failed (non-fatal): "
-                << resp_or.status().message();
+                << status_or.status().message();
       return;
     }
-    if (resp_or->status_code == 200)
+    if (*status_or == 200)
       LOG(INFO) << '[' << cfg_.ip << "] subscription released";
     else
       LOG(INFO) << '[' << cfg_.ip << "] unsubscribe HTTP "
-                << resp_or->status_code << " (non-fatal)";
+                << *status_or << " (non-fatal)";
   }
 
+  // One PullMessages round.  @p http_status receives the HTTP status (0 for
+  // a transport error).
   absl::Status pull(const std::string& sub_url, const std::string& ref_params,
-                    const std::string& alarm_url) {
+                    const std::string& alarm_url, int* http_status) {
     static const char* ACTION =
       "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/"
       "PullMessagesRequest";
@@ -912,13 +1741,19 @@ class CameraWorker {
                            ref_params);
     // HTTP timeout > SOAP pull timeout (5 s) to allow for network headroom
     auto resp_or = soap_post_r(sub_url, soap, ACTION, 20);
-    if (!resp_or.ok()) return resp_or.status();
+    if (!resp_or.ok()) {
+      *http_status = 0;
+      return resp_or.status();
+    }
 
     const HttpResponse& resp = *resp_or;
+    *http_status = static_cast<int>(resp.status_code);
     if (resp.status_code != 200)
       return absl::InternalError(
         "PullMessages HTTP " + std::to_string(resp.status_code) +
         ": " + resp.body.substr(0, 300));
+
+    if (cfg_.event_proxy && hooks_.raw_tap) hooks_.raw_tap(cfg_, resp.body);
 
     auto events = parse_notifications(resp.body);
     if (!events.empty()) {
@@ -930,10 +1765,14 @@ class CameraWorker {
     for (auto& n : events) {
       LOG(INFO) << '[' << cfg_.ip << "]   topic=" << n.topic
                 << " op=" << n.property_op << " t=" << n.event_time;
-      cb_(OnvifEvent{
+      OnvifEvent ev{
         cfg_.ip, cfg_.user,
         n.topic, n.event_time, n.property_op,
-        n.source, n.data, n.bbox, alarm_url});
+        n.source, n.data, n.bbox, alarm_url};
+      if (async_)
+        async_->push(std::move(ev));
+      else
+        cb_(ev);
     }
     return absl::OkStatus();
   }
@@ -1052,19 +1891,107 @@ void OnvifListener::enable_raw_recording(const std::string& path) {
   RawSink::instance().enable_disk(path);
 }
 
+void OnvifListener::set_raw_response_tap(RawResponseTap tap) {
+  raw_tap_ = std::move(tap);
+}
+
+void OnvifListener::set_upstream_state_tap(UpstreamStateTap tap) {
+  state_tap_ = std::move(tap);
+}
+
+void OnvifListener::set_heartbeat_suffix_fn(HeartbeatSuffixFn fn) {
+  heartbeat_suffix_fn_ = std::move(fn);
+}
+
+void OnvifListener::set_resume_path(const std::string& path,
+                                    std::vector<CameraConfig> credentials) {
+  resume_path_  = path;
+  resume_creds_ = std::move(credentials);
+}
+
+std::vector<std::shared_ptr<detail::WorkerControl>>
+OnvifListener::controls_for(const std::string& ip) {
+  std::vector<std::shared_ptr<detail::WorkerControl>> out;
+  absl::MutexLock lock(&controls_mutex_);
+  for (const auto& c : controls_)
+    if (c->ip == ip) out.push_back(c);
+  return out;
+}
+
+void OnvifListener::nudge(const std::string& ip) {
+  for (const auto& c : controls_for(ip)) {
+    {
+      std::lock_guard<std::mutex> lk(c->mu);
+      c->wake          = true;
+      c->reset_backoff = true;
+    }
+    c->cv.notify_all();
+  }
+}
+
+void OnvifListener::resubscribe(const std::string& ip) {
+  for (const auto& c : controls_for(ip)) {
+    {
+      std::lock_guard<std::mutex> lk(c->mu);
+      c->resubscribe = true;
+    }
+    c->cv.notify_all();
+  }
+}
+
 void OnvifListener::run(EventCallback cb) {
   running_ = true;
   // stop() sets stop_requested_ before clearing running_, so either this
   // check sees it or stop()'s own store lands after ours.
   if (stop_requested_) running_ = false;
 
+  // Subscriptions the previous run() kept for event_proxy cameras.  Each
+  // goes to the first camera that matches it.
+  std::vector<SavedSubscription> saved;
+  std::shared_ptr<ResumeCollector> resume_out;
+  if (!resume_path_.empty()) {
+    saved = take_saved_subscriptions(resume_path_);
+    resume_out = std::make_shared<ResumeCollector>();
+  }
+  auto claim_saved = [&saved](const CameraConfig& cam)
+      -> std::optional<SavedSubscription> {
+    // A MAC match wins over an ip match.
+    for (int pass = 0; pass < 2; ++pass) {
+      for (auto it = saved.begin(); it != saved.end(); ++it) {
+        const bool by_mac = !normalize_mac(it->mac).empty() &&
+                            !normalize_mac(cam.mac).empty();
+        if ((pass == 0) != by_mac || !saved_matches(*it, cam)) continue;
+        SavedSubscription s = std::move(*it);
+        saved.erase(it);
+        return s;
+      }
+    }
+    return std::nullopt;
+  };
+
+  auto make_worker = [&](const CameraConfig& cam) {
+    WorkerHooks h;
+    h.publish_health   = [this](const CameraHealth& ch) {
+      this->publish_health(ch);
+    };
+    h.raw_tap          = raw_tap_;
+    h.state_tap        = state_tap_;
+    h.heartbeat_suffix = heartbeat_suffix_fn_;
+    h.control          = std::make_shared<detail::WorkerControl>(cam.ip);
+    h.resume_out       = resume_out;
+    h.resume_in        = claim_saved(cam);
+    {
+      absl::MutexLock lock(&controls_mutex_);
+      controls_.push_back(h.control);
+    }
+    return std::make_unique<CameraWorker>(cam, cb, running_, std::move(h));
+  };
+
   // Build workers (heap-allocated so their address is stable across moves)
   std::vector<std::unique_ptr<CameraWorker>> workers;
   workers.reserve(cameras_.size());
   for (const auto& cam : cameras_)
-    workers.push_back(
-      std::make_unique<CameraWorker>(cam, cb, running_,
-          [this](const CameraHealth& h){ this->publish_health(h); }));
+    workers.push_back(make_worker(cam));
 
   // Launch one thread per camera
   std::vector<std::thread> threads;
@@ -1072,6 +1999,19 @@ void OnvifListener::run(EventCallback cb) {
   for (auto& w : workers) {
     CameraWorker* ptr = w.get();
     threads.emplace_back([ptr] { ptr->run(); });
+  }
+
+  // A saved subscription no camera took (its camera was excluded, removed
+  // or paired with an AI Port since) would hold a slot on the camera until
+  // it expires; release it now.
+  if (!saved.empty()) {
+    LOG(INFO) << "[onvif] " << saved.size()
+              << " saved subscription(s) matched no camera";
+    std::vector<CameraConfig> creds = resume_creds_;
+    creds.insert(creds.end(), cameras_.begin(), cameras_.end());
+    for (const SavedSubscription& s : saved)
+      release_saved_subscription(s, creds);
+    saved.clear();
   }
 
   // Block until stop() is called or every worker finishes on its own
@@ -1090,9 +2030,7 @@ void OnvifListener::run(EventCallback cb) {
       }
       for (auto& cfg : hot_adds) {
         cameras_.push_back(cfg);
-        workers.push_back(
-            std::make_unique<CameraWorker>(cfg, cb, running_,
-                [this](const CameraHealth& h){ this->publish_health(h); }));
+        workers.push_back(make_worker(cfg));
         CameraWorker* ptr = workers.back().get();
         threads.emplace_back([ptr] { ptr->run(); });
       }
@@ -1144,11 +2082,57 @@ void OnvifListener::run(EventCallback cb) {
       static_cast<void>(workers[i].release());
     }
   }
+
+  {
+    absl::MutexLock lock(&controls_mutex_);
+    controls_.clear();
+  }
+
+  // Save what the joined workers kept.  Closing the collector first makes
+  // a detached worker that finishes later release its subscription itself.
+  if (resume_out) {
+    std::vector<SavedSubscription> keep;
+    {
+      std::lock_guard<std::mutex> lk(resume_out->mu);
+      resume_out->closed = true;
+      keep.swap(resume_out->entries);
+    }
+    // Kept subscriptions that cannot be saved are released instead.
+    if (!store_saved_subscriptions(resume_path_, keep)) {
+      std::vector<CameraConfig> creds = cameras_;
+      creds.insert(creds.end(), resume_creds_.begin(), resume_creds_.end());
+      for (const SavedSubscription& s : keep)
+        release_saved_subscription(s, creds);
+    }
+  }
 }
 
 void OnvifListener::stop() {
   stop_requested_ = true;
   running_ = false;
+}
+
+absl::Status OnvifListener::release_saved_subscriptions(
+    const std::string& path, const std::vector<CameraConfig>& cams) {
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) {
+    if (errno == ENOENT) return absl::OkStatus();
+    return absl::InternalError("cannot read " + path + ": " +
+                               std::strerror(errno));
+  }
+  std::string text;
+  if (!read_whole_file(path, &text))
+    return absl::InternalError("cannot read " + path);
+  std::vector<SavedSubscription> subs;
+  const bool parsed = SavedSubscriptionsReader(text).read(&subs);
+  for (const SavedSubscription& s : subs) release_saved_subscription(s, cams);
+  if (std::remove(path.c_str()) != 0 && errno != ENOENT)
+    return absl::InternalError("cannot delete " + path + ": " +
+                               std::strerror(errno));
+  if (!parsed)
+    return absl::InvalidArgumentError("unreadable saved subscriptions file " +
+                                      path);
+  return absl::OkStatus();
 }
 
 // ============================================================

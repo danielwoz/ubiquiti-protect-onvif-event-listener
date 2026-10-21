@@ -14,11 +14,48 @@
 
 #pragma once
 
+#include <sys/types.h>
+
 #include <string>
 
 #include "absl/status/status.h"
 
 namespace protect_ui {
+
+/// The optional service.js patches patch_alarm_picker() applies.  A patch
+/// that is off is removed again where an earlier run applied it.
+struct PatchOptions {
+  /// Protect's ONVIF client sends the WS-Addressing To and Action headers
+  /// with PullMessages, Renew and Unsubscribe (Protect 7.1+).
+  bool onvif_addressing = true;
+  /// Protect offers its ONVIF event subscriptions to onvif-recorder's
+  /// PullPoint service on 127.0.0.1:7892 first, and falls back to the
+  /// camera when that refuses or does not answer within 4 s (Protect 7.1+).
+  bool event_proxy = false;
+};
+
+/// What patch_alarm_picker() did with one optional patch.
+enum class PatchOutcome {
+  kNotRun,         // patching skipped (dpkg unpacking, file missing), or
+                   // the file could not be written
+  kApplied,        // written by this call
+  kAlready,        // already present
+  kRemoved,        // was present, removed by this call
+  kAbsent,         // disabled and not present
+  kNotApplicable,  // anchor not found, or safety scan refused
+  kAmbiguous,      // anchor found more than once
+};
+
+/// Lower-case name of @p outcome: "not_run", "applied", "already",
+/// "removed", "absent", "not_applicable" or "ambiguous".
+const char* patch_outcome_name(PatchOutcome outcome);
+
+/// Outcome of each optional service.js patch in one patch_alarm_picker()
+/// call.
+struct PatchReport {
+  PatchOutcome onvif_addressing = PatchOutcome::kNotRun;
+  PatchOutcome event_proxy = PatchOutcome::kNotRun;
+};
 
 /// Live-patch the Protect UI to allow third-party cameras in the alarm picker.
 ///
@@ -29,23 +66,33 @@ namespace protect_ui {
 ///
 /// This function replaces that predicate with a constant `true` (same byte
 /// length) so all cameras pass through, and removes the matching exclusion
-/// from the backend's camera scope in service.js.  With @p onvif_addressing
-/// it also makes Protect's own ONVIF client send the WS-Addressing To and
-/// Action headers with its event requests (Protect 7.1+), which some cameras
-/// (Reolink) require.  Without it that change is removed again.  Changes to
-/// service.js load at Protect's next start.
+/// from the backend's camera scope in service.js.  With
+/// @p opts.onvif_addressing it also makes Protect's own ONVIF client send the
+/// WS-Addressing To and Action headers with its event requests (Protect
+/// 7.1+), which some cameras (Reolink) require.  With @p opts.event_proxy it
+/// routes Protect's ONVIF event subscriptions through onvif-recorder (see
+/// PatchOptions).  An option that is off removes its change again.  Changes
+/// to service.js load at Protect's next start.
 ///
-/// Each patch is applied only where its target code occurs exactly once.  A
-/// file that differs from the package original is rebuilt from its .bak when
-/// dpkg confirms the .bak is that original; otherwise an unpatched file is
-/// backed up to .bak first.  Files are replaced via rename(), so a failed
-/// write leaves the old one.  Nothing is patched while dpkg is unpacking
-/// unifi-protect.
+/// Each patch is applied only where its target code occurs exactly once.
+/// The event-sharing patch is also refused when Protect's SOAP transport
+/// function cannot be delimited, uses `this` or `arguments`, or service.js
+/// already uses the names the patch injects.  A file that differs from the
+/// package original is rebuilt from its .bak when dpkg confirms the .bak is
+/// that original; otherwise an unpatched file is backed up to .bak first.
+/// Files are replaced via rename(), so a failed write leaves the old one.
+/// Nothing is patched while dpkg is unpacking unifi-protect.
+///
+/// When @p report is set it receives the outcome of each optional patch.
 ///
 /// Returns OK if the files were patched or already patched, including when
 /// no patch matches this Protect version.
 /// Returns NotFoundError if none of the Protect files exist.
-absl::Status patch_alarm_picker(bool onvif_addressing);
+absl::Status patch_alarm_picker(const PatchOptions& opts,
+                                PatchReport* report = nullptr);
+
+/// unifi-protect's MainPID from systemd, or 0 when it is not running.
+pid_t protect_main_pid();
 
 /// Whether the running unifi-protect process started before service.js was
 /// last written, so it is still running the code it loaded at start-up and

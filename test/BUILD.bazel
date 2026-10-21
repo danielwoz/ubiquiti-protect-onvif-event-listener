@@ -484,3 +484,191 @@ cc_binary(
     ],
     deps = ["//:object_detect"],
 )
+
+cc_test(
+    name = "test_notification_fragments",
+    srcs = ["test_notification_fragments.cpp"],
+    args = [
+        "$(location //test:hikvision_raw_log)",
+        "$(location //test:dahua_raw_log)",
+        "$(location //test:cell_motion_raw_log)",
+        "$(location //test:cell_motion_no_events_raw_log)",
+        "$(location //test:thingino_raw_log)",
+        "$(location //test:html_404_raw_log)",
+        "$(location //test:unvr_78_raw_log)",
+        "$(location //test:unvr_119_raw_log)",
+        "$(location //test:unvr_173_raw_log)",
+        "$(location //test:unvr_227_raw_log)",
+        "$(location //test:unvr_245_raw_log)",
+        "$(location //test:unvr_251_raw_log)",
+        "$(location //test:unvr_1_45_raw_log)",
+        "$(location //test:unvr_1_47_raw_log)",
+        "$(location //test:reolink_bullet_raw_log)",
+        "$(location //test:hikvision_pullpoint_notauthorized_raw_log)",
+        "$(location //test:dahua_ivs_linecross_raw_log)",
+        "$(location //test:reolink_ai_doorbell_raw_log)",
+    ],
+    data = [
+        "//test:hikvision_raw_log",
+        "//test:dahua_raw_log",
+        "//test:cell_motion_raw_log",
+        "//test:cell_motion_no_events_raw_log",
+        "//test:thingino_raw_log",
+        "//test:html_404_raw_log",
+        "//test:unvr_78_raw_log",
+        "//test:unvr_119_raw_log",
+        "//test:unvr_173_raw_log",
+        "//test:unvr_227_raw_log",
+        "//test:unvr_245_raw_log",
+        "//test:unvr_251_raw_log",
+        "//test:unvr_1_45_raw_log",
+        "//test:unvr_1_47_raw_log",
+        "//test:reolink_bullet_raw_log",
+        "//test:hikvision_pullpoint_notauthorized_raw_log",
+        "//test:dahua_ivs_linecross_raw_log",
+        "//test:reolink_ai_doorbell_raw_log",
+    ],
+    deps = [
+        "//:notification_fragments",
+    ] + select({
+        ":is_arm64": ["@arm64_sysroot//:libxml2"],
+        "//conditions:default": ["//third_party:libxml2"],
+    }),
+)
+
+cc_test(
+    name = "test_event_proxy_mode",
+    srcs = ["test_event_proxy_mode.cpp"],
+    deps = ["//:event_proxy_mode"],
+)
+
+cc_test(
+    name = "test_pullpoint_hub",
+    srcs = ["test_pullpoint_hub.cpp"],
+    env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},
+    data = ["//test:tsan_suppressions"],
+    deps = [
+        "//:pullpoint_hub",
+        "//:notification_fragments",
+        "//:upstream_event",
+        "@com_google_absl//absl/log:log_entry",
+        "@com_google_absl//absl/log:log_sink",
+        "@com_google_absl//absl/log:log_sink_registry",
+    ],
+)
+
+cc_test(
+    name = "test_pullpoint_server",
+    srcs = ["test_pullpoint_server.cpp"],
+    env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},
+    data = ["//test:tsan_suppressions"],
+    deps = [
+        "//:notification_fragments",
+        "//:pullpoint_hub",
+        "//:pullpoint_server",
+        "//:upstream_event",
+    ] + select({
+        ":is_arm64": ["@arm64_sysroot//:libcurl", "@arm64_sysroot//:libxml2"],
+        "//conditions:default": ["//third_party:libcurl", "//third_party:libxml2"],
+    }),
+)
+
+cc_test(
+    name = "test_pullpoint_e2e",
+    srcs = ["test_pullpoint_e2e.cpp"],
+    env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},
+    args = [
+        "$(location //test:hikvision_raw_log)",
+        "$(location //test:dahua_raw_log)",
+        "$(location //test:cell_motion_raw_log)",
+        "$(location //test:cell_motion_no_events_raw_log)",
+        "$(location //test:thingino_raw_log)",
+        "$(location //test:html_404_raw_log)",
+        "$(location //test:unvr_78_raw_log)",
+        "$(location //test:unvr_119_raw_log)",
+        "$(location //test:unvr_173_raw_log)",
+        "$(location //test:unvr_227_raw_log)",
+        "$(location //test:unvr_245_raw_log)",
+        "$(location //test:unvr_251_raw_log)",
+        "$(location //test:unvr_1_45_raw_log)",
+        "$(location //test:unvr_1_47_raw_log)",
+        "$(location //test:reolink_bullet_raw_log)",
+        "$(location //test:hikvision_pullpoint_notauthorized_raw_log)",
+        "$(location //test:dahua_ivs_linecross_raw_log)",
+        "$(location //test:reolink_ai_doorbell_raw_log)",
+    ],
+    data = ["//test:tsan_suppressions"] + [
+        "//test:hikvision_raw_log",
+        "//test:dahua_raw_log",
+        "//test:cell_motion_raw_log",
+        "//test:cell_motion_no_events_raw_log",
+        "//test:thingino_raw_log",
+        "//test:html_404_raw_log",
+        "//test:unvr_78_raw_log",
+        "//test:unvr_119_raw_log",
+        "//test:unvr_173_raw_log",
+        "//test:unvr_227_raw_log",
+        "//test:unvr_245_raw_log",
+        "//test:unvr_251_raw_log",
+        "//test:unvr_1_45_raw_log",
+        "//test:unvr_1_47_raw_log",
+        "//test:reolink_bullet_raw_log",
+        "//test:hikvision_pullpoint_notauthorized_raw_log",
+        "//test:dahua_ivs_linecross_raw_log",
+        "//test:reolink_ai_doorbell_raw_log",
+    ],
+    deps = [
+        "//:notification_fragments",
+        "//:onvif_listener",
+        "//:pullpoint_hub",
+        "//:pullpoint_server",
+        "//:upstream_event",
+        ":camera_emulators",
+        ":onvif_camera_emulator",
+        "@com_google_absl//absl/status:status",
+    ] + select({
+        ":is_arm64": ["@arm64_sysroot//:libcurl", "@arm64_sysroot//:libxml2"],
+        "//conditions:default": ["//third_party:libcurl", "//third_party:libxml2"],
+    }),
+)
+
+# Long-running recorder with emulated cameras for manual checks of Protect
+# event sharing and for scripts/protect-e2e.
+cc_binary(
+    name = "pullpoint_demo",
+    testonly = True,
+    srcs = ["pullpoint_demo.cpp"],
+    deps = [
+        "//:onvif_listener",
+        "//:pullpoint_hub",
+        "//:pullpoint_server",
+        "//:upstream_event",
+        ":camera_emulators",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/flags:usage",
+        "@com_google_absl//absl/log:globals",
+        "@com_google_absl//absl/log:initialize",
+        "@com_google_absl//absl/log:log",
+    ],
+)
+
+# Applies the recorder's service.js patch set to a copy of a Protect
+# bundle, for scripts/protect-e2e.
+cc_binary(
+    name = "patch_service_js",
+    testonly = True,
+    srcs = ["patch_service_js.cpp"],
+    deps = [":protect_ui_patch_internal"],
+)
+
+sh_test(
+    name = "test_debian_scripts",
+    srcs = ["test_debian_scripts.sh"],
+    data = [
+        "//:debian/postinst",
+        "//:debian/postrm",
+        "//:debian/preinst",
+        "//:debian/prerm",
+    ],
+)

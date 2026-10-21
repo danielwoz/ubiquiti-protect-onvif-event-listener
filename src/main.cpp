@@ -69,6 +69,7 @@
 #define ONVIF_RECORDER_VERSION "dev"
 #endif
 #include "cameras_change_listener.hpp"
+#include "event_proxy_mode.hpp"
 #include "event_recovery.hpp"
 #include "motion_poller.hpp"
 #include "wedge_healer.hpp"
@@ -79,8 +80,11 @@
 #include "protect_pid_watcher.hpp"
 #include "protect_ui_patch.hpp"
 #include "protect_user_id_provider.hpp"
+#include "pullpoint_hub.hpp"
+#include "pullpoint_server.hpp"
 #include "runtime_config.hpp"
 #include "unifi_camera_config.hpp"
+#include "upstream_event.hpp"
 #include "util.hpp"
 
 // ============================================================
@@ -429,6 +433,21 @@ ABSL_FLAG(bool, patch_onvif_addressing, true,
     "change when it next starts; with --auto_heal_protect it is restarted "
     "for that automatically. Setting this to false removes the change "
     "again. Needs --patch_alarm_picker.");
+ABSL_FLAG(std::string, protect_event_proxy_cameras, "",
+    "Comma-separated MAC addresses of third-party cameras whose ONVIF "
+    "event subscription Protect (7.1+) gets through onvif-recorder "
+    "instead of subscribing to the camera itself, so the camera has one "
+    "event subscriber.  Meant for cameras that accept only one, on which "
+    "Protect logs ter:BlockedThreadUpperLimit.  Case and ':', '-' or "
+    "space separators are ignored.  onvif-recorder answers Protect from "
+    "its own camera subscription on 127.0.0.1:7892; Protect subscribes "
+    "to the camera directly when onvif-recorder declines, is not running "
+    "or does not answer within 4 s.  Needs --patch_alarm_picker.  "
+    "Protect is restarted about five minutes after the first camera is "
+    "added or the last one removed (with --auto_heal_protect=false, "
+    "restart it yourself).  Empty (default) turns sharing off.  Managed "
+    "via the Share with Protect tickboxes on the Camera Health card at "
+    "/onvif/admin/.");
 ABSL_FLAG(uint16_t, log_port, 7890,
     "TCP port for the in-memory log viewer (loopback only). "
     "Served via nginx at /onvif/events/log with Protect auth.");
@@ -602,6 +621,7 @@ int main(int argc, char* argv[]) {
   const std::string raw_log     = absl::GetFlag(FLAGS_raw_log);
   const std::string change_log  = absl::GetFlag(FLAGS_change_log);
   const std::string rollback    = absl::GetFlag(FLAGS_rollback);
+  const std::string state_dir   = absl::GetFlag(FLAGS_state_dir);
   const std::string fp_cam_str  = absl::GetFlag(FLAGS_first_party_cameras);
   const std::string fp_model_str =
       absl::GetFlag(FLAGS_first_party_camera_models);
@@ -611,20 +631,14 @@ int main(int argc, char* argv[]) {
   // poller add loop consult it.  Normalising both the flag values and
   // each camera's MAC before comparison handles the mix of colonised /
   // bare-hex forms present across the codebase.
-  auto norm_mac = [](std::string s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-      if (c == ':' || c == '-' || c == ' ') continue;
-      out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return out;
-  };
-  std::set<std::string> excluded_macs;
-  for (const auto& raw : parse_csv(absl::GetFlag(FLAGS_excluded_cameras))) {
-    const std::string m = norm_mac(raw);
-    if (!m.empty()) excluded_macs.insert(m);
-  }
+  // --protect_event_proxy_cameras uses the same form.
+  const auto norm_mac = &onvif::event_proxy::normalize_mac;
+  const std::set<std::string> excluded_macs =
+      onvif::event_proxy::parse_mac_list(
+          absl::GetFlag(FLAGS_excluded_cameras));
+  const std::set<std::string> proxy_macs =
+      onvif::event_proxy::parse_mac_list(
+          absl::GetFlag(FLAGS_protect_event_proxy_cameras));
   if (!excluded_macs.empty()) {
     LOG(INFO) << "[excluded_cameras] " << excluded_macs.size()
               << " camera MAC(s) will be skipped";
@@ -696,27 +710,150 @@ int main(int argc, char* argv[]) {
     if (!ng_a.ok())
       LOG(WARNING) << "[rollback] " << ng_a.message();
 
+    // Protect event sharing: unsubscribe the camera subscriptions kept
+    // across restarts, then remove the sharing state.  Best-effort: without
+    // the DB the subscriptions are released without credentials.
+    const std::string resume_path =
+        state_dir + "/" + onvif::event_proxy::kResumeFile;
+    struct stat resume_st{};
+    if (stat(resume_path.c_str(), &resume_st) == 0) {
+      std::vector<onvif::CameraConfig> rb_cams;
+      auto rb_cams_or = unifi::load_cameras(cam_db);
+      if (rb_cams_or.ok()) {
+        rb_cams = std::move(*rb_cams_or);
+      } else {
+        LOG(WARNING) << "[rollback] event sharing: "
+                     << rb_cams_or.status().message();
+      }
+      onvif::global_init();
+      auto rel = onvif::OnvifListener::release_saved_subscriptions(
+          resume_path, rb_cams);
+      if (!rel.ok())
+        LOG(WARNING) << "[rollback] event sharing: " << rel.message();
+      onvif::global_cleanup();
+    }
+    const int ep_files = onvif::event_proxy::remove_state_files(state_dir);
+    if (ep_files > 0)
+      LOG(INFO) << "[rollback] event sharing: removed " << ep_files
+                << " state file(s)";
+
     return 0;
   }
 
   onvif::global_init();
+  (void)mkdir(state_dir.c_str(), 0755);
 
-  // Patch the Protect UI alarm picker to include third-party cameras, and
-  // Protect's ONVIF client to send WS-Addressing headers.
+  // ----------------------------------------------------------------
+  // Protect event sharing (--protect_event_proxy_cameras).  The mode
+  // comes from the setting, the state files of earlier runs and Protect's
+  // PID.  The PullPoint service binds here, before service.js is patched,
+  // so the route patch is only applied while the port is ours, and early,
+  // because Protect's requests are refused until it is bound again.
+  // ----------------------------------------------------------------
+  namespace ep = onvif::event_proxy;
+  using onvif::pullpoint::PullPointHub;
+  using onvif::pullpoint::PullPointServer;
   const bool patch_protect = absl::GetFlag(FLAGS_patch_alarm_picker);
   const bool onvif_addressing = absl::GetFlag(FLAGS_patch_onvif_addressing);
+  const ep::Decision proxy =
+      ep::decide_mode(patch_protect, proxy_macs,
+                      ep::read_state_files(state_dir),
+                      &protect_ui::protect_main_pid);
+  if (auto s = ep::apply_decision(state_dir, proxy); !s.ok())
+    LOG(WARNING) << "[event_proxy] state file: " << s.message();
+  switch (proxy.mode) {
+    case ep::Mode::kServe:
+      LOG(INFO) << "[event_proxy] mode=serve cameras="
+                << ep::join_macs(proxy.macs);
+      break;
+    case ep::Mode::kDrain:
+      LOG(INFO) << "[event_proxy] mode=drain until Protect restarts (pid "
+                << proxy.protect_pid << ") cameras="
+                << ep::join_macs(proxy.macs);
+      break;
+    case ep::Mode::kOff:
+      if (proxy.patching_off) {
+        LOG(WARNING) << "[event_proxy] protect_event_proxy_cameras is set "
+                        "but --patch_alarm_picker=false, so no events are "
+                        "shared with Protect";
+      } else if (proxy.cleared) {
+        LOG(INFO) << "[event_proxy] mode=off; removed the sharing state "
+                     "left by an earlier run";
+      }
+      break;
+  }
+  // The mode in effect: Off when the PullPoint service cannot listen.
+  ep::Mode proxy_mode = proxy.mode;
+  bool proxy_bind_failed = false;
+  // Shared with the listener's taps, so a camera worker detached at
+  // shutdown never calls into a destroyed hub.
+  std::shared_ptr<PullPointHub> hub;
+  std::unique_ptr<PullPointServer> pp_server;
+  if (proxy_mode != ep::Mode::kOff) {
+    PullPointHub::Options hub_opts;
+    hub_opts.state_path = state_dir + "/" + ep::kHubStateFile;
+    hub = std::make_shared<PullPointHub>(hub_opts);
+    pp_server = std::make_unique<PullPointServer>(hub.get());
+    if (pp_server->start(PullPointServer::kDefaultPort, 10)) {
+      hub->start();
+    } else {
+      LOG(ERROR) << "[event_proxy] port " << PullPointServer::kDefaultPort
+                 << " is in use; events are not shared with Protect";
+      proxy_bind_failed = true;
+      pp_server.reset();
+      hub.reset();
+      proxy_mode = ep::Mode::kOff;
+    }
+  }
+  // Normalised MACs of the cameras whose events are shared.
+  const std::set<std::string> shared_macs =
+      proxy_mode == ep::Mode::kOff ? std::set<std::string>{} : proxy.macs;
+  // Stops the PullPoint service; also used before global_cleanup() on the
+  // fatal start-up paths, because its connection threads use libxml2.
+  auto stop_event_proxy = [&hub, &pp_server] {
+    if (hub) hub->stop();
+    if (pp_server) pp_server->stop();
+  };
+
+  // Patch the Protect UI alarm picker to include third-party cameras, and
+  // Protect's ONVIF client to send WS-Addressing headers and, while events
+  // are shared, to offer its event subscriptions to the PullPoint service.
+  const protect_ui::PatchOptions patch_opts{
+      onvif_addressing, /*event_proxy=*/proxy_mode == ep::Mode::kServe};
+  // Latest outcome of the route patch, for /api/event_proxy.
+  std::atomic<protect_ui::PatchOutcome> route_patch{
+      protect_ui::PatchOutcome::kNotRun};
   if (patch_protect) {
-    auto s = protect_ui::patch_alarm_picker(onvif_addressing);
+    protect_ui::PatchReport report;
+    auto s = protect_ui::patch_alarm_picker(patch_opts, &report);
+    route_patch = report.event_proxy;
     if (s.ok()) {
       LOG(INFO) << "[ui_patch] success";
     } else {
       LOG(WARNING) << "[ui_patch] " << s.message();
+    }
+    if (proxy_mode == ep::Mode::kServe &&
+        (report.event_proxy == protect_ui::PatchOutcome::kNotApplicable ||
+         report.event_proxy == protect_ui::PatchOutcome::kAmbiguous)) {
+      LOG(WARNING) << "[event_proxy] this Protect version can't be patched "
+                      "to share events (route patch "
+                   << protect_ui::patch_outcome_name(report.event_proxy)
+                   << "); Protect keeps subscribing to the cameras itself";
     }
     if (!absl::GetFlag(FLAGS_auto_heal_protect) &&
         protect_ui::protect_predates_service_js()) {
       LOG(WARNING) << "[ui_patch] unifi-protect started before service.js "
                       "was patched; restart it (systemctl restart "
                       "unifi-protect) to load the patch";
+      if (proxy_mode == ep::Mode::kServe &&
+          (report.event_proxy == protect_ui::PatchOutcome::kApplied ||
+           report.event_proxy == protect_ui::PatchOutcome::kAlready)) {
+        LOG(WARNING) << "[event_proxy] Protect shares events through "
+                        "onvif-recorder only after that restart";
+      } else if (proxy_mode == ep::Mode::kDrain) {
+        LOG(WARNING) << "[event_proxy] Protect keeps getting events through "
+                        "onvif-recorder until that restart";
+      }
     }
   }
 
@@ -738,8 +875,6 @@ int main(int argc, char* argv[]) {
   // also receives the cache_path so it can self-heal across Protect
   // user_id rotations (re-discover on 401, persist back to the cache).
   std::string protect_user_id = absl::GetFlag(FLAGS_protect_user_id);
-  const std::string state_dir = absl::GetFlag(FLAGS_state_dir);
-  (void)mkdir(state_dir.c_str(), 0755);
   const std::string protect_user_id_cache_path =
       state_dir + "/protect-user-id";
   if (protect_user_id.empty()) {
@@ -769,6 +904,24 @@ int main(int argc, char* argv[]) {
   // Start the admin page (loopback HTTP, proxied at /onvif/admin/).
   onvif::AdminServer admin_server;
   admin_server.set_log_ring(&log_ring);
+  admin_server.set_event_proxy_status_fn(
+      [status_mode = proxy_mode, proxy_bind_failed, hub,
+       server = pp_server.get(), &route_patch] {
+        ep::StatusInfo st;
+        st.mode = status_mode;
+        st.port = PullPointServer::kDefaultPort;
+        st.bound = server != nullptr && server->running();
+        st.bind_failed = proxy_bind_failed;
+        const protect_ui::PatchOutcome patch = route_patch.load();
+        st.patch = protect_ui::patch_outcome_name(patch);
+        // Protect runs the route patch only once it has restarted.
+        st.protect_restart_pending =
+            (patch == protect_ui::PatchOutcome::kApplied ||
+             patch == protect_ui::PatchOutcome::kAlready) &&
+            protect_ui::protect_predates_service_js();
+        if (hub) st.hub_json = hub->snapshot_json();
+        return ep::status_json(st);
+      });
   const uint16_t admin_port = absl::GetFlag(FLAGS_admin_port);
   const std::string channel_file = absl::GetFlag(FLAGS_channel_file);
   if (admin_server.start(ONVIF_RECORDER_VERSION, channel_file, admin_port,
@@ -812,8 +965,10 @@ int main(int argc, char* argv[]) {
     };
     patch_watcher = std::make_unique<protect_ui::PatchWatcher>(
         std::move(specs),
-        [log_port, admin_port, onvif_addressing]() {
-          auto sp = protect_ui::patch_alarm_picker(onvif_addressing);
+        [log_port, admin_port, patch_opts, &route_patch]() {
+          protect_ui::PatchReport report;
+          auto sp = protect_ui::patch_alarm_picker(patch_opts, &report);
+          route_patch = report.event_proxy;
           if (!sp.ok())
             LOG(WARNING) << "[patch_watcher] alarm picker: " << sp.message();
           auto sl = protect_ui::patch_nginx_log_proxy(log_port);
@@ -834,6 +989,7 @@ int main(int argc, char* argv[]) {
     auto cl_or = unifi::CameraChangeLog::Create(change_log);
     if (!cl_or.ok()) {
       LOG(ERROR) << "Fatal: " << cl_or.status().message();
+      stop_event_proxy();
       onvif::global_cleanup();
       return 1;
     }
@@ -848,6 +1004,7 @@ int main(int argc, char* argv[]) {
     auto er_or = onvif::EventRecorder::Create(event_log);
     if (!er_or.ok()) {
       LOG(ERROR) << "Fatal: " << er_or.status().message();
+      stop_event_proxy();
       onvif::global_cleanup();
       return 1;
     }
@@ -859,6 +1016,7 @@ int main(int argc, char* argv[]) {
   auto dr_or = onvif::DetectionRecorder::Create(db_conn);
   if (!dr_or.ok()) {
     LOG(ERROR) << "Fatal: " << dr_or.status().message();
+    stop_event_proxy();
     onvif::global_cleanup();
     return 1;
   }
@@ -995,6 +1153,12 @@ int main(int argc, char* argv[]) {
 
   onvif::OnvifListener listener;
   g_listener = &listener;
+  // Clears g_listener on every return from here on, before the listener
+  // itself is destroyed, so the signal handler and the admin page's
+  // healths() never reach a destroyed listener.
+  struct ListenerPointerReset {
+    ~ListenerPointerReset() { g_listener = nullptr; }
+  } listener_pointer_reset;
   std::signal(SIGINT,  signal_handler);
   std::signal(SIGTERM, signal_handler);
 
@@ -1015,6 +1179,7 @@ int main(int argc, char* argv[]) {
   auto cams_or = unifi::load_cameras(cam_db);
   if (!cams_or.ok()) {
     LOG(ERROR) << "Fatal: " << cams_or.status().message();
+    stop_event_proxy();
     onvif::global_cleanup();
     return 1;
   }
@@ -1025,6 +1190,7 @@ int main(int argc, char* argv[]) {
   auto ai_port_or = unifi::load_ai_port_paired_ids(cam_db);
   if (!ai_port_or.ok()) {
     LOG(ERROR) << "Fatal: " << ai_port_or.status().message();
+    stop_event_proxy();
     onvif::global_cleanup();
     return 1;
   }
@@ -1049,8 +1215,34 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // Protect event sharing: mark the shared cameras and register every
+  // managed camera with the hub, which declines Protect's requests for
+  // cameras that are not shared.
+  if (hub) {
+    std::set<std::string> managed_macs;
+    for (auto& cam : managed) {
+      const std::string mac = norm_mac(cam.mac);
+      cam.event_proxy = !mac.empty() && shared_macs.count(mac) > 0;
+      if (!mac.empty()) managed_macs.insert(mac);
+      hub->register_camera({cam.ip, cam.mac, cam.event_proxy});
+    }
+    if (proxy_mode == ep::Mode::kServe) {
+      std::set<std::string> ai_port_macs;
+      for (const auto& cam : cameras) {
+        if (ai_port_ids.count(cam.id)) ai_port_macs.insert(norm_mac(cam.mac));
+      }
+      for (const auto& [mac, why] : ep::unmanaged_reasons(
+               shared_macs, managed_macs, ai_port_macs, excluded_macs)) {
+        LOG(WARNING) << "[event_proxy] camera " << mac
+                     << " is not shared with Protect: " << why;
+      }
+    }
+    hub->set_ready();
+  }
+
   if (auto s = unifi::enable_smart_detect(managed, cam_db, cam_log); !s.ok()) {
     LOG(ERROR) << "Fatal: " << s.message();
+    stop_event_proxy();
     onvif::global_cleanup();
     return 1;
   }
@@ -1058,6 +1250,7 @@ int main(int argc, char* argv[]) {
   if (auto s = unifi::ensure_smart_detect_zones(managed, cam_db, cam_log);
       !s.ok()) {
     LOG(ERROR) << "Fatal: " << s.message();
+    stop_event_proxy();
     onvif::global_cleanup();
     return 1;
   }
@@ -1079,6 +1272,7 @@ int main(int argc, char* argv[]) {
       const bool enable = (rtsp_audio == "enable");
       if (auto s = unifi::set_rtsp_audio(enable, cam_db, cam_log); !s.ok()) {
         LOG(ERROR) << "Fatal: " << s.message();
+        stop_event_proxy();
         onvif::global_cleanup();
         return 1;
       }
@@ -1461,6 +1655,39 @@ int main(int argc, char* argv[]) {
   if (!raw_log.empty())
     listener.enable_raw_recording(raw_log);
 
+  // Protect event sharing: the shared cameras' subscriptions feed the hub
+  // and are kept across restarts.
+  const std::string resume_path = state_dir + "/" + ep::kResumeFile;
+  if (hub) {
+    listener.set_raw_response_tap(
+        [hub](const onvif::CameraConfig& c, const std::string& xml) {
+          hub->on_upstream_response(c.ip, xml);
+        });
+    listener.set_upstream_state_tap(
+        [hub](const onvif::CameraConfig& c, onvif::UpstreamEvent ev,
+              int http_status, const std::string& detail) {
+          hub->on_upstream_event(c.ip, ev, http_status, detail);
+        });
+    listener.set_heartbeat_suffix_fn([hub](const onvif::CameraConfig& c) {
+      return hub->heartbeat_suffix(c.ip);
+    });
+    listener.set_resume_path(resume_path, cameras);
+    hub->set_nudge_fn(
+        [&listener](const std::string& ip) { listener.nudge(ip); });
+    hub->set_resubscribe_fn(
+        [&listener](const std::string& ip) { listener.resubscribe(ip); });
+  } else {
+    // Subscriptions a sharing run kept hold a slot on their camera until
+    // they expire (up to 2 min); release them so the camera has a free
+    // slot now.
+    struct stat resume_st{};
+    if (stat(resume_path.c_str(), &resume_st) == 0) {
+      auto s = onvif::OnvifListener::release_saved_subscriptions(resume_path,
+                                                                 cameras);
+      if (!s.ok()) LOG(WARNING) << "[event_proxy] " << s.message();
+    }
+  }
+
   // Start the motion poller before the listener (non-blocking).
   if (motion_poller) {
     motion_poller->start();
@@ -1674,6 +1901,11 @@ int main(int argc, char* argv[]) {
       for (auto cam : fresh) {
         cam.max_consecutive_failures = 3;
         known_ids.insert(cam.id);
+        if (hub) {
+          const std::string mac = norm_mac(cam.mac);
+          cam.event_proxy = !mac.empty() && shared_macs.count(mac) > 0;
+          hub->register_camera({cam.ip, cam.mac, cam.event_proxy});
+        }
         det_rec.set_snapshot(cam);
         listener.add_camera_live(cam);
         LOG(INFO) << "Watching camera " << cam.ip;
@@ -1704,6 +1936,15 @@ int main(int argc, char* argv[]) {
   g_recovery_shutdown.store(true, std::memory_order_relaxed);
   if (auto_recover_thread.joinable())
     auto_recover_thread.join();
+  // Protect event sharing: the PullPoint service answered Protect while
+  // the listener stopped.  Persist the hub and release held pulls, close
+  // the port, then cut the hub off from the listener, which a camera
+  // worker detached at shutdown could still reach through its taps.
+  stop_event_proxy();
+  if (hub) {
+    hub->set_nudge_fn(nullptr);
+    hub->set_resubscribe_fn(nullptr);
+  }
   g_listener = nullptr;
   onvif::global_cleanup();
   LOG(INFO) << "Done";

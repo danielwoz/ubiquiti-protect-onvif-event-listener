@@ -61,7 +61,13 @@ exports_files(
 )
 
 exports_files(
-    ["debian/detect-channel.sh"],
+    [
+        "debian/detect-channel.sh",
+        "debian/postinst",
+        "debian/postrm",
+        "debian/preinst",
+        "debian/prerm",
+    ],
     visibility = ["//test:__pkg__"],
 )
 
@@ -237,6 +243,72 @@ cc_library(
 )
 
 cc_library(
+    name = "upstream_event",
+    hdrs = ["src/upstream_event.hpp"],
+    strip_include_prefix = "src",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "notification_fragments",
+    srcs = ["src/notification_fragments.cpp"],
+    hdrs = ["src/notification_fragments.hpp"],
+    strip_include_prefix = "src",
+    deps = _XML2,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "pullpoint_hub",
+    srcs = ["src/pullpoint_hub.cpp"],
+    hdrs = [
+        "src/pullpoint_hub.hpp",
+        "src/pullpoint_hub_internal.hpp",
+    ],
+    strip_include_prefix = "src",
+    deps = [
+        ":notification_fragments",
+        ":upstream_event",
+        ":util",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/synchronization:synchronization",
+        "@com_google_absl//absl/time",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "pullpoint_server",
+    srcs = [
+        "src/pullpoint_server.cpp",
+        "src/pullpoint_soap.cpp",
+    ],
+    hdrs = [
+        "src/pullpoint_server.hpp",
+        "src/pullpoint_soap.hpp",
+    ],
+    strip_include_prefix = "src",
+    deps = _MHD + _XML2 + [
+        ":pullpoint_hub",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/synchronization:synchronization",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "event_proxy_mode",
+    srcs = ["src/event_proxy_mode.cpp"],
+    hdrs = ["src/event_proxy_mode.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        ":util",
+        "@com_google_absl//absl/status:status",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "onvif_listener",
     srcs = ["src/onvif_listener.cpp"],
     hdrs = ["src/onvif_listener.hpp"],
@@ -245,6 +317,7 @@ cc_library(
         ":contention_profiler",
         ":jpeg_crop",
         ":listener_status",
+        ":upstream_event",
         ":util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
@@ -535,6 +608,7 @@ cc_binary(
         ":contention_profiler",
         ":cpu_profiler",
         ":detection_recorder",
+        ":event_proxy_mode",
         ":event_recorder",
         ":event_recovery",
         ":log_ring",
@@ -549,8 +623,11 @@ cc_binary(
         ":protect_pid_watcher",
         ":protect_ui_patch",
         ":protect_user_id_provider",
+        ":pullpoint_hub",
+        ":pullpoint_server",
         ":runtime_config",
         ":unifi_camera_config",
+        ":upstream_event",
         ":util",
         ":wedge_healer",
         "@com_google_absl//absl/flags:flag",

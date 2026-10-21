@@ -15,6 +15,7 @@
 #include "camera_emulators.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <cstdio>
 #include <cstdlib>
@@ -199,6 +200,16 @@ std::pair<int, std::string> next_cycle(
   const auto& ex = vec[idx % vec.size()];
   ++idx;
   return {ex.status, ex.response};
+}
+
+// SOAP 1.2 SetSynchronizationPointResponse.
+std::string sync_point_response() {
+  return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+         "<SOAP-ENV:Envelope"
+         " xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+         " xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\">"
+         "<SOAP-ENV:Body><tev:SetSynchronizationPointResponse/></SOAP-ENV:Body>"
+         "</SOAP-ENV:Envelope>";
 }
 
 }  // anonymous namespace
@@ -617,12 +628,239 @@ std::pair<int, std::string> ReplayCameraEmulator::handle(
     resp = next_cycle(session_.pull, pull_idx_);
   } else if (tail == "RenewRequest") {
     resp = next_clamp(session_.renew, renew_idx_);
+  } else if (tail == "SetSynchronizationPointRequest") {
+    resp = {200, sync_point_response()};
   } else {
     resp = {400, ""};
   }
 
   resp.second = rewrite_urls(resp.second);
   return resp;
+}
+
+// ============================================================
+// SlotLimitedCameraEmulator
+// ============================================================
+
+namespace {
+
+// SOAP 1.2 envelope around @p body.
+std::string slot_envelope(const std::string& body) {
+  return std::string(
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<SOAP-ENV:Envelope"
+      " xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+      " xmlns:wsa5=\"http://www.w3.org/2005/08/addressing\""
+      " xmlns:wsnt=\"http://docs.oasis-open.org/wsn/b-2\""
+      " xmlns:tev=\"http://www.onvif.org/ver10/events/wsdl\""
+      " xmlns:ter=\"http://www.onvif.org/ver10/error\">"
+      "<SOAP-ENV:Body>") + body + "</SOAP-ENV:Body></SOAP-ENV:Envelope>";
+}
+
+std::string slot_fault(const std::string& subcode, const std::string& text) {
+  return slot_envelope(
+      "<SOAP-ENV:Fault><SOAP-ENV:Code>"
+      "<SOAP-ENV:Value>SOAP-ENV:Sender</SOAP-ENV:Value>"
+      "<SOAP-ENV:Subcode><SOAP-ENV:Value>" + subcode +
+      "</SOAP-ENV:Value></SOAP-ENV:Subcode></SOAP-ENV:Code>"
+      "<SOAP-ENV:Reason><SOAP-ENV:Text xml:lang=\"en\">" + text +
+      "</SOAP-ENV:Text></SOAP-ENV:Reason></SOAP-ENV:Fault>");
+}
+
+// Seconds in the first ...TerminationTime element of @p body when it holds
+// an xs:duration such as PT120S, PT2M or PT1H; @p fallback otherwise.
+int termination_seconds(const std::string& body, int fallback) {
+  const std::string tag = "TerminationTime>";
+  const auto p = body.find(tag);
+  if (p == std::string::npos) return fallback;
+  const auto start = p + tag.size();
+  const auto end = body.find('<', start);
+  if (end == std::string::npos) return fallback;
+  std::string v = body.substr(start, end - start);
+  v.erase(0, v.find_first_not_of(" \t\r\n"));
+  const auto t = v.find('T');
+  if (v.empty() || v[0] != 'P' || t == std::string::npos) return fallback;
+  int total = 0;
+  int num = -1;
+  for (std::size_t i = t + 1; i < v.size(); ++i) {
+    const char c = v[i];
+    if (c >= '0' && c <= '9') {
+      num = (num < 0 ? 0 : num * 10) + (c - '0');
+    } else if (c == '.') {
+      // Fractional seconds: keep the whole part.
+      while (i + 1 < v.size() && v[i + 1] >= '0' && v[i + 1] <= '9') ++i;
+    } else if (num >= 0 && (c == 'H' || c == 'M' || c == 'S')) {
+      total += num * (c == 'H' ? 3600 : c == 'M' ? 60 : 1);
+      num = -1;
+    } else {
+      break;
+    }
+  }
+  return total > 0 ? total : fallback;
+}
+
+}  // namespace
+
+SlotLimitedCameraEmulator::SlotLimitedCameraEmulator(
+    const std::string& jsonl_path, int slots)
+  : OnvifCameraEmulator(peek_camera_ip(jsonl_path)), slots_(slots) {
+  session_ = RecordedSession::from_jsonl(jsonl_path);
+  for (const auto& ex : session_.create_sub) {
+    if (ex.status != 200 && fault_body_.empty() &&
+        ex.response.find("BlockedThreadUpperLimit") != std::string::npos) {
+      fault_status_ = ex.status;
+      fault_body_   = ex.response;
+    }
+    if (ex.status == 200 && create_template_.empty() &&
+        ex.response.find("Address>") != std::string::npos)
+      create_template_ = ex.response;
+  }
+  if (fault_body_.empty())
+    fault_body_ = slot_fault("ter:BlockedThreadUpperLimit", "");
+  if (create_template_.empty()) {
+    create_template_ = slot_envelope(
+      "<tev:CreatePullPointSubscriptionResponse><tev:SubscriptionReference>"
+      "<wsa5:Address>http://" + real_ip_ + "/onvif/Events/pullSubmanager"
+      "</wsa5:Address></tev:SubscriptionReference>"
+      "<wsnt:CurrentTime>2026-01-01T00:00:00Z</wsnt:CurrentTime>"
+      "<wsnt:TerminationTime>2026-01-01T00:02:00Z</wsnt:TerminationTime>"
+      "</tev:CreatePullPointSubscriptionResponse>");
+  }
+}
+
+void SlotLimitedCameraEmulator::expire_locked() {
+  const auto now = Clock::now();
+  for (auto it = live_.begin(); it != live_.end();) {
+    if (it->second <= now)
+      it = live_.erase(it);
+    else
+      ++it;
+  }
+}
+
+std::string SlotLimitedCameraEmulator::create_response(
+    const std::string& path) const {
+  std::string resp = create_template_;
+  const auto a = resp.find("Address>");
+  const auto start = a + std::string("Address>").size();
+  const auto end = resp.find('<', start);
+  resp.replace(start, end - start,
+               "http://127.0.0.1:" + std::to_string(port()) + path);
+  return rewrite_urls(resp);
+}
+
+std::pair<int, std::string> SlotLimitedCameraEmulator::handle(
+    const std::string& path,
+    const std::string& soap_action,
+    const std::string& body) {
+  std::lock_guard<std::mutex> lk(mu_);
+  expire_locked();
+  const auto tail = action_tail(soap_action);
+
+  if (tail == "GetServicesRequest")
+    return {200, rewrite_urls(make_get_services_response(real_ip_,
+                                                         alarm_service_url_))};
+
+  if (tail == "CreatePullPointSubscriptionRequest") {
+    ++creates_total_;
+    if (static_cast<int>(live_.size()) >= slots_) {
+      ++creates_refused_;
+      return {fault_status_, rewrite_urls(fault_body_)};
+    }
+    const std::string sub_path =
+        "/onvif/Events/pullSubmanager/" + std::to_string(next_id_++);
+    live_[sub_path] =
+        Clock::now() + std::chrono::seconds(termination_seconds(body, 60));
+    return {200, create_response(sub_path)};
+  }
+
+  const auto live = live_.find(path);
+  if (tail == "UnsubscribeRequest") {
+    ++unsubscribes_total_;
+    if (live == live_.end())
+      return {400, slot_fault("ter:InvalidArgVal", "unknown subscription")};
+    live_.erase(live);
+    return {200, slot_envelope("<wsnt:UnsubscribeResponse/>")};
+  }
+  if (tail == "RenewRequest") {
+    ++renews_total_;
+    if (live == live_.end())
+      return {400, slot_fault("ter:InvalidArgVal", "unknown subscription")};
+    if (fail_renews_)
+      return {400, slot_fault("ter:InvalidArgVal", "renew refused")};
+    live->second =
+        Clock::now() + std::chrono::seconds(termination_seconds(body, 60));
+    return {200, slot_envelope(
+                     "<wsnt:RenewResponse>"
+                     "<wsnt:TerminationTime>2026-01-01T00:02:00Z"
+                     "</wsnt:TerminationTime>"
+                     "<wsnt:CurrentTime>2026-01-01T00:00:00Z</wsnt:CurrentTime>"
+                     "</wsnt:RenewResponse>")};
+  }
+  if (tail == "PullMessagesRequest") {
+    if (live == live_.end())
+      return {400, slot_fault("ter:InvalidArgVal", "unknown subscription")};
+    ++pulls_total_;
+    auto resp = next_cycle(session_.pull, pull_idx_);
+    resp.second = rewrite_urls(resp.second);
+    return resp;
+  }
+  if (tail == "SetSynchronizationPointRequest") {
+    if (live == live_.end())
+      return {400, slot_fault("ter:InvalidArgVal", "unknown subscription")};
+    ++sync_points_total_;
+    return {200, sync_point_response()};
+  }
+  return {400, ""};
+}
+
+int SlotLimitedCameraEmulator::live_subscriptions() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  const auto now = Clock::now();
+  int n = 0;
+  for (const auto& [path, until] : live_)
+    if (until > now) ++n;
+  return n;
+}
+
+int SlotLimitedCameraEmulator::creates_total() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return creates_total_;
+}
+
+int SlotLimitedCameraEmulator::creates_refused() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return creates_refused_;
+}
+
+int SlotLimitedCameraEmulator::unsubscribes_total() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return unsubscribes_total_;
+}
+
+int SlotLimitedCameraEmulator::renews_total() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return renews_total_;
+}
+
+int SlotLimitedCameraEmulator::pulls_total() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return pulls_total_;
+}
+
+int SlotLimitedCameraEmulator::sync_points_total() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return sync_points_total_;
+}
+
+void SlotLimitedCameraEmulator::set_fail_renews(bool fail) {
+  std::lock_guard<std::mutex> lk(mu_);
+  fail_renews_ = fail;
+}
+
+void SlotLimitedCameraEmulator::set_slots(int slots) {
+  std::lock_guard<std::mutex> lk(mu_);
+  slots_ = slots;
 }
 
 // ============================================================

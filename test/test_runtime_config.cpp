@@ -29,6 +29,7 @@ ABSL_FLAG(bool, verbose, false, "test");
 ABSL_FLAG(bool, detect_override, false, "test");
 ABSL_FLAG(int32_t, coalesce_window_sec, 30, "test");
 ABSL_FLAG(std::string, first_party_cameras, "", "test");
+ABSL_FLAG(std::string, protect_event_proxy_cameras, "", "test");
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -60,6 +61,7 @@ static void reset_flags() {
   absl::SetFlag(&FLAGS_detect_override, false);
   absl::SetFlag(&FLAGS_coalesce_window_sec, 30);
   absl::SetFlag(&FLAGS_first_party_cameras, std::string());
+  absl::SetFlag(&FLAGS_protect_event_proxy_cameras, std::string());
 }
 
 // ---------------------------------------------------------------
@@ -164,6 +166,37 @@ static void test_schema_sanity() {
   }
 }
 
+// ---------------------------------------------------------------
+// Test: protect_event_proxy_cameras is a String entry in the Cameras
+// group, and a saved MAC list overrides the flag.
+// ---------------------------------------------------------------
+static void test_event_proxy_entry() {
+  const runtime_config::Entry* entry = nullptr;
+  for (const auto& e : runtime_config::Schema()) {
+    if (std::string(e.name) == "protect_event_proxy_cameras") entry = &e;
+  }
+  check(entry != nullptr, "schema contains protect_event_proxy_cameras");
+  if (entry == nullptr) return;
+  check(entry->type == runtime_config::Type::String,
+        "protect_event_proxy_cameras is a String");
+  check(std::string(entry->group) == "Cameras",
+        "protect_event_proxy_cameras is in the Cameras group");
+  check(std::string(entry->description).find("restarts Protect") !=
+            std::string::npos,
+        "protect_event_proxy_cameras help mentions the Protect restart");
+
+  reset_flags();
+  const std::string path = tmp_path("event_proxy");
+  check(write(path,
+              R"({"protect_event_proxy_cameras":"F0:00:00:FD:AE:D9,aabbccddeeff"})"),
+        "write event proxy config");
+  check(runtime_config::LoadFromFile(path) == 1,
+        "event proxy MAC list applied");
+  check(absl::GetFlag(FLAGS_protect_event_proxy_cameras) ==
+            "F0:00:00:FD:AE:D9,aabbccddeeff",
+        "protect_event_proxy_cameras set to the saved CSV");
+}
+
 int main(int /*argc*/, char* argv[]) {
   // ParseCommandLine is not strictly required for SetFlag/GetFlag, but
   // calling it ensures any platform-specific absl init runs.
@@ -175,6 +208,7 @@ int main(int /*argc*/, char* argv[]) {
   test_invalid_value();
   test_missing_file();
   test_write_then_read();
+  test_event_proxy_entry();
 
   std::cout << "test_runtime_config: " << g_pass << " passed, "
             << g_fail << " failed\n";

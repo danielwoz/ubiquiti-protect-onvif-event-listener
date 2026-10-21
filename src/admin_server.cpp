@@ -135,8 +135,10 @@ line-height:14px;cursor:help;margin-left:4px;vertical-align:middle}
 <th style="padding:4px 6px"></th>
 <th style="padding:4px 6px">Via Protect<span class="help" title="Route thumbnail fetches through Protect's own /api/cameras/&lt;id&gt;/snapshot endpoint instead of hitting the camera's own HTTP snapshot server directly. Useful for cheap third-party cameras whose HTTP snapshot endpoint chokes or returns black frames while RTSP is streaming -- Protect is already decoding the stream, so we just grab a frame from that decode. Tradeoff: the frame is Protect's currently-decoded one, so there is 200-500 ms of slop vs the exact ONVIF-event moment. Third-party cameras only.">?</span></th>
 <th style="padding:4px 6px" title="Untick to skip this camera entirely (no ONVIF subscription for third-party, no motion polling for first-party). Useful when another integration (e.g. a UniFi AI Port) is already handling the same physical camera and would otherwise produce duplicate events. Untick a third-party camera to make it pairable with an AI Port; it appears in Protect's pairing list after Protect restarts. Saved as excluded_cameras (issue #42).">Enabled</th>
+<th style="padding:4px 6px">Share with Protect<span class="help" title="Protect gets this camera's motion events through onvif-recorder, so the camera has just one event subscriber. Use it for cameras that allow only one (some PTZs), where Protect and onvif-recorder otherwise keep taking that one slot from each other and both miss events. Turning on the first camera, or off the last one, restarts Protect about five minutes later. If onvif-recorder isn't running, Protect goes back to the camera by itself. Third-party cameras only. Saved as protect_event_proxy_cameras.">?</span></th>
 </tr></thead>
-<tbody id="camhealth-body"><tr><td colspan="8">Loading…</td></tr></tbody></table>
+<tbody id="camhealth-body"><tr><td colspan="9">Loading…</td></tr></tbody></table>
+<div id="event-proxy-note" style="display:none;margin-top:8px;font-size:12px;color:#f0c674"></div>
 <div style="margin-top:8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
   <button id="save-via-protect" onclick="saveViaProtect()" disabled
           style="padding:4px 12px;font-size:12px">Save via-Protect changes</button>
@@ -144,6 +146,9 @@ line-height:14px;cursor:help;margin-left:4px;vertical-align:middle}
   <button id="save-enabled" onclick="saveEnabled()" disabled
           style="padding:4px 12px;font-size:12px">Save Enabled changes</button>
   <span id="save-enabled-msg" style="font-size:12px;color:#9aa0a6"></span>
+  <button id="save-share" onclick="saveShare()" disabled
+          style="padding:4px 12px;font-size:12px">Save sharing changes</button>
+  <span id="save-share-msg" style="font-size:12px;color:#9aa0a6"></span>
 </div></div>
 
 <div class="card"><h2>Database load
@@ -340,6 +345,7 @@ function renderConfigForm(entries){
     if (e.name === 'first_party_cameras') continue;  // rendered separately
     if (e.name === 'camera_snapshot_via_protect') continue;  // rendered as tickboxes on the Camera Health card
     if (e.name === 'excluded_cameras') continue;              // rendered as Enabled tickboxes on the Camera Health card
+    if (e.name === 'protect_event_proxy_cameras') continue;   // rendered as Share with Protect tickboxes on the Camera Health card
     if (e.group !== lastGroup){
       html += `<div class="cfg-section">${e.group}</div>`;
       lastGroup = e.group;
@@ -407,6 +413,7 @@ async function saveConfig(){
     if (e.name === 'first_party_cameras') continue;
     if (e.name === 'camera_snapshot_via_protect') continue;  // saved by the tickbox flow
     if (e.name === 'excluded_cameras') continue;              // saved by the Enabled tickbox flow
+    if (e.name === 'protect_event_proxy_cameras') continue;   // saved by the Share with Protect tickbox flow
     const el = document.getElementById('cfg-' + e.name);
     if (el) values[e.name] = el.value || '';
   }
@@ -544,13 +551,135 @@ async function saveEnabled(){
   }
 }
 
+// Share with Protect tick-box state: the MACs in
+// protect_event_proxy_cameras.  Keyed by MAC like the Enabled column.
+let shareLocal  = new Set();  // includes unsaved changes
+let shareServer = new Set();  // as-persisted on server
+
+function escHtml(s){
+  return String(s).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;',
+    '>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+function updateSaveShareState(){
+  const dirty = shareServer.size !== shareLocal.size
+             || [...shareLocal].some(m => !shareServer.has(m));
+  const btn = document.getElementById('save-share');
+  if (btn) btn.disabled = !dirty;
+  const msg = document.getElementById('save-share-msg');
+  if (msg && !dirty) msg.textContent = '';
+}
+function toggleShare(mac, checked){
+  if (checked) shareLocal.add(mac); else shareLocal.delete(mac);
+  updateSaveShareState();
+}
+async function saveShare(){
+  const csv = [...shareLocal].sort().join(',');
+  // Protect restarts only when sharing as a whole turns on or off.
+  const restartsProtect = (shareServer.size === 0) !== (shareLocal.size === 0);
+  const msg = document.getElementById('save-share-msg');
+  const sp  = document.getElementById('spinner');
+  document.getElementById('spinner-text').textContent =
+      'Saving sharing changes and restarting service…';
+  sp.classList.add('on');
+  try {
+    const r = await post('api/config', { protect_event_proxy_cameras: csv });
+    if (!r.ok) { if (msg) msg.textContent = r.text; sp.classList.remove('on'); return; }
+    await waitForRestart();
+    await loadCameraHealth();
+    if (msg) {
+      msg.textContent = restartsProtect
+          ? 'Saved. Protect restarts in about five minutes.' : 'Saved.';
+      msg.style.color = '#a0e0a0';
+    }
+  } finally {
+    sp.classList.remove('on');
+  }
+}
+
+// /api/event_proxy reply, or null when the endpoint is unavailable.
+async function loadEventProxy(){
+  try {
+    const r = captureCsrf(await fetch('api/event_proxy'));
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (_) { return null; }
+}
+function normMac(s){ return String(s || '').replace(/[:\- ]/g, '').toLowerCase(); }
+// The hub's entry for camera row @p c: matched by MAC, else by address
+// (the hub's ip may carry a :port suffix).
+function hubCameraFor(ep, c){
+  const cams = (ep && ep.hub && ep.hub.cameras) || [];
+  const mac = normMac(c.mac);
+  return cams.find(h => mac && normMac(h.mac) === mac)
+      || cams.find(h => h.ip && c.host
+                        && (h.ip === c.host || h.ip.startsWith(c.host + ':')))
+      || null;
+}
+function handedBackReason(h){
+  if (typeof h.handed_back === 'string') return h.handed_back;
+  if (h.handed_back === true)
+    return String(h.reason || '').replace(/^handed back:\s*/, '') || 'unknown';
+  return '';
+}
+// Short sharing status under a camera's tickbox as {text, title};
+// text is '' when there is nothing to show.
+function shareStatus(ep, c, shared){
+  if (!ep || !ep.mode || ep.mode === 'off') return {text: '', title: ''};
+  const h = hubCameraFor(ep, c);
+  const ready = !!(ep.hub && ep.hub.ready);
+  const serving = !!h && (h.pull_points || []).some(p => p.state === 'serving');
+  const detail = h && h.failure_detail ? String(h.failure_detail) : '';
+  const s = (text, title) => ({text, title: title || detail});
+  // Unticked cameras Protect still reaches through onvif-recorder until
+  // its next restart picks up the removed patch.
+  if (!shared) return serving ? s('via onvif-recorder until Protect restarts')
+                              : s('');
+  if (serving) return s('via onvif-recorder');
+  const handedBack = h ? handedBackReason(h) : '';
+  if (handedBack)
+    return s('handed back: ' + handedBack,
+             ('Protect is using its own subscription to the camera again. '
+              + detail).trim());
+  if (ep.protect_restart_pending) return s('Protect restart pending');
+  if (!h && ready)
+    return s('not available',
+             "onvif-recorder isn't subscribed to this camera (disabled, "
+             + 'paired with an AI Port, or not found), so it has no events '
+             + 'to share.');
+  if (!h || !ready || h.reason === 'starting' || h.upstream !== 'up')
+    return s('starting');
+  return s('not used by Protect yet');
+}
+function renderEventProxyNote(ep){
+  const el = document.getElementById('event-proxy-note');
+  if (!el) return;
+  const notes = [];
+  // The patch outcome only says whether Protect can share events while
+  // sharing is on; with it off, the patch is being removed instead.
+  const patch = String((ep && ep.patch) || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (ep && ep.mode === 'serve'
+      && (patch.endsWith('notapplicable') || patch.endsWith('ambiguous')))
+    notes.push("This Protect version can't share events with onvif-recorder, "
+             + 'so Protect keeps subscribing to these cameras itself.');
+  // A failed bind turns sharing off, so bind_failed reports it; a mode
+  // other than off without the port bound means the same.
+  if (ep && ep.bound === false
+      && (ep.bind_failed === true || (ep.mode && ep.mode !== 'off')))
+    notes.push('Port ' + escHtml(ep.port || 7892) + ' is in use, so events '
+             + "can't be shared with Protect.");
+  el.innerHTML = notes.map(n => '&#9888; ' + n).join('<br>');
+  el.style.display = notes.length ? 'block' : 'none';
+}
+
 async function loadCameraHealth(){
   try {
     const r = captureCsrf(await fetch('api/camera_health'));
     const j = await r.json();
+    const ep = await loadEventProxy();
+    renderEventProxyNote(ep);
     const body = document.getElementById('camhealth-body');
     if (!j.cameras || !j.cameras.length){
-      body.innerHTML = '<tr><td colspan="8" style="color:#7a8190">No adopted cameras.</td></tr>';
+      body.innerHTML = '<tr><td colspan="9" style="color:#7a8190">No adopted cameras.</td></tr>';
       return;
     }
     // Re-seed via-Protect state from server, but preserve any local
@@ -572,11 +701,21 @@ async function loadCameraHealth(){
     enabledServer = nextEnabledServer;
     if (!wasEnabledDirty) enabledLocal = new Set(enabledServer);
     updateSaveEnabledState();
+    // Same seed/preserve pattern for the Share with Protect column.
+    const wasShareDirty =
+        document.getElementById('save-share')?.disabled === false;
+    const nextShareServer = new Set();
+    for (const c of j.cameras) {
+      if (c.is_third_party && c.event_proxy && c.mac) nextShareServer.add(c.mac);
+    }
+    shareServer = nextShareServer;
+    if (!wasShareDirty) shareLocal = new Set(shareServer);
+    updateSaveShareState();
     const now = j.now_ms || Date.now();
     body.innerHTML = j.cameras.map(c => {
       const age = c.last_event_ms ? (now - c.last_event_ms) : null;
       const hintRow = c.hint === 'needs_onvif_admin'
-        ? `<tr><td colspan="8" style="padding:4px 6px 8px 22px;color:#f0c674;font-size:11px;border-top:0">
+        ? `<tr><td colspan="9" style="padding:4px 6px 8px 22px;color:#f0c674;font-size:11px;border-top:0">
              &#9888; ONVIF event subscription rejected with <code>ter:NotAuthorized</code>.
              Most Hikvision firmware (and OEM rebadges) require a separate ONVIF user with
              <b>Administrator</b> privileges -- web-UI admin alone is not enough.
@@ -599,6 +738,29 @@ async function loadCameraHealth(){
         ? `<input type="checkbox" ${enabledLocal.has(c.mac) ? '' : 'checked'}
                   onchange="toggleEnabled('${c.mac}', this.checked)">`
         : '<span style="color:#5a6070" title="No MAC on file -- cannot exclude">—</span>';
+      // Share with Protect tickbox: third-party cameras with a MAC.  An
+      // excluded camera has no subscription to share, so its box can be
+      // unticked but not ticked until it is enabled again.
+      const shared = !!c.mac && shareLocal.has(c.mac);
+      const st = c.mac ? shareStatus(ep, c, shareServer.has(c.mac))
+                       : {text: '', title: ''};
+      const shareNote = st.text
+        ? `<div style="font-size:11px;color:#9aa0a6;margin-top:2px"
+                title="${escHtml(st.title)}">${escHtml(st.text)}</div>`
+        : '';
+      let shareCell;
+      if (!c.is_third_party) {
+        shareCell = '<span style="color:#5a6070">—</span>';
+      } else if (!c.mac) {
+        shareCell = '<span style="color:#5a6070" title="No MAC on file -- cannot share">—</span>';
+      } else if (c.excluded && !shared && !shareServer.has(c.mac)) {
+        shareCell = `<input type="checkbox" disabled
+                  title="Tick Enabled for this camera and save first: onvif-recorder doesn't connect to disabled cameras, so it has no events to share.">`
+                  + shareNote;
+      } else {
+        shareCell = `<input type="checkbox" ${shared ? 'checked' : ''}
+                  onchange="toggleShare('${c.mac}', this.checked)">` + shareNote;
+      }
       return `<tr>
         <td style="padding:4px 6px">${c.name || '(unnamed)'}</td>
         <td style="padding:4px 6px;color:#9aa0a6">${c.host || '-'}</td>
@@ -610,11 +772,12 @@ async function loadCameraHealth(){
             : pillFor(age)}</td>
         <td style="padding:4px 6px;text-align:center">${viaCell}</td>
         <td style="padding:4px 6px;text-align:center">${enabledCell}</td>
+        <td style="padding:4px 6px;text-align:center">${shareCell}</td>
       </tr>${hintRow}`;
     }).join('');
   } catch (e) {
     document.getElementById('camhealth-body').innerHTML =
-      '<tr><td colspan="8" style="color:#e0a0a0">Failed to load camera health.</td></tr>';
+      '<tr><td colspan="9" style="color:#e0a0a0">Failed to load camera health.</td></tr>';
   }
 }
 
@@ -950,6 +1113,8 @@ struct Ctx {
   std::function<std::vector<onvif::CameraHealth>()> get_onvif_healths;
   // Optional shared log ring for /api/recent_errors.  null in tests.
   const onvif::LogRing* log_ring{nullptr};
+  // JSON for /api/event_proxy and the dump's event_proxy.json.
+  std::function<std::string()> event_proxy_status;
 };
 
 // Build a JSON response body for GET /api/status.
@@ -1189,25 +1354,43 @@ std::string build_camera_health_json(const Ctx& ctx) {
   const uint64_t now_ms = static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::system_clock::now().time_since_epoch()).count());
-  std::string j = "{\"now_ms\":";
-  j += std::to_string(now_ms);
-  j += ",\"cameras\":[";
-  if (ctx.db == nullptr) {
-    j += "]}";
-    return j;
-  }
+  const std::string config_path = ctx.config_path ? ctx.config_path : "";
+  if (ctx.db == nullptr) return camera_health_json({}, config_path, now_ms);
   auto rows_or = unifi::load_camera_health(*ctx.db);
   if (!rows_or.ok()) {
     LOG(WARNING) << "[admin] load_camera_health: "
                  << rows_or.status().message();
+    return camera_health_json({}, config_path, now_ms);
+  }
+  return camera_health_json(*rows_or, config_path, now_ms);
+}
+
+// Build JSON for GET /api/event_proxy: the provider's status, or
+// {"mode":"off"} when event sharing is not wired up.
+std::string build_event_proxy_json(const Ctx& ctx) {
+  std::string j;
+  if (ctx.event_proxy_status) j = ctx.event_proxy_status();
+  return j.empty() ? std::string("{\"mode\":\"off\"}") : j;
+}
+
+}  // namespace
+
+std::string camera_health_json(const std::vector<unifi::CameraHealth>& rows,
+                               const std::string& config_path,
+                               uint64_t now_ms) {
+  std::string j = "{\"now_ms\":";
+  j += std::to_string(now_ms);
+  j += ",\"cameras\":[";
+  if (rows.empty()) {
     j += "]}";
     return j;
   }
-  // Load the persisted camera_snapshot_via_protect and excluded_cameras
-  // settings so the UI can pre-tick the right rows.  Reads the same
-  // config.json the config form writes to, so this stays in sync with
-  // the tickboxes.  excluded_cameras is keyed by MAC (lower-case,
-  // colon-stripped) to match the same normalisation the enforcement
+  // Load the persisted camera_snapshot_via_protect, excluded_cameras and
+  // protect_event_proxy_cameras settings so the UI can pre-tick the
+  // right rows.  Reads the same config.json the config form writes to,
+  // so this stays in sync with the tickboxes.  excluded_cameras and
+  // protect_event_proxy_cameras are keyed by MAC (lower-case, ':', '-'
+  // and spaces stripped) to match the normalisation the enforcement
   // side in main.cpp does.
   auto parse_csv_tokens = [](const std::string& s) {
     std::set<std::string> out;
@@ -1237,9 +1420,9 @@ std::string build_camera_health_json(const Ctx& ctx) {
   };
   std::set<std::string> via_protect_ips;
   std::set<std::string> excluded_macs;
+  std::set<std::string> event_proxy_macs;
   {
-    auto overrides = runtime_config::ReadFromFile(
-        ctx.config_path ? ctx.config_path : "");
+    auto overrides = runtime_config::ReadFromFile(config_path);
     auto vit = overrides.find("camera_snapshot_via_protect");
     if (vit != overrides.end()) via_protect_ips = parse_csv_tokens(vit->second);
     auto eit = overrides.find("excluded_cameras");
@@ -1247,9 +1430,14 @@ std::string build_camera_health_json(const Ctx& ctx) {
       for (const auto& m : parse_csv_tokens(eit->second))
         excluded_macs.insert(norm_mac(m));
     }
+    auto pit = overrides.find("protect_event_proxy_cameras");
+    if (pit != overrides.end()) {
+      for (const auto& m : parse_csv_tokens(pit->second))
+        event_proxy_macs.insert(norm_mac(m));
+    }
   }
   bool first = true;
-  for (const auto& r : *rows_or) {
+  for (const auto& r : rows) {
     if (!first) j += ',';
     first = false;
     j += "{\"id\":\"";   j += json_escape(r.id);
@@ -1265,6 +1453,11 @@ std::string build_camera_health_json(const Ctx& ctx) {
     if (r.is_third_party) {
       j += ",\"snapshot_via_protect\":";
       j += via_protect_ips.count(r.host) ? "true" : "false";
+      // Share with Protect tickbox state.  A camera without a MAC can't
+      // be listed, so it is never shared.
+      j += ",\"event_proxy\":";
+      j += !r.mac.empty() && event_proxy_macs.count(norm_mac(r.mac))
+               ? "true" : "false";
     }
     // Enabled tickbox state: reflect the persisted excluded_cameras
     // config so the UI can pre-tick the right rows.  Normalised on
@@ -1281,6 +1474,8 @@ std::string build_camera_health_json(const Ctx& ctx) {
   j += "]}";
   return j;
 }
+
+namespace {
 
 // Build JSON for GET /api/recent_events.  Calls unifi::load_recent_events
 // and shapes the rows for the admin UI.  Each row carries a
@@ -1403,6 +1598,7 @@ std::pair<int, std::string> handle_config(const Ctx& ctx,
 //   - config.json        copy of /etc/onvif-recorder/config.json
 //   - status.json        output of /api/status
 //   - camera_health.json output of /api/camera_health
+//   - event_proxy.json   output of /api/event_proxy
 //   - journal.log        journalctl -u onvif-recorder --since "12 hours ago"
 //   - journal-prev.log   journalctl -u onvif-recorder -b -1 (previous boot)
 //   - service-status.txt systemctl status onvif-recorder
@@ -1939,6 +2135,9 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
                            {"thumbnail_hook_url"}));
   write("status.json", build_status_json(ctx));
   write("camera_health.json", build_camera_health_json(ctx));
+  // Protect event sharing: mode, patch state and the per-camera hub
+  // snapshot (camera addresses and MACs are redacted like the rest).
+  write("event_proxy.json", build_event_proxy_json(ctx));
   // Per-camera Protect DB rows and recordingFiles aggregates.  Both are
   // JSON blobs coming straight from Postgres via jsonb_agg / jsonb_
   // build_object; the standard DumpSanitizer pipeline redacts embedded
@@ -2160,6 +2359,10 @@ MHD_Result handler(
     body = build_camera_health_json(*ctx);
     content_type = "application/json";
   } else if (is_get &&
+             std::strcmp(url, "/api/event_proxy") == 0) {
+    body = build_event_proxy_json(*ctx);
+    content_type = "application/json";
+  } else if (is_get &&
              std::strcmp(url, "/api/recent_events") == 0) {
     body = build_recent_events_json(*ctx);
     content_type = "application/json";
@@ -2228,7 +2431,8 @@ MHD_Result handler(
     }
   } else if (is_get &&
              std::strcmp(url, "/api/diagnostic_dump") == 0) {
-    const std::string tar_path = "/tmp/onvif-dump.tar.gz";
+    const std::string tar_path =
+        "/tmp/onvif-dump." + std::to_string(getpid()) + ".tar.gz";
     auto s = build_diagnostic_dump(*ctx, tar_path);
     if (!s.ok()) {
       status = 500;
@@ -2335,7 +2539,8 @@ bool AdminServer::start(const std::string& version,
                                    protect_url_.c_str(),
                                    protect_user_id_provider_,
                                    event_log_path_.c_str(), get_onvif_healths_,
-                                   log_ring_});
+                                   log_ring_,
+                                   [this] { return event_proxy_status(); }});
 
   daemon_ = MHD_start_daemon(
       MHD_USE_INTERNAL_POLLING_THREAD,
@@ -2354,6 +2559,20 @@ bool AdminServer::start(const std::string& version,
       MHD_get_daemon_info(daemon_, MHD_DAEMON_INFO_BIND_PORT);
   port_ = info ? info->port : port;
   return true;
+}
+
+void AdminServer::set_event_proxy_status_fn(EventProxyStatusFn fn) {
+  std::lock_guard<std::mutex> lock(event_proxy_mu_);
+  event_proxy_fn_ = std::move(fn);
+}
+
+std::string AdminServer::event_proxy_status() const {
+  EventProxyStatusFn fn;
+  {
+    std::lock_guard<std::mutex> lock(event_proxy_mu_);
+    fn = event_proxy_fn_;
+  }
+  return fn ? fn() : std::string();
 }
 
 void AdminServer::stop() {
