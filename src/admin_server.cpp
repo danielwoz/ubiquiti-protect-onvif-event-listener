@@ -36,6 +36,7 @@ typedef int MHD_Result;
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -2328,23 +2329,25 @@ bool AdminServer::start(const std::string& version,
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-  // Leaked Ctx: one per server instance; lives for the program lifetime.
-  auto* ctx = new Ctx{version_.c_str(), channel_file_.c_str(),
-                      config_path_.c_str(), &db_,
-                      protect_url_.c_str(), protect_user_id_provider_,
-                      event_log_path_.c_str(), get_onvif_healths_,
-                      log_ring_};
+  // Freed by stop(), once MHD's thread, the only user, has been joined.
+  std::shared_ptr<Ctx> ctx(new Ctx{version_.c_str(), channel_file_.c_str(),
+                                   config_path_.c_str(), &db_,
+                                   protect_url_.c_str(),
+                                   protect_user_id_provider_,
+                                   event_log_path_.c_str(), get_onvif_healths_,
+                                   log_ring_});
 
   daemon_ = MHD_start_daemon(
       MHD_USE_INTERNAL_POLLING_THREAD,
       port,
       nullptr, nullptr,
-      &handler, ctx,
+      &handler, ctx.get(),
       MHD_OPTION_NOTIFY_COMPLETED, &request_completed, nullptr,
       MHD_OPTION_SOCK_ADDR,
       reinterpret_cast<struct sockaddr*>(&addr),
       MHD_OPTION_END);
   if (!daemon_) return false;
+  ctx_ = std::move(ctx);
 
   // Record the bound port so callers that passed port=0 can discover it.
   const union MHD_DaemonInfo* info =
@@ -2358,6 +2361,7 @@ void AdminServer::stop() {
     MHD_stop_daemon(daemon_);
     daemon_ = nullptr;
   }
+  ctx_.reset();
 }
 
 AdminServer::~AdminServer() {

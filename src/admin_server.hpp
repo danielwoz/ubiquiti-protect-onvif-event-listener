@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -81,6 +82,8 @@ class AdminServer {
 
  private:
   ::MHD_Daemon* daemon_{nullptr};
+  // State the request handler reads; set while the daemon runs.
+  std::shared_ptr<void> ctx_;
   const LogRing* log_ring_{nullptr};
   std::string version_;
   std::string channel_file_;

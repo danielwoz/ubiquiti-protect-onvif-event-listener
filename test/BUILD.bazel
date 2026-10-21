@@ -365,6 +365,8 @@ cc_test(
 cc_test(
     name = "test_admin_server",
     srcs = ["test_admin_server.cpp"],
+    data = ["//test:tsan_suppressions"],
+    env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},
     deps = [
         "//:admin_server",
     ],

@@ -25,8 +25,10 @@ namespace onvif {
 ContentionProfiler* ContentionProfiler::g_instance_ = nullptr;
 
 ContentionProfiler& ContentionProfiler::instance() {
-  static ContentionProfiler kInstance;
-  return kInstance;
+  // Never destroyed: mutexes register and the absl tracer reports into it
+  // until the process exits, and its entries stay reachable for LeakSanitizer.
+  static ContentionProfiler* const kInstance = new ContentionProfiler;
+  return *kInstance;
 }
 
 void ContentionProfiler::install() {
