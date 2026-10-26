@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cstdio>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <string>
@@ -433,6 +434,23 @@ absl::Status ValidateValue(const std::string& name, const std::string& value) {
                                         std::string(s.message()));
   }
   return absl::OkStatus();
+}
+
+void ForEachIpValue(
+    const std::string& list,
+    const std::function<void(const std::string&, const std::string&)>& fn) {
+  size_t pos = 0;
+  while (pos < list.size()) {
+    size_t comma = list.find(',', pos);
+    if (comma == std::string::npos) comma = list.size();
+    const std::string pair = list.substr(pos, comma - pos);
+    pos = comma + 1;
+    const size_t eq = pair.find('=');
+    if (eq == std::string::npos) continue;
+    const std::string ip = trim(pair.substr(0, eq));
+    if (ip.empty()) continue;
+    fn(ip, trim(pair.substr(eq + 1)));
+  }
 }
 
 }  // namespace runtime_config

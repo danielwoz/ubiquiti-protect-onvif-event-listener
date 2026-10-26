@@ -17,6 +17,8 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "absl/flags/flag.h"
 #include "absl/status/status.h"
@@ -283,6 +285,26 @@ static void test_validate_value() {
   check(ValidateValue("verbose", "true").ok(), "bool settings pass through");
 }
 
+static void test_for_each_ip_value() {
+  std::vector<std::pair<std::string, std::string>> got;
+  runtime_config::ForEachIpValue(
+      " 192.168.1.108=animal, 192.168.1.109 = package ,,bad, =x,"
+      "192.168.1.110=",
+      [&](const std::string& ip, const std::string& v) {
+        got.emplace_back(ip, v);
+      });
+  check(got.size() == 3, "ForEachIpValue: three usable pairs");
+  check(got.size() > 1 && got[0].first == "192.168.1.108" &&
+            got[0].second == "animal",
+        "ForEachIpValue: leading space trimmed");
+  check(got.size() > 1 && got[1].first == "192.168.1.109" &&
+            got[1].second == "package",
+        "ForEachIpValue: spaces around '=' and after ',' trimmed");
+  check(got.size() > 2 && got[2].first == "192.168.1.110" &&
+            got[2].second.empty(),
+        "ForEachIpValue: ip= gives an empty value");
+}
+
 int main(int /*argc*/, char* argv[]) {
   // ParseCommandLine is not strictly required for SetFlag/GetFlag, but
   // calling it ensures any platform-specific absl init runs.
@@ -297,6 +319,7 @@ int main(int /*argc*/, char* argv[]) {
   test_event_proxy_entry();
   test_validate_object_type();
   test_validate_value();
+  test_for_each_ip_value();
 
   std::cout << "test_runtime_config: " << g_pass << " passed, "
             << g_fail << " failed\n";

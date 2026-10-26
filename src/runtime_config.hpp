@@ -9,6 +9,7 @@
 #ifndef SRC_RUNTIME_CONFIG_HPP_
 #define SRC_RUNTIME_CONFIG_HPP_
 
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -64,6 +65,13 @@ absl::Status ValidateObjectType(const std::string& type, bool allow_motion);
 // camera_object_types takes ip=type pairs.  OK for every other setting
 // and for an empty value, which clears the setting.
 absl::Status ValidateValue(const std::string& name, const std::string& value);
+
+// Calls @p fn(ip, value) for each ip=value pair of the comma-separated
+// @p list, with surrounding spaces removed from both.  Pairs without '='
+// or with an empty ip are skipped.
+void ForEachIpValue(
+    const std::string& list,
+    const std::function<void(const std::string&, const std::string&)>& fn);
 
 }  // namespace runtime_config
 

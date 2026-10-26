@@ -1117,24 +1117,10 @@ int main(int argc, char* argv[]) {
   det_rec.set_max_events_per_hour(
       static_cast<uint32_t>(absl::GetFlag(FLAGS_max_events_per_hour)));
 
-  // Helper to walk a comma-separated `ip=value` list and call a per-pair
-  // callback.  Used by --camera_object_types / --camera_coalesce_window_sec
-  // / --camera_snapshot_urls below.
-  auto for_each_ip_value =
-      [&](const std::string& csv,
-          const std::function<void(const std::string&,
-                                   const std::string&)>& fn) {
-    size_t pos = 0;
-    while (pos < csv.size()) {
-      size_t comma = csv.find(',', pos);
-      if (comma == std::string::npos) comma = csv.size();
-      const std::string pair = csv.substr(pos, comma - pos);
-      const size_t eq = pair.find('=');
-      if (eq != std::string::npos)
-        fn(pair.substr(0, eq), pair.substr(eq + 1));
-      pos = comma + 1;
-    }
-  };
+  // Walks a comma-separated `ip=value` list and calls a per-pair callback.
+  // Used by --camera_object_types / --camera_coalesce_window_sec /
+  // --camera_snapshot_urls below.
+  auto* const for_each_ip_value = &runtime_config::ForEachIpValue;
 
   for_each_ip_value(absl::GetFlag(FLAGS_camera_object_types),
       [&](const std::string& ip, const std::string& v) {
