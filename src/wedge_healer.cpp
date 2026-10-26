@@ -668,6 +668,21 @@ ProtectRecordingState read_protect_recording_state(
   return recording_state_of(cam);
 }
 
+ProtectRecordingSummary summarize_protect_recording(
+    const std::vector<std::pair<std::string, std::string>>& bodies) {
+  ProtectRecordingSummary out;
+  for (const auto& [id, body] : bodies) {
+    const ProtectRecordingState st = read_protect_recording_state(body);
+    if (st.recording_started) out.recording.push_back(id);
+    if (st.stuck && !st.paired_with_ai_port) {
+      out.stuck.push_back(id);
+    } else if (st.connected && st.recording_started) {
+      out.other_recording = true;
+    }
+  }
+  return out;
+}
+
 bool protect_lists_recording_camera(
     const std::string& api_body, const std::vector<std::string>& ignore_ids) {
   json::Value cams;

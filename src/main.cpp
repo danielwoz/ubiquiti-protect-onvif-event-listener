@@ -1862,21 +1862,17 @@ int main(int argc, char* argv[]) {
         std::lock_guard<std::mutex> lk(managed_ids_mu);
         ids.assign(managed_ids.begin(), managed_ids.end());
       }
-      std::vector<std::string> candidates;
-      bool other_recording = false;
+      std::vector<std::pair<std::string, std::string>> bodies;
       for (const auto& id : ids) {
-        const std::string body = onvif::AlarmNotifier::protect_api_get(
+        std::string body = onvif::AlarmNotifier::protect_api_get(
             protect_url_for_drift + "/api/cameras/" + id, user_id);
         if (body.empty()) return out;  // API unreachable; judge nothing
-        const auto st = onvif::read_protect_recording_state(body);
-        if (st.recording_started) out.recording.push_back(id);
-        // A camera paired with an AI Port is Protect's to manage.
-        if (st.stuck && !st.paired_with_ai_port) {
-          candidates.push_back(id);
-        } else if (st.connected && st.recording_started) {
-          other_recording = true;
-        }
+        bodies.emplace_back(id, std::move(body));
       }
+      auto summary = onvif::summarize_protect_recording(bodies);
+      out.recording = std::move(summary.recording);
+      std::vector<std::string> candidates = std::move(summary.stuck);
+      bool other_recording = summary.other_recording;
       if (candidates.empty()) return out;
       // Count a camera only while Protect records another one, so a
       // recording outage such as MSR being down is not taken for this.

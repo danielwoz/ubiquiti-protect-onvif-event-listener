@@ -832,6 +832,29 @@ int main() {
                                            {"cam1"}));
     assert(!protect_lists_recording_camera(recording, {}));
     assert(!protect_lists_recording_camera("", {}));
+
+    // The managed cameras' bodies: a stuck camera counts only next to a
+    // connected camera that records; one paired with an AI Port is left
+    // to Protect and does not count as recording either.
+    using onvif::summarize_protect_recording;
+    const std::string paired = with(
+        with(no_motion, "\"isPairedWithAiPort\":false",
+             "\"isPairedWithAiPort\":true"),
+        "\"id\":\"cam1\"", "\"id\":\"cam4\"");
+    auto sum = summarize_protect_recording(
+        {{"cam1", stuck}, {"cam2", recording}, {"cam3", offline},
+         {"cam4", paired}, {"cam5", "{\"error\":\"Entity not found\"}"}});
+    assert(sum.stuck == std::vector<std::string>{"cam1"});
+    assert((sum.recording == std::vector<std::string>{"cam2", "cam3"}));
+    assert(sum.other_recording);
+    sum = summarize_protect_recording(
+        {{"cam1", stuck}, {"cam3", offline}, {"cam4", paired}});
+    assert(sum.stuck == std::vector<std::string>{"cam1"});
+    assert(sum.recording == std::vector<std::string>{"cam3"});
+    assert(!sum.other_recording);
+    sum = summarize_protect_recording({{"cam2", recording}});
+    assert(sum.stuck.empty() && sum.other_recording);
+    assert(summarize_protect_recording({}).recording.empty());
   }
 
   // JSON reader used by the recording-state parser.

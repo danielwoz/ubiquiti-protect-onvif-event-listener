@@ -347,6 +347,22 @@ struct ProtectRecordingState {
 };
 ProtectRecordingState read_protect_recording_state(const std::string& api_body);
 
+/// The recording states of the cameras the recording-stuck check reads,
+/// from their `GET /api/cameras/<id>` bodies.
+struct ProtectRecordingSummary {
+  // Stuck cameras (see ProtectRecordingState::stuck), leaving out those
+  // paired with an AI Port: Protect manages their recording.
+  std::vector<std::string> stuck;
+  // Cameras whose recording Protect has started.
+  std::vector<std::string> recording;
+  // A connected camera other than the stuck ones is recording.
+  bool other_recording = false;
+};
+/// Summarise @p bodies, each a camera ID and its `GET /api/cameras/<id>`
+/// body.
+ProtectRecordingSummary summarize_protect_recording(
+    const std::vector<std::pair<std::string, std::string>>& bodies);
+
 /// Whether Protect's `GET /api/cameras` body lists a connected camera whose
 /// recording has started, other than those in @p ignore_ids.
 bool protect_lists_recording_camera(const std::string& api_body,
