@@ -202,9 +202,10 @@ ABSL_FLAG(std::string, default_object_type, "person",
     "and NanoDet-M cannot classify it. Valid values: person, vehicle, "
     "animal, package, motion. 'motion' records no smart detection for "
     "such events and leaves them to Protect's own motion events, as "
-    "--drop_unclassified_motion does; Protect older than 7.1 creates no "
-    "motion events for third-party cameras, so there they are not "
-    "recorded at all. Unknown values are recorded as person.");
+    "--drop_unclassified_motion does; Protect creates those only while "
+    "motion detection is on for the camera in Protect, and none for "
+    "third-party cameras before 7.1, so otherwise they are not recorded "
+    "at all. Unknown values are recorded as person.");
 ABSL_FLAG(std::string, camera_object_types, "",
     "Per-camera object type overrides as comma-separated ip=type pairs, "
     "e.g. '192.168.1.108=animal,192.168.1.109=package'. "

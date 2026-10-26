@@ -47,8 +47,9 @@ It is the same as `--drop_unclassified_motion=true`: motion NanoDet-M classifies
 is still recorded with its class, and camera AI events, line crossings and
 per-camera overrides are unaffected. A line crossing or field rule that carries
 no class is recorded as `person`. Protect 7.1 and later creates motion events for
-third-party cameras itself; older Protect does not, so on it this setting leaves
-unclassified motion from third-party cameras unrecorded.
+third-party cameras itself while motion detection is on for the camera in
+Protect; with it off, or on older Protect, this setting leaves unclassified
+motion from those cameras unrecorded.
 
 AI-specific events (Human/Vehicle detections from FieldDetector, HumanShapeDetect,
 etc.) are never affected by `--default_object_type` or NanoDet-M class inference.

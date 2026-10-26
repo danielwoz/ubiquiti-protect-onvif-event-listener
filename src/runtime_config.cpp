@@ -94,8 +94,9 @@ const std::vector<Entry>& Schema() {
      "vehicle, animal, package or motion.  motion records no smart "
      "detection for unclassified generic motion and leaves it to "
      "Protect's own motion events, as drop_unclassified_motion does.  "
-     "Protect older than 7.1 creates no motion events for third-party "
-     "cameras, so there motion leaves that motion unrecorded.",
+     "Protect creates those only while motion detection is on for the "
+     "camera in Protect, and creates none for third-party cameras before "
+     "7.1; otherwise motion leaves that motion unrecorded.",
      "Detection"},
     {"camera_object_types", Type::String,
      "Per-camera type overrides as comma-separated ip=type pairs, e.g. "
