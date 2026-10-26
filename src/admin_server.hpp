@@ -79,6 +79,15 @@ class AdminServer {
   /// start(), from any thread.
   void set_event_proxy_status_fn(EventProxyStatusFn fn);
 
+  /// Returns what became of the user's local service.js patches
+  /// (--local_patches) as a JSON object (path, error, entries).
+  using LocalPatchesStatusFn = std::function<std::string()>;
+
+  /// Set the source of "local_patches" in GET /api/status.  Without one,
+  /// or when it returns an empty string, the key is left out.  Callable
+  /// before or after start(), from any thread.
+  void set_local_patches_status_fn(LocalPatchesStatusFn fn);
+
   /// Return the port the server is listening on. Only meaningful after a
   /// successful start().  Useful when start() was called with port=0.
   uint16_t port() const { return port_; }
@@ -95,6 +104,7 @@ class AdminServer {
  private:
   // The provider's JSON, or an empty string without one.
   std::string event_proxy_status() const;
+  std::string local_patches_status() const;
 
   ::MHD_Daemon* daemon_{nullptr};
   // State the request handler reads; set while the daemon runs.
@@ -110,6 +120,8 @@ class AdminServer {
   GetOnvifHealthsFn get_onvif_healths_;
   mutable std::mutex event_proxy_mu_;
   EventProxyStatusFn event_proxy_fn_;  // guarded by event_proxy_mu_
+  mutable std::mutex local_patches_mu_;
+  LocalPatchesStatusFn local_patches_fn_;  // guarded by local_patches_mu_
   uint16_t port_{0};
 };
 

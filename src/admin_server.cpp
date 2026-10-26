@@ -255,11 +255,29 @@ async function fetchStatus(){
     ['Auto-update', j.autoupdate_enabled ? 'enabled ('+j.autoupdate_schedule+')' : 'disabled'],
     ['Last check', j.last_check || 'never'],
   ];
+  const lp = j.local_patches;
+  if (lp && (lp.error || (lp.entries && lp.entries.length)))
+    rows.push(['Local patches', localPatchesText(lp)]);
   document.getElementById('status').innerHTML =
     rows.map(([k,v]) => `<span class="k">${k}</span><span>${v}</span>`).join('');
   document.getElementById('channel').value = j.channel;
   document.getElementById('autoupdate-enabled').value = String(!!j.autoupdate_enabled);
   document.getElementById('autoupdate-schedule').value = j.autoupdate_schedule || 'daily';
+}
+// Status line for the user's own service.js patches (/api/status
+// local_patches): how many apply, and which do not.
+function localPatchesText(lp){
+  const where = `<span class="help" title="${escHtml(lp.path)}">?</span>`;
+  if (lp.error)
+    return `<span style="color:#e0a0a0">${escHtml(lp.error)}; none applied</span>${where}`;
+  const ok = e => e.outcome === 'applied' || e.outcome === 'already';
+  const bad = lp.entries.filter(e => !ok(e));
+  let s = `${lp.entries.length - bad.length} of ${lp.entries.length} applied`;
+  if (bad.length)
+    s += '; <span style="color:#f0c674">not applied: '
+       + bad.map(e => `${escHtml(e.name)} (${e.outcome.replace('_', ' ')})`).join(', ')
+       + '</span>';
+  return s + where;
 }
 function msg(id, text, ok){
   const e = document.getElementById(id);
@@ -1125,6 +1143,8 @@ struct Ctx {
   const onvif::LogRing* log_ring{nullptr};
   // JSON for /api/event_proxy and the dump's event_proxy.json.
   std::function<std::string()> event_proxy_status;
+  // JSON for "local_patches" in /api/status; empty leaves it out.
+  std::function<std::string()> local_patches_status;
 };
 
 // Build a JSON response body for GET /api/status.
@@ -1185,7 +1205,14 @@ std::string build_status_json(const Ctx& ctx) {
   j += schedule;
   j += "\",\"last_check\":\"";
   j += last_check;
-  j += "\"}";
+  j += "\"";
+  const std::string local_patches =
+      ctx.local_patches_status ? ctx.local_patches_status() : std::string();
+  if (!local_patches.empty()) {
+    j += ",\"local_patches\":";
+    j += local_patches;
+  }
+  j += "}";
   return j;
 }
 
@@ -2566,7 +2593,8 @@ bool AdminServer::start(const std::string& version,
                                    protect_user_id_provider_,
                                    event_log_path_.c_str(), get_onvif_healths_,
                                    log_ring_,
-                                   [this] { return event_proxy_status(); }});
+                                   [this] { return event_proxy_status(); },
+                                   [this] { return local_patches_status(); }});
 
   daemon_ = MHD_start_daemon(
       MHD_USE_INTERNAL_POLLING_THREAD,
@@ -2597,6 +2625,20 @@ std::string AdminServer::event_proxy_status() const {
   {
     std::lock_guard<std::mutex> lock(event_proxy_mu_);
     fn = event_proxy_fn_;
+  }
+  return fn ? fn() : std::string();
+}
+
+void AdminServer::set_local_patches_status_fn(LocalPatchesStatusFn fn) {
+  std::lock_guard<std::mutex> lock(local_patches_mu_);
+  local_patches_fn_ = std::move(fn);
+}
+
+std::string AdminServer::local_patches_status() const {
+  LocalPatchesStatusFn fn;
+  {
+    std::lock_guard<std::mutex> lock(local_patches_mu_);
+    fn = local_patches_fn_;
   }
   return fn ? fn() : std::string();
 }

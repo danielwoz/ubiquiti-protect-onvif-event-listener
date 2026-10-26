@@ -970,6 +970,369 @@ static void test_service_js_report() {
   std::remove(bak.c_str());
 }
 
+// ---------------------------------------------------------------
+// Local patches (--local_patches)
+// ---------------------------------------------------------------
+
+// One local patches entry as JSON.
+static std::string local_entry(const std::string& name,
+                               const std::string& original,
+                               const std::string& replacement,
+                               const std::string& file = "service.js") {
+  return "{\"name\":" + json_quote(name) + ",\"file\":" + json_quote(file) +
+         ",\"original\":" + json_quote(original) +
+         ",\"replacement\":" + json_quote(replacement) + "}";
+}
+
+// Whether parsing @p text fails with a message containing @p part.
+static bool parse_fails_with(const std::string& text, const std::string& part) {
+  const auto r = parse_local_patches(text);
+  if (r.ok()) return false;
+  const std::string m(r.status().message());
+  if (m.find(part) != std::string::npos) return true;
+  std::cerr << "  message was: " << m << '\n';
+  return false;
+}
+
+// The file format: an array of objects with four string members.
+static void test_parse_local_patches() {
+  const std::string text =
+      "\xEF\xBB\xBF[\n"
+      "  {\"name\": \"a\", \"file\": \"service.js\", \"original\": \"x=1;\","
+      " \"replacement\": \"x=2;\"},\n"
+      "  {\"file\": \"service.js\", \"original\": \"y\\u00e9\\ud83d\\ude00"
+      "\\n\\\"\\\\\\/\", \"replacement\": \"z\"}\n"
+      "]\n";
+  const auto r = parse_local_patches(text);
+  check(r.ok() && r->size() == 2, "local parse: two entries");
+  if (r.ok() && r->size() == 2) {
+    const LocalPatch& a = (*r)[0];
+    const LocalPatch& b = (*r)[1];
+    check(a.name == "a" && a.file == "service.js" && a.original == "x=1;" &&
+              a.replacement == "x=2;",
+          "local parse: first entry");
+    check(b.name == "entry 2", "local parse: default name");
+    check(b.original == "y\xC3\xA9\xF0\x9F\x98\x80\n\"\\/",
+          "local parse: escapes and surrogate pairs decoded");
+  }
+  for (const char* empty : {"", " \n\t", "\xEF\xBB\xBF", "[]", " [ ]\n"}) {
+    const auto e = parse_local_patches(empty);
+    check(e.ok() && e->empty(), "local parse: no entries");
+  }
+
+  const std::string ok_entry = local_entry("a", "x=1;", "x=2;");
+  check(parse_fails_with("{\"name\":\"a\"}", "expected '['"),
+        "local parse: not an array");
+  check(parse_fails_with("[" + ok_entry + " " + ok_entry + "]",
+                         "line 1, column 74: expected ',' or ']'"),
+        "local parse: missing comma, with position");
+  check(parse_fails_with("[\n" + ok_entry + ",\n\n  {\"name\" \"b\"}]",
+                         "line 4, column 11: expected ':'"),
+        "local parse: position on a later line");
+  check(parse_fails_with("[\"x\"]", "expected '{'"),
+        "local parse: entry not an object");
+  check(parse_fails_with("[" + ok_entry + ",]", "expected '{'"),
+        "local parse: trailing comma");
+  check(parse_fails_with("[{\"file\":\"service.js\",\"original\":1,"
+                         "\"replacement\":\"b\"}]",
+                         "the value of \"original\" must be a string"),
+        "local parse: non-string value");
+  check(parse_fails_with("[{\"enabled\":\"false\"}]",
+                         "unknown key \"enabled\""),
+        "local parse: unknown key");
+  check(parse_fails_with("[{\"name\":\"a\",\"name\":\"b\"}]",
+                         "\"name\" given twice"),
+        "local parse: duplicate key");
+  check(parse_fails_with("[{\"original\":\"a\",\"replacement\":\"b\"}]",
+                         "entry 1 (line 1, column 2): \"file\" is missing"),
+        "local parse: file missing");
+  check(parse_fails_with("[" + local_entry("ui", "a", "b", "swai.js") + "]",
+                         "entry 1 \"ui\" (line 1, column 2): \"file\" is "
+                         "\"swai.js\"; only \"service.js\" can be patched"),
+        "local parse: wrong file");
+  check(parse_fails_with("[{\"file\":\"service.js\",\"replacement\":\"b\"}]",
+                         "\"original\" is missing or empty"),
+        "local parse: original missing");
+  check(parse_fails_with("[" + local_entry("a", "", "b") + "]",
+                         "\"original\" is missing or empty"),
+        "local parse: original empty");
+  check(parse_fails_with("[" + local_entry("a", "x", "") + "]",
+                         "\"replacement\" is missing or empty"),
+        "local parse: replacement empty");
+  check(parse_fails_with("[" + local_entry("a", "x=1", "x=1;y=2") + "]",
+                         "\"replacement\" contains \"original\""),
+        "local parse: replacement contains original");
+  check(parse_fails_with("[{\"name\":\"a\",\"file\":\"service.js\","
+                         "\"original\":\"x\\u0000\",\"replacement\":\"y\"}]",
+                         "\\u0000"),
+        "local parse: NUL character");
+  check(parse_fails_with("[{\"name\":\"a", "string not terminated"),
+        "local parse: unterminated string");
+  check(parse_fails_with("[{\"name\":\"a\nb\"}]", "control character"),
+        "local parse: raw line break in a string");
+  check(parse_fails_with("[{\"name\":\"\\q\"}]", "unknown escape"),
+        "local parse: unknown escape");
+  check(parse_fails_with("[{\"name\":\"\\ud83d\"}]", "unpaired"),
+        "local parse: unpaired surrogate");
+  check(parse_fails_with("[{\"name\":\"\\u12\"}]", "four hex digits"),
+        "local parse: short \\u escape");
+  check(parse_fails_with("[] x", "unexpected text after the array"),
+        "local parse: trailing text");
+
+  std::string many = "[";
+  for (size_t i = 0; i <= kMaxLocalPatches; ++i) {
+    if (i > 0) many += ',';
+    many += local_entry("e" + std::to_string(i), "o" + std::to_string(i),
+                        "r" + std::to_string(i));
+  }
+  many += "]";
+  check(parse_fails_with(many, "more than 100 entries"),
+        "local parse: too many entries");
+}
+
+// A missing file holds no entries; a directory or an oversized file is an
+// error.
+static void test_load_local_patches() {
+  const std::string path = temp_dir() + "/test_local_patches_load.json";
+  std::remove(path.c_str());
+  auto r = load_local_patches(path);
+  check(r.ok() && r->empty(), "local load: missing file has no entries");
+
+  check(!load_local_patches(temp_dir()).ok(), "local load: directory");
+
+  write_test_file(path, std::string(kMaxLocalPatchesBytes + 1, ' '));
+  r = load_local_patches(path);
+  check(!r.ok() && std::string(r.status().message()).find("larger than") !=
+                       std::string::npos,
+        "local load: oversized file");
+  write_test_file(path, std::string(kMaxLocalPatchesBytes, ' '));
+  r = load_local_patches(path);
+  check(r.ok() && r->empty(), "local load: file at the size limit");
+
+  write_test_file(path, "[" + local_entry("a", "x=1;", "x=2;") + "]");
+  r = load_local_patches(path);
+  check(r.ok() && r->size() == 1 && (*r)[0].replacement == "x=2;",
+        "local load: entries read");
+  write_test_file(path, "[");
+  r = load_local_patches(path);
+  check(!r.ok() && std::string(r.status().message()).find("not valid JSON") !=
+                       std::string::npos,
+        "local load: parse error");
+  std::remove(path.c_str());
+}
+
+// /api/status's local_patches object.
+static void test_local_patches_json() {
+  PatchReport rep;
+  rep.local_patches_path = "/data/onvif-recorder/local-patches.json";
+  rep.local_patches = {{"say \"hi\"\n", PatchOutcome::kApplied},
+                       {"b", PatchOutcome::kNotApplicable}};
+  check(local_patches_json(rep) ==
+            "{\"path\":\"/data/onvif-recorder/local-patches.json\","
+            "\"error\":\"\",\"entries\":[{\"name\":\"say \\\"hi\\\"\\u000a\","
+            "\"outcome\":\"applied\"},{\"name\":\"b\",\"outcome\":"
+            "\"not_applicable\"}]}",
+        "local json: entries");
+  PatchReport broken;
+  broken.local_patches_path = "p";
+  broken.local_patches_error = "not valid JSON at line 1, column 1: x\\y";
+  check(local_patches_json(broken) ==
+            "{\"path\":\"p\",\"error\":\"not valid JSON at line 1, column 1: "
+            "x\\\\y\",\"entries\":[]}",
+        "local json: error");
+}
+
+// Local patches follow ours in patch_service_js(): each is reported, a
+// broken file applies none of them while ours still apply, and with a
+// verified .bak removing an entry restores the original text.
+static void test_local_patches_service_js() {
+  const std::string path = temp_dir() + "/test_local_service.js";
+  const std::string bak = path + ".bak";
+  const std::string lp = temp_dir() + "/test_local_patches.json";
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+  std::remove(lp.c_str());
+  const std::string original =
+      soap_fixture() + "var A=1;var B=2;var C=3;C=3;";
+  write_test_file(path, original);
+  auto replaced = [](std::string s, const std::string& from,
+                     const std::string& to) {
+    s.replace(s.find(from), from.size(), to);
+    return s;
+  };
+  const std::string wsa_only = with_patch(original, kBackendPatchWsa);
+  const std::string wsa_a = replaced(wsa_only, "var A=1;", "var A=10;");
+  const std::string wsa_ab = replaced(wsa_a, "var B=2;", "var B=20;");
+  const PatchOptions opts{true, false, lp};
+
+  // Applied, after ours, in one write.
+  write_test_file(lp, "[" + local_entry("a", "var A=1;", "var A=10;") + "," +
+                          local_entry("b", "var B=2;", "var B=20;") + "]");
+  PatchReport rep;
+  check(patch_service_js(path, opts, {}, &rep) == 3,
+        "local: ours and both entries written");
+  check(read_test_file(path) == wsa_ab, "local: file patched");
+  check(read_test_file(bak) == original, "local: original backed up");
+  check(rep.onvif_addressing == PatchOutcome::kApplied &&
+            rep.event_proxy == PatchOutcome::kAbsent,
+        "local: our outcomes");
+  check(rep.local_patches_path == lp && rep.local_patches_error.empty() &&
+            rep.local_patches.size() == 2 && rep.local_patches[0].name == "a" &&
+            rep.local_patches[0].outcome == PatchOutcome::kApplied &&
+            rep.local_patches[1].name == "b" &&
+            rep.local_patches[1].outcome == PatchOutcome::kApplied,
+        "local: entries applied");
+
+  // Already present, with and without a verified .bak.
+  check(patch_service_js(path, opts, {}, &rep) == 0,
+        "local: second pass writes nothing");
+  check(rep.local_patches.size() == 2 &&
+            rep.local_patches[0].outcome == PatchOutcome::kAlready &&
+            rep.local_patches[1].outcome == PatchOutcome::kAlready,
+        "local: entries already present");
+  std::unordered_map<std::string, std::string> md5sums;
+  md5sums[path.substr(1)] = md5_of_file(bak);
+  patch_service_js(path, opts, md5sums, &rep);
+  check(read_test_file(path) == wsa_ab &&
+            rep.local_patches[0].outcome == PatchOutcome::kAlready &&
+            rep.local_patches[1].outcome == PatchOutcome::kAlready,
+        "local: rebuilt from .bak, entries already present");
+
+  // Removing "b" restores its original text; an entry whose text is gone
+  // is not applicable, one whose text occurs twice is ambiguous.
+  write_test_file(lp, "[" + local_entry("a", "var A=1;", "var A=10;") + "," +
+                          local_entry("gone", "var Z=9;", "var Z=90;") + "," +
+                          local_entry("twice", "C=3;", "C=30;") + "]");
+  patch_service_js(path, opts, md5sums, &rep);
+  check(read_test_file(path) == wsa_a, "local: removed entry undone");
+  check(read_test_file(bak) == original, "local: .bak kept");
+  check(rep.local_patches.size() == 3 &&
+            rep.local_patches[0].outcome == PatchOutcome::kAlready &&
+            rep.local_patches[1].outcome == PatchOutcome::kNotApplicable &&
+            rep.local_patches[2].outcome == PatchOutcome::kAmbiguous &&
+            rep.onvif_addressing == PatchOutcome::kAlready,
+        "local: already, not applicable, ambiguous");
+
+  // A file that is not valid applies none of its entries; ours still
+  // apply.
+  write_test_file(lp, "[" + local_entry("a", "var A=1;", "var A=10;"));
+  patch_service_js(path, opts, md5sums, &rep);
+  check(read_test_file(path) == wsa_only, "local invalid: no entry applied");
+  check(rep.local_patches.empty() &&
+            rep.local_patches_error.find("not valid JSON") !=
+                std::string::npos &&
+            rep.onvif_addressing == PatchOutcome::kAlready,
+        "local invalid: error reported, ours applied");
+
+  // So does one with an entry for another file.
+  write_test_file(lp, "[" + local_entry("a", "var A=1;", "var A=10;") + "," +
+                          local_entry("ui", "x", "y", "swai.js") + "]");
+  write_test_file(path, original);
+  check(patch_service_js(path, opts, md5sums, &rep) == 1,
+        "local wrong file: only ours written");
+  check(read_test_file(path) == wsa_only, "local wrong file: none applied");
+  check(rep.local_patches.empty() &&
+            rep.local_patches_error.find("only \"service.js\"") !=
+                std::string::npos,
+        "local wrong file: error reported");
+
+  // No file, then no path: no entries and no error.
+  std::remove(lp.c_str());
+  write_test_file(path, wsa_a);
+  patch_service_js(path, opts, md5sums, &rep);
+  check(read_test_file(path) == wsa_only && rep.local_patches.empty() &&
+            rep.local_patches_error.empty() && rep.local_patches_path == lp,
+        "local: missing file holds no entries");
+  patch_service_js(path, PatchOptions{true, false, ""}, md5sums, &rep);
+  check(rep.local_patches_path.empty() && rep.local_patches.empty() &&
+            rep.local_patches_error.empty(),
+        "local: no path");
+
+  // With everything off the original comes back byte for byte.
+  write_test_file(lp, "[" + local_entry("a", "var A=1;", "var A=10;") + "]");
+  patch_service_js(path, opts, md5sums, &rep);
+  check(read_test_file(path) == wsa_a, "local: entry applied again");
+  std::remove(lp.c_str());
+  patch_service_js(path, PatchOptions{false, false, lp}, md5sums, &rep);
+  check(read_test_file(path) == original, "local: original restored");
+
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+}
+
+// Our patches are applied and reported the same with local patches
+// present: ours go first, so an entry cannot take an anchor of ours or
+// make a safety scan of ours refuse, and turning ours off keeps the
+// entries.
+static void test_local_patches_after_ours() {
+  const std::string path = temp_dir() + "/test_local_order_service.js";
+  const std::string bak = path + ".bak";
+  const std::string lp = temp_dir() + "/test_local_order_patches.json";
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+  const std::string original = soap_fixture();
+  write_test_file(path, original);
+  write_test_file(bak, original);
+  std::unordered_map<std::string, std::string> md5sums;
+  md5sums[path.substr(1)] = md5_of_file(bak);
+
+  // "this" in soapRequestRaw would make the route patch refuse, and the
+  // WS-Addressing anchor is ours.
+  const std::string uses_this =
+      local_entry("this", "return l.set(t,!0),i", "return l.set(t,!0),this&&i");
+  const std::string takes_anchor =
+      local_entry("anchor", kBackendPatchWsa.original, "t.connSoapRequest=0");
+  write_test_file(lp, "[" + uses_this + "," + takes_anchor + "]");
+
+  const std::string ours = with_patch(with_patch(original, kBackendPatchWsa),
+                                      kBackendPatchRoute);
+  std::string expected = ours;
+  expected.replace(expected.find("return l.set(t,!0),i"),
+                   std::strlen("return l.set(t,!0),i"),
+                   "return l.set(t,!0),this&&i");
+  for (int pass = 0; pass < 2; ++pass) {
+    PatchReport rep;
+    patch_service_js(path, PatchOptions{true, true, lp}, md5sums, &rep);
+    const PatchOutcome want =
+        pass == 0 ? PatchOutcome::kApplied : PatchOutcome::kAlready;
+    check(rep.onvif_addressing == want && rep.event_proxy == want,
+          "local order: ours applied as without local patches");
+    check(rep.local_patches.size() == 2 &&
+              rep.local_patches[0].outcome == want &&
+              rep.local_patches[1].outcome == PatchOutcome::kNotApplicable,
+          "local order: entry applied, our anchor not taken");
+    check(read_test_file(path) == expected, "local order: file");
+  }
+
+  // Without a verified .bak the next pass starts from the live file.
+  PatchReport rep;
+  patch_service_js(path, PatchOptions{true, true, lp}, {}, &rep);
+  check(rep.onvif_addressing == PatchOutcome::kAlready &&
+            rep.event_proxy == PatchOutcome::kAlready &&
+            rep.local_patches[0].outcome == PatchOutcome::kAlready,
+        "local order: live file pass");
+
+  // Ours off: removed, the entry stays, and the entry on our former anchor
+  // now applies.
+  patch_service_js(path, PatchOptions{false, false, lp}, md5sums, &rep);
+  check(rep.onvif_addressing == PatchOutcome::kRemoved &&
+            rep.event_proxy == PatchOutcome::kRemoved &&
+            rep.local_patches[0].outcome == PatchOutcome::kAlready &&
+            rep.local_patches[1].outcome == PatchOutcome::kApplied,
+        "local order: ours removed, entries kept or applied");
+  std::string entries_only = original;
+  entries_only.replace(entries_only.find("return l.set(t,!0),i"),
+                       std::strlen("return l.set(t,!0),i"),
+                       "return l.set(t,!0),this&&i");
+  entries_only = with_patch(
+      entries_only, Patch{kBackendPatchWsa.original, "t.connSoapRequest=0"});
+  check(read_test_file(path) == entries_only, "local order: entries only");
+
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+  std::remove(lp.c_str());
+}
+
 // scan_js_block() finds the closing brace past braces inside strings,
 // template literals, comments and regular expressions.
 static void test_scan_js_block() {
@@ -1300,6 +1663,11 @@ int main() {
   test_route_patch_ambiguous();
   test_patch_outcomes();
   test_service_js_report();
+  test_parse_local_patches();
+  test_load_local_patches();
+  test_local_patches_json();
+  test_local_patches_service_js();
+  test_local_patches_after_ours();
   test_scan_js_block();
   test_file_newer_than_process();
   test_dpkg_backup_logic();

@@ -206,6 +206,66 @@ cameras' MAC addresses, comma-separated (case and `:` or `-` separators don't ma
 - onvif-recorder serves Protect on port 7892 of the loopback address only. If another
   program already uses that port, sharing stays off and the admin page says so.
 
+## Keeping your own Protect patches
+
+onvif-recorder patches Protect's `service.js` (in `/usr/share/unifi-protect/app`). Whenever
+it changes its patches, it rebuilds the file from Protect's original copy
+(`service.js.bak`), so edits you make to `service.js` by hand are lost. To keep your own
+changes, list them in `/data/onvif-recorder/local-patches.json` (set `--local_patches` to use
+another path). onvif-recorder applies them after its own patches each time it patches
+Protect, so they come back by themselves after a Protect or UniFi OS update.
+
+```json
+[
+  {
+    "name": "my change",
+    "file": "service.js",
+    "original": "exact text copied from service.js",
+    "replacement": "the text to put in its place"
+  }
+]
+```
+
+- `file` must be `service.js`. `name` is optional; it is shown in the log and on the admin
+  page.
+- `original` is plain text, not a pattern, and must occur exactly once in `service.js`.
+  Include enough of the surrounding code to make it unique. In JSON, write `"` as `\"` and
+  `\` as `\\`.
+- `replacement` must not be empty and must not contain `original`.
+- The file is read when onvif-recorder starts, so restart it after editing
+  (`systemctl restart onvif-recorder`). Removing an entry undoes it.
+
+**What happens:**
+
+- Protect reads `service.js` only when it starts, so onvif-recorder restarts Protect about
+  five minutes after it changes the file. That restart counts towards the four automatic
+  Protect restarts allowed per day. With `--auto_heal_protect=false`, restart Protect
+  yourself.
+- The **Status** card on the admin page shows how many entries are applied and names any that
+  are not. Log lines start with `[ui_patch] local patch`. An entry that doesn't apply is
+  logged as a warning.
+- If the file can't be read or isn't valid (bad JSON, a missing or unknown key, a `file`
+  other than `service.js`), none of its entries is applied, and the error is logged and shown
+  on the Status card. onvif-recorder's own patches still apply.
+- The file is on `/data`, so UniFi OS updates and `apt purge` leave it in place.
+
+**Caveats:**
+
+- Entries are plain find/replace on Protect's minified code. A Protect update can change that
+  code, and the entry then stops applying until you update it. Check the Status card after a
+  Protect update.
+- Entries are applied after onvif-recorder's own patches. An entry whose `original` overlaps
+  code that one of those patches changes does not apply while that patch is on.
+- `patch_alarm_picker=false` turns off all patching, these entries included.
+- Removing an entry undoes it only while `service.js.bak` is still Protect's original, which
+  onvif-recorder checks against dpkg's checksums. If you edited `service.js.bak` by hand
+  before, undo those edits so the two match again:
+  ```bash
+  md5sum /usr/share/unifi-protect/app/service.js.bak
+  grep 'app/service.js$' /var/lib/dpkg/info/unifi-protect.md5sums
+  ```
+  Otherwise the next Protect update replaces both files and puts this right.
+
 ## Troubleshooting
 
 **Check the log for errors:**

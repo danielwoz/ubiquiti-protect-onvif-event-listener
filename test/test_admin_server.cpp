@@ -414,6 +414,31 @@ int main() {
   check(http_body(http_get(port, "/api/event_proxy")) == proxy_json,
         "event_proxy returns the provider's JSON");
 
+  // /api/status carries the local patches provider's JSON as
+  // "local_patches", and leaves the key out without one or when it is
+  // empty; the Status card renders it.
+  {
+    check(http_body(http_get(port, "/api/status")).find("local_patches") ==
+              std::string::npos,
+          "status without a local patches provider has no local_patches");
+    server.set_local_patches_status_fn([] { return std::string(); });
+    check(http_body(http_get(port, "/api/status")).find("local_patches") ==
+              std::string::npos,
+          "empty local patches reply leaves local_patches out");
+    const std::string lp =
+        "{\"path\":\"/data/onvif-recorder/local-patches.json\",\"error\":\"\","
+        "\"entries\":[{\"name\":\"recording hook\",\"outcome\":\"applied\"}]}";
+    server.set_local_patches_status_fn([lp] { return lp; });
+    const std::string body = http_body(http_get(port, "/api/status"));
+    check(body.find(",\"local_patches\":" + lp + "}") != std::string::npos &&
+              body.rfind("{\"version\":", 0) == 0,
+          "status carries the local patches JSON as its last key");
+    check(http_body(http_get(port, "/")).find(
+              "rows.push(['Local patches', localPatchesText(lp)]);") !=
+              std::string::npos,
+          "status card shows local patches");
+  }
+
   // The diagnostic dump carries event_proxy.json, sanitised like the
   // other files.
   {

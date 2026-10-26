@@ -445,6 +445,16 @@ ABSL_FLAG(bool, patch_onvif_addressing, true,
     "change when it next starts; with --auto_heal_protect it is restarted "
     "for that automatically. Setting this to false removes the change "
     "again. Needs --patch_alarm_picker.");
+ABSL_FLAG(std::string, local_patches, "/data/onvif-recorder/local-patches.json",
+    "JSON file with your own find/replace patches to Protect's service.js, "
+    "applied after onvif-recorder's own patches whenever it patches "
+    "Protect: an array of {\"name\", \"file\": \"service.js\", \"original\", "
+    "\"replacement\"} objects. An entry is applied only where its original "
+    "text occurs exactly once; removing an entry undoes it. A missing file "
+    "holds no patches; a file that is not valid applies none of them. Read "
+    "at start-up and whenever onvif-recorder re-patches Protect, so restart "
+    "onvif-recorder after editing it. Needs --patch_alarm_picker. Empty "
+    "disables.");
 ABSL_FLAG(std::string, protect_event_proxy_cameras, "",
     "Comma-separated MAC addresses of third-party cameras whose ONVIF "
     "event subscription Protect (7.1+) gets through onvif-recorder "
@@ -836,15 +846,38 @@ int main(int argc, char* argv[]) {
   // Patch the Protect UI alarm picker to include third-party cameras, and
   // Protect's ONVIF client to send WS-Addressing headers and, while events
   // are shared, to offer its event subscriptions to the PullPoint service.
+  // The user's local patches follow.
+  const std::string local_patches = absl::GetFlag(FLAGS_local_patches);
   const protect_ui::PatchOptions patch_opts{
-      onvif_addressing, /*event_proxy=*/proxy_mode == ep::Mode::kServe};
+      onvif_addressing, /*event_proxy=*/proxy_mode == ep::Mode::kServe,
+      local_patches};
   // Latest outcome of the route patch, for /api/event_proxy.
   std::atomic<protect_ui::PatchOutcome> route_patch{
       protect_ui::PatchOutcome::kNotRun};
+  // Latest outcome of the local patches, as JSON for /api/status; empty
+  // while none has been applied or none is configured.
+  std::mutex local_patches_mu;
+  std::string local_patches_status;  // guarded by local_patches_mu
+  auto record_local_patches =
+      [&local_patches_mu, &local_patches_status](
+          const protect_ui::PatchReport& report) {
+        std::string j = report.local_patches_path.empty()
+                            ? std::string()
+                            : protect_ui::local_patches_json(report);
+        std::lock_guard<std::mutex> lock(local_patches_mu);
+        local_patches_status = std::move(j);
+      };
+  struct stat local_patches_st;
+  if (!patch_protect && !local_patches.empty() &&
+      stat(local_patches.c_str(), &local_patches_st) == 0) {
+    LOG(WARNING) << "[ui_patch] local patches " << local_patches
+                 << " not applied: --patch_alarm_picker=false";
+  }
   if (patch_protect) {
     protect_ui::PatchReport report;
     auto s = protect_ui::patch_alarm_picker(patch_opts, &report);
     route_patch = report.event_proxy;
+    record_local_patches(report);
     if (s.ok()) {
       LOG(INFO) << "[ui_patch] success";
     } else {
@@ -940,6 +973,11 @@ int main(int argc, char* argv[]) {
         if (hub) st.hub_json = hub->snapshot_json();
         return ep::status_json(st);
       });
+  admin_server.set_local_patches_status_fn(
+      [&local_patches_mu, &local_patches_status] {
+        std::lock_guard<std::mutex> lock(local_patches_mu);
+        return local_patches_status;
+      });
   const uint16_t admin_port = absl::GetFlag(FLAGS_admin_port);
   const std::string channel_file = absl::GetFlag(FLAGS_channel_file);
   if (admin_server.start(ONVIF_RECORDER_VERSION, channel_file, admin_port,
@@ -983,10 +1021,12 @@ int main(int argc, char* argv[]) {
     };
     patch_watcher = std::make_unique<protect_ui::PatchWatcher>(
         std::move(specs),
-        [log_port, admin_port, patch_opts, &route_patch]() {
+        [log_port, admin_port, patch_opts, &route_patch,
+         record_local_patches]() {
           protect_ui::PatchReport report;
           auto sp = protect_ui::patch_alarm_picker(patch_opts, &report);
           route_patch = report.event_proxy;
+          record_local_patches(report);
           if (!sp.ok())
             LOG(WARNING) << "[patch_watcher] alarm picker: " << sp.message();
           auto sl = protect_ui::patch_nginx_log_proxy(log_port);

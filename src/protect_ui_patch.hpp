@@ -16,9 +16,12 @@
 
 #include <sys/types.h>
 
+#include <cstddef>
 #include <string>
+#include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 
 namespace protect_ui {
 
@@ -32,7 +35,39 @@ struct PatchOptions {
   /// PullPoint service on 127.0.0.1:7892 first, and falls back to the
   /// camera when that refuses or does not answer within 4 s (Protect 7.1+).
   bool event_proxy = false;
+  /// Path of the user's local patches file (--local_patches), read on
+  /// every pass; empty for none.  See load_local_patches().
+  std::string local_patches{};
 };
+
+/// One entry of the local patches file: a literal find/replace in one of
+/// Protect's files, applied after onvif-recorder's own patches and by the
+/// same rules.
+struct LocalPatch {
+  std::string name;         // "entry <n>" when the file gives none
+  std::string file;         // only "service.js"
+  std::string original;     // non-empty; must occur exactly once
+  std::string replacement;  // non-empty; must not contain original
+};
+
+/// Largest local patches file read, in bytes.
+inline constexpr size_t kMaxLocalPatchesBytes = 1024 * 1024;
+/// Most entries a local patches file may hold.
+inline constexpr size_t kMaxLocalPatches = 100;
+
+/// Parse the text of a local patches file: a JSON array of objects with
+/// the string members "name" (optional), "file" ("service.js"), "original"
+/// and "replacement", and no others.  Text that is empty or only white
+/// space holds no entries.  Returns InvalidArgumentError naming the
+/// problem (with line and column for malformed JSON) otherwise.
+absl::StatusOr<std::vector<LocalPatch>> parse_local_patches(
+    const std::string& text);
+
+/// Read and parse the local patches file at @p path.  A file that does not
+/// exist holds no entries.  Returns an error for a file that cannot be
+/// read, is larger than kMaxLocalPatchesBytes or does not parse.
+absl::StatusOr<std::vector<LocalPatch>> load_local_patches(
+    const std::string& path);
 
 /// What patch_alarm_picker() did with one optional patch.
 enum class PatchOutcome {
@@ -50,12 +85,32 @@ enum class PatchOutcome {
 /// "removed", "absent", "not_applicable" or "ambiguous".
 const char* patch_outcome_name(PatchOutcome outcome);
 
+/// What patch_alarm_picker() did with one local patch.
+struct LocalPatchOutcome {
+  std::string name;
+  /// kApplied, kAlready, kNotApplicable, kAmbiguous, or kNotRun when
+  /// service.js was not patched.
+  PatchOutcome outcome = PatchOutcome::kNotRun;
+};
+
 /// Outcome of each optional service.js patch in one patch_alarm_picker()
 /// call.
 struct PatchReport {
   PatchOutcome onvif_addressing = PatchOutcome::kNotRun;
   PatchOutcome event_proxy = PatchOutcome::kNotRun;
+  /// PatchOptions::local_patches of the call.
+  std::string local_patches_path;
+  /// Why no local patch was applied: the file could not be read or is
+  /// not valid.  Empty when it was used or does not exist.
+  std::string local_patches_error;
+  /// Each entry of the local patches file, in file order.
+  std::vector<LocalPatchOutcome> local_patches;
 };
+
+/// JSON object for /api/status describing the local patches of @p report:
+/// {"path":..., "error":..., "entries":[{"name":..., "outcome":...}]},
+/// with outcomes named as by patch_outcome_name().
+std::string local_patches_json(const PatchReport& report);
 
 /// Live-patch the Protect UI to allow third-party cameras in the alarm picker.
 ///
@@ -71,8 +126,11 @@ struct PatchReport {
 /// WS-Addressing To and Action headers with its event requests (Protect
 /// 7.1+), which some cameras (Reolink) require.  With @p opts.event_proxy it
 /// routes Protect's ONVIF event subscriptions through onvif-recorder (see
-/// PatchOptions).  An option that is off removes its change again.  Changes
-/// to service.js load at Protect's next start.
+/// PatchOptions).  An option that is off removes its change again.  The
+/// entries of the local patches file @p opts.local_patches follow
+/// onvif-recorder's own patches; when the file cannot be read or is not
+/// valid, none of them is applied.  Changes to service.js load at
+/// Protect's next start.
 ///
 /// Each patch is applied only where its target code occurs exactly once.
 /// The event-sharing patch is also refused when Protect's SOAP transport
