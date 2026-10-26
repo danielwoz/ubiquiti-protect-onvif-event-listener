@@ -41,18 +41,31 @@ default type — so a snapshot containing a car is stored as `vehicle` even thou
 the camera reported only "motion". Per-camera `--camera_object_types` overrides
 always take priority over NanoDet-M.
 
+**`--default_object_type=motion`** records no smart detection for generic motion
+that NanoDet-M cannot classify, and leaves it to Protect's own motion events.
+It is the same as `--drop_unclassified_motion=true`: motion NanoDet-M classifies
+is still recorded with its class, and camera AI events, line crossings and
+per-camera overrides are unaffected. A line crossing or field rule that carries
+no class is recorded as `person`. Protect 7.1 and later creates motion events for
+third-party cameras itself; older Protect does not, so on it this setting leaves
+unclassified motion from third-party cameras unrecorded.
+
 AI-specific events (Human/Vehicle detections from FieldDetector, HumanShapeDetect,
 etc.) are never affected by `--default_object_type` or NanoDet-M class inference.
 
 **Per-camera overrides** (`--camera_object_types`) replace the detection type for
 every event from the named camera, including AI events. This is useful for
 wildlife cameras or entrance monitors where you always want a specific type
-regardless of what the camera reports.
+regardless of what the camera reports. Because an override applies to every
+event, `motion` is not a valid override.
+
+Types are matched ignoring case. An unknown type is logged as a warning at
+start-up and recorded as `person`; the admin page refuses to save one.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--default_object_type` | `person` | Object type written for generic motion events that carry no object class. Valid values: `person`, `vehicle`, `animal`, `package`. |
-| `--camera_object_types` | _(disabled)_ | Comma-separated `ip=type` overrides applied to all events from each named camera, e.g. `192.168.1.108=animal,192.168.1.109=package`. |
+| `--default_object_type` | `person` | Object type written for generic motion events that carry no object class. Valid values: `person`, `vehicle`, `animal`, `package`, `motion` (no smart detection for motion NanoDet-M cannot classify; see above). |
+| `--camera_object_types` | _(disabled)_ | Comma-separated `ip=type` overrides applied to all events from each named camera, e.g. `192.168.1.108=animal,192.168.1.109=package`. Valid types: `person`, `vehicle`, `animal`, `package`. |
 
 **Example — wildlife camera on `.108` and package camera on `.109`:**
 ```bash
@@ -239,7 +252,7 @@ ExecStart=/usr/bin/onvif-recorder \
 | `--post_buffer_sec` | `2` | Seconds after the last detection to mark as clip end. |
 | `--coalesce_window_sec` | `30` | Merge consecutive detections within this window into one event. `0` to disable. |
 | `--trigger_automations` | `true` | Trigger Protect automations (push notifications, chimes, sirens) for detections onvif-recorder records. Set to `false` to keep recording events without notifying. Automations for Protect's own detections (e.g. a UniFi doorbell) are unaffected. |
-| `--drop_unclassified_motion` | `false` | Drop generic motion events (CellMotionDetector / MotionAlarm) that carry no ONVIF object class and that NanoDet-M cannot classify, instead of recording them as `--default_object_type`. Real camera AI events (Person / Vehicle / Pet), `--camera_object_types` overrides and momentary topics such as line crossing are unaffected. Cuts false-positive clutter from AI cameras (e.g. Reolink) that also emit noisy basic-motion events. Recommended on Protect 7.1+, which creates basic motion events for third-party cameras itself; with it off, unclassified motion appears twice (Protect's motion event plus a `person` smart detection). |
+| `--drop_unclassified_motion` | `false` | Drop generic motion events (CellMotionDetector / MotionAlarm) that carry no ONVIF object class and that NanoDet-M cannot classify, instead of recording them as `--default_object_type`. Real camera AI events (Person / Vehicle / Pet), `--camera_object_types` overrides and momentary topics such as line crossing are unaffected. Cuts false-positive clutter from AI cameras (e.g. Reolink) that also emit noisy basic-motion events. Recommended on Protect 7.1+, which creates basic motion events for third-party cameras itself; with it off, unclassified motion appears twice (Protect's motion event plus a `person` smart detection). `--default_object_type=motion` does the same. |
 | `--patch_onvif_addressing` | `true` | Make Protect's own ONVIF client (Protect 7.1+) send the WS-Addressing `To` and `Action` headers with its PullMessages, Renew and Unsubscribe requests, as onvif-recorder does. Cameras that require them, such as Reolink, otherwise reject Protect's event requests, so Protect gets no native motion events from them (on 7.2+ it shows their motion detection as misconfigured). `false` removes the change again. Needs `--patch_alarm_picker`. Protect reads service.js only when it starts, so whenever onvif-recorder changes service.js while Protect is running (on install, after a Protect or UniFi OS update, or when this setting changes) Protect is restarted about five minutes later. With `--auto_heal_protect=false`, restart it yourself. |
 | `--auto_heal_protect` | `true` | Restart Protect services automatically when: Protect's Postgres stops answering for over 60 s (restarts msp, msr and unifi-protect); MSR keeps failing for over 60 s (restarts msr); Protect still holds stale camera featureFlags 60 s after onvif-recorder wrote them (restarts unifi-protect); or Protect started before onvif-recorder last patched service.js (restarts unifi-protect). At most one restart per 5 min, none in the first 5 min after start, and 4 per 24 h. Each restart is logged at ERROR and shown on the admin page's Recent errors card. |
 | `--protect_event_proxy_cameras` | _(empty = off)_ | Comma-separated MAC addresses of third-party cameras whose ONVIF events Protect (7.1+) gets through onvif-recorder instead of subscribing to the camera itself, so the camera has one event subscriber. Meant for cameras that accept only one subscriber, on which Protect logs `ter:BlockedThreadUpperLimit` and shows motion detection as misconfigured. Case and `:` or `-` separators are ignored. Usually set with the **Share with Protect** tickboxes on the admin page's Camera health card. Needs `--patch_alarm_picker`, and onvif-recorder must be able to subscribe to the camera. Protect is restarted about five minutes after the first camera is added or the last one removed (with `--auto_heal_protect=false`, restart it yourself). Only the event subscription is shared; Protect's other requests still go to the camera, and Protect subscribes to the camera directly when onvif-recorder is not running or does not answer. See [Sharing a camera's events with Protect](README.md#sharing-a-cameras-events-with-protect). |

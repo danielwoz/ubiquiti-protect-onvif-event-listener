@@ -295,12 +295,19 @@ typename Container::const_iterator find_camera_setting(
 }
 
 // Normalise a user-facing or internal type name: the recorder uses
-// "human" internally while settings and Protect use "person".
+// "human" internally while settings and Protect use "person".  Case and
+// surrounding spaces are ignored.
 std::string canonical_object_type(std::string t) {
+  t.erase(0, t.find_first_not_of(" \t"));
+  t.erase(t.find_last_not_of(" \t") + 1);
   for (char& c : t) c = static_cast<char>(std::tolower(
       static_cast<unsigned char>(c)));
   return t == "human" ? "person" : t;
 }
+
+// default_object_type value that records no smart detection for generic
+// motion with no class, leaving it to Protect's own motion events.
+constexpr char kMotionObjectType[] = "motion";
 
 bool looks_like_jpeg(const std::vector<unsigned char>& b) {
   return b.size() >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF;
@@ -1619,7 +1626,12 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       if (ai_capable_cameras_.count(ev.camera_ip) ||
           cell_motion_cameras_.count(ev.camera_ip)) return;
     }
-    default_obj_type = default_object_type_;
+    // default_object_type=motion drops unclassified generic motion below,
+    // as --drop_unclassified_motion does.  What it does not drop and that
+    // still needs a type (a line crossing or field rule with no class) is
+    // recorded as person.
+    default_obj_type = default_object_type_ == kMotionObjectType
+                           ? std::string("person") : default_object_type_;
     auto it = find_camera_setting(camera_object_types_, ev.camera_ip);
     if (it != camera_object_types_.end())
       cam_override_type = it->second;
@@ -1831,7 +1843,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       pre_ms       = pre_buffer_ms_;
       det_ptr      = detector_;
       det_override = detect_override_;
-      drop_unclassified = drop_unclassified_motion_;
+      drop_unclassified = drop_unclassified_motion_ ||
+                          default_object_type_ == kMotionObjectType;
       alarm_notif  = alarm_notifier_;
       msr          = msr_client_;
       msr_drop_on_failure = msr_drop_on_failure_;
@@ -1999,9 +2012,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     }
 
     // Drop unclassified generic motion when --drop_unclassified_motion is
-    // set.  Deliberately evaluated HERE, after the snapshot block, rather
-    // than inside it: a fallback event is unclassified whether the
-    // snapshot arrived or not, and nesting the decision under a
+    // set or default_object_type is motion, leaving it to Protect's own
+    // motion events.  Deliberately evaluated HERE, after the snapshot
+    // block, rather than inside it: a fallback event is unclassified
+    // whether the snapshot arrived or not, and nesting the decision under a
     // successful fetch made the flag silently no-op on exactly the
     // firmwares it exists for -- cameras whose HTTP snapshot endpoint
     // chokes while RTSP is streaming are the ones flooding the timeline
@@ -2015,7 +2029,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         coalesced_event_id.empty()) {
       LOG(INFO) << '[' << ev.camera_ip
                 << "] dropping unclassified motion event "
-                   "(--drop_unclassified_motion)";
+                   "(--drop_unclassified_motion or "
+                   "--default_object_type=motion)";
       return;
     }
 
@@ -2433,14 +2448,16 @@ int DetectionRecorder::purge_stale_open_events(uint64_t older_than_ms) {
 }
 
 void DetectionRecorder::set_default_object_type(const std::string& type) {
+  std::string norm = canonical_object_type(type);
   absl::MutexLock lk(&mu_);
-  default_object_type_ = type;
+  default_object_type_ = std::move(norm);
 }
 
 void DetectionRecorder::set_camera_object_type(const std::string& ip,
                                                 const std::string& type) {
+  std::string norm = canonical_object_type(type);
   absl::MutexLock lk(&mu_);
-  camera_object_types_[ip] = type;
+  camera_object_types_[ip] = std::move(norm);
 }
 
 void DetectionRecorder::set_camera_coalesce_window(const std::string& ip,

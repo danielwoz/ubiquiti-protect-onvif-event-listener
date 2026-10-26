@@ -212,9 +212,16 @@ cc_test(
 cc_test(
     name = "test_detection_recorder",
     srcs = ["test_detection_recorder.cpp"],
-    env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},
+    env = {
+        "TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)",
+        # NanoDet-M model for the generic-motion classification tests.
+        "NANODET_PARAM": "$(rootpath @nanodet_m_param//file)",
+        "NANODET_BIN": "$(rootpath @nanodet_m_bin//file)",
+    },
     data = [
         "//test:tsan_suppressions",
+        "@nanodet_m_bin//file",
+        "@nanodet_m_param//file",
         "testdata/security_cam_vehicle.jpg",
         "testdata/snapshot_108.jpg",
         "testdata/snapshot_109.jpg",
@@ -224,6 +231,7 @@ cc_test(
         "//:alarm_notifier",
         "//:detection_recorder",
         "//:msr_client",
+        "//:object_detect",
         "//:pg_util",
         "//:protect_version",
         "//:ubv_thumbnail",

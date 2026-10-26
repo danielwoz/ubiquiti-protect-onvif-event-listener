@@ -198,13 +198,19 @@ ABSL_FLAG(std::string, protect_user_id, "",
     "-c \"SELECT id FROM users LIMIT 1\"");
 ABSL_FLAG(std::string, default_object_type, "person",
     "Object type reported for generic motion events (CellMotionDetector, "
-    "VideoSource/MotionAlarm) when the camera does not identify a type. "
-    "Valid values: person, vehicle, animal, package.");
+    "VideoSource/MotionAlarm) when the camera does not identify a type "
+    "and NanoDet-M cannot classify it. Valid values: person, vehicle, "
+    "animal, package, motion. 'motion' records no smart detection for "
+    "such events and leaves them to Protect's own motion events, as "
+    "--drop_unclassified_motion does; Protect older than 7.1 creates no "
+    "motion events for third-party cameras, so there they are not "
+    "recorded at all. Unknown values are recorded as person.");
 ABSL_FLAG(std::string, camera_object_types, "",
     "Per-camera object type overrides as comma-separated ip=type pairs, "
     "e.g. '192.168.1.108=animal,192.168.1.109=package'. "
     "Overrides the detection type for all events from that camera. "
-    "Valid types: person, vehicle, animal, package.");
+    "Valid types: person, vehicle, animal, package; unknown types are "
+    "recorded as person.");
 ABSL_FLAG(std::string, disabled_object_types, "",
     "Comma-separated object types never recorded for third-party cameras, "
     "e.g. 'package' or 'package,animal'.  Applies after camera and "
@@ -405,7 +411,7 @@ ABSL_FLAG(bool, drop_unclassified_motion, false,
     "events (Person/Vehicle/Pet), --camera_object_types overrides and "
     "momentary topics such as line crossing are unaffected. Useful with "
     "Reolink/other AI cameras that also emit noisy basic-motion events. "
-    "Default false.");
+    "--default_object_type=motion does the same. Default false.");
 ABSL_FLAG(bool, motion_push, true,
     "Reactive motion polling via Postgres LISTEN/NOTIFY. When true "
     "(default), motion_poller installs an AFTER-INSERT trigger on the "
@@ -1025,13 +1031,30 @@ int main(int argc, char* argv[]) {
   det_rec.set_momentary_event_sec(momentary_sec);
   det_rec.set_drop_unclassified_motion(
       absl::GetFlag(FLAGS_drop_unclassified_motion));
+
+  // Object types.  An unknown type is reported and recorded as person.
+  std::string default_object_type = runtime_config::NormalizeObjectType(
+      absl::GetFlag(FLAGS_default_object_type));
+  if (absl::Status s = runtime_config::ValidateObjectType(
+          default_object_type, /*allow_motion=*/true);
+      !s.ok()) {
+    LOG(WARNING) << "[detect] --default_object_type: " << s.message()
+                 << "; recording such events as person";
+    default_object_type = "person";
+  }
+  det_rec.set_default_object_type(default_object_type);
+  const bool motion_left_to_protect =
+      absl::GetFlag(FLAGS_drop_unclassified_motion) ||
+      default_object_type == "motion";
+
   // With no detector there is nothing to classify with, so the flag stops
   // meaning "drop what NanoDet-M couldn't identify" and starts meaning
   // "drop every generic motion event".  That may be what someone wants,
   // but it should never be a surprise.
-  if (absl::GetFlag(FLAGS_drop_unclassified_motion) &&
+  if (motion_left_to_protect &&
       !absl::GetFlag(FLAGS_detect) && !absl::GetFlag(FLAGS_detect_override)) {
-    LOG(WARNING) << "[detect] --drop_unclassified_motion is set but NanoDet-M "
+    LOG(WARNING) << "[detect] --drop_unclassified_motion or "
+                    "--default_object_type=motion is set but NanoDet-M "
                     "is disabled (--detect=false), so EVERY generic motion "
                     "event will be dropped -- only camera-reported AI events "
                     "and per-camera overrides will be recorded. Enable "
@@ -1041,9 +1064,6 @@ int main(int argc, char* argv[]) {
       static_cast<uint32_t>(absl::GetFlag(FLAGS_coalesce_window_sec)));
   det_rec.set_max_events_per_hour(
       static_cast<uint32_t>(absl::GetFlag(FLAGS_max_events_per_hour)));
-
-  // Object type configuration.
-  det_rec.set_default_object_type(absl::GetFlag(FLAGS_default_object_type));
 
   // Helper to walk a comma-separated `ip=value` list and call a per-pair
   // callback.  Used by --camera_object_types / --camera_coalesce_window_sec
@@ -1066,7 +1086,15 @@ int main(int argc, char* argv[]) {
 
   for_each_ip_value(absl::GetFlag(FLAGS_camera_object_types),
       [&](const std::string& ip, const std::string& v) {
-        det_rec.set_camera_object_type(ip, v);
+        std::string type = runtime_config::NormalizeObjectType(v);
+        absl::Status s =
+            runtime_config::ValidateObjectType(type, /*allow_motion=*/false);
+        if (!type.empty() && !s.ok()) {
+          LOG(WARNING) << "[detect] --camera_object_types " << ip << ": "
+                       << s.message() << "; recording its events as person";
+          type = "person";
+        }
+        det_rec.set_camera_object_type(ip, type);
       });
   for_each_ip_value(absl::GetFlag(FLAGS_camera_coalesce_window_sec),
       [&](const std::string& ip, const std::string& v) {

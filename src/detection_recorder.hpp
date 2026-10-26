@@ -84,7 +84,9 @@ class MsrClient;      // forward declaration; full definition in msr_client.hpp
  *   enabled (--detect / --detect_override), in which case the COCO class
  *   returned by the detector overrides the type (person / vehicle / animal).
  *   Per-camera overrides (set_camera_object_type) take priority over NCNN.
- *   Valid object types: person, vehicle, animal, package.
+ *   Valid object types: person, vehicle, animal, package.  default_object_type
+ *   also takes "motion": generic motion that NanoDet-M cannot classify is
+ *   then not recorded, and left to Protect's own motion events.
  *
  * Backend selection
  * -----------------
@@ -242,13 +244,20 @@ class DetectionRecorder {
 
   /// Set the object type reported for generic motion events (CellMotionDetector,
   /// VideoSource/MotionAlarm) where the camera does not specify a type.
-  /// Valid values: "person" (default), "vehicle", "animal", "package".
+  /// Valid values: "person" (default), "vehicle", "animal", "package" and
+  /// "motion".  "motion" drops such an event unless NanoDet-M classifies
+  /// it, exactly as set_drop_unclassified_motion(true) does, so Protect's
+  /// own motion event is its only record; other events without a class
+  /// (a line crossing, a field rule) are recorded as "person".  Case and
+  /// surrounding spaces are ignored.  Unknown values are recorded as
+  /// "person"; callers validate and warn first.
   void set_default_object_type(const std::string& type);
 
   /// Override the detection type for all events from a specific camera IP.
   /// The per-camera type takes precedence over the ONVIF-reported type and
   /// over the default_object_type.
-  /// Valid values: "person", "vehicle", "animal", "package".
+  /// Valid values: "person", "vehicle", "animal", "package"; an empty type
+  /// sets no override.  Case and surrounding spaces are ignored.
   void set_camera_object_type(const std::string& ip, const std::string& type);
 
   /// When override is true the detector is always run, ignoring any ONVIF
@@ -262,7 +271,8 @@ class DetectionRecorder {
   /// Person/Vehicle/Pet events this removes a stream of phantom "person"
   /// detections triggered by wind, IR and reflections.  Real camera AI
   /// events and --camera_object_types overrides are unaffected, as are
-  /// momentary topics such as line crossing.  Default false.
+  /// momentary topics such as line crossing.  default_object_type "motion"
+  /// turns the same behaviour on.  Default false.
   void set_drop_unclassified_motion(bool drop);
 
   /// When enabled, thumbnail IDs use the MSR "{MAC}-{timestamp_ms}" format
@@ -621,6 +631,7 @@ class DetectionRecorder {
   std::atomic<uint64_t> stats_msr_burst_reuses_{0};
 
   // Object type for generic motion events (CellMotionDetector, MotionAlarm).
+  // "motion" drops them unless NanoDet-M classifies them.
   std::string default_object_type_{"person"};
 
   // Per-camera type overrides: all events from the keyed IP use this type.

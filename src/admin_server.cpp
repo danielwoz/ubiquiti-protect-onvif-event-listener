@@ -1568,6 +1568,14 @@ std::pair<int, std::string> handle_config(const Ctx& ctx,
     if (!raw.empty()) {
       auto* flag = absl::FindCommandLineFlag(e.name);
       if (flag == nullptr) continue;  // schema/flag mismatch -- skip
+      // Settings that take a fixed set of values (object types) are
+      // checked beyond what the flag type allows, before the flag is
+      // touched.
+      absl::Status valid = runtime_config::ValidateValue(e.name, raw);
+      if (!valid.ok()) {
+        return {400, std::string("invalid ") + e.name + ": " +
+                         std::string(valid.message())};
+      }
       std::string err;
       // ParseFrom mutates the flag, but we only call it for validation.
       // The change is overwritten on the next process restart by

@@ -240,9 +240,11 @@ camera can show the same status for a different reason; see below.
 third-party camera's ONVIF motion itself and creates the basic motion events.
 onvif-recorder never writes plain motion events, but by default it records motion
 it cannot classify as a smart detection of `default_object_type` (person). On
-Protect 7.1+ set `drop_unclassified_motion` to true (admin page, Detection) and
-leave motion detection on in Protect. Cameras for which Protect shows motion
-detection as misconfigured get no basic motion events with that setting.
+Protect 7.1+ set `drop_unclassified_motion` to true, or `default_object_type` to
+`motion`, which does the same (admin page, Detection), and leave motion detection
+on in Protect. Cameras for which Protect shows motion detection as misconfigured
+get no basic motion events with that setting, and neither do any third-party
+cameras on Protect older than 7.1.
 
 **No native motion from a Reolink camera, or Protect shows its motion detection as
 misconfigured?** From Protect 7.1, Protect subscribes to the camera's ONVIF motion

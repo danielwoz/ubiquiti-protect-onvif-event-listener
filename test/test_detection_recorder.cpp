@@ -74,6 +74,7 @@
 #include "absl/log/log_sink_registry.h"
 #include "alarm_notifier.hpp"
 #include "detection_recorder.hpp"
+#include "object_detect.hpp"
 #include "onvif_listener.hpp"
 #include "pg_util.hpp"
 #include "protect_version.hpp"
@@ -3284,6 +3285,207 @@ static void test_drop_unclassified_without_snapshot() {
             std::to_string(bptr->events.size()));
 }
 
+// Generic motion events, built directly for the default_object_type tests.
+static onvif::OnvifEvent make_cell_motion_event(const std::string& ip) {
+  onvif::OnvifEvent e;
+  e.camera_ip   = ip;
+  e.topic       = "tns1:RuleEngine/CellMotionDetector/Motion";
+  e.event_time  = "2026-03-24T14:00:00Z";
+  e.property_op = "Changed";
+  e.data["IsMotion"] = "true";
+  return e;
+}
+
+static onvif::OnvifEvent make_motion_alarm_event(const std::string& ip) {
+  onvif::OnvifEvent e;
+  e.camera_ip   = ip;
+  e.topic       = "tns1:VideoSource/MotionAlarm";
+  e.event_time  = "2026-03-24T14:00:00Z";
+  e.property_op = "Changed";
+  e.data["State"] = "true";
+  return e;
+}
+
+// Every default_object_type value records generic motion as that type,
+// whatever its case and surrounding spaces.
+static void test_default_object_type_each_value() {
+  const std::pair<const char*, const char*> cases[] = {
+    {"person", "person"}, {"vehicle", "vehicle"}, {"animal", "animal"},
+    {"package", "package"}, {" Vehicle ", "vehicle"},
+  };
+  for (const auto& [setting, want] : cases) {
+    auto backend = std::make_unique<MockBackend>();
+    MockBackend* bptr = backend.get();
+    auto rec_or =
+        onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+    CHECK(rec_or.ok(), "default_type_each: CreateWithBackend failed");
+    onvif::DetectionRecorder& recorder = **rec_or;
+    recorder.set_coalesce_window(0);
+    recorder.set_default_object_type(setting);
+
+    recorder.on_event(make_cell_motion_event("192.168.1.233"));
+    const std::string label =
+        std::string("default_object_type=\"") + setting + "\"";
+    CHECK(bptr->events.size() == 1,
+          label + ": expected 1 event, got " +
+              std::to_string(bptr->events.size()));
+    if (bptr->events.empty()) continue;
+    CHECK(bptr->events[0].sdt_json == std::string("[\"") + want + "\"]",
+          label + ": expected " + want + ", got " + bptr->events[0].sdt_json);
+    CHECK(!bptr->sdos.empty() && bptr->sdos[0].obj_type == want,
+          label + ": smartDetectObjects type must be " + want);
+  }
+}
+
+// default_object_type=motion leaves unclassified generic motion to
+// Protect's own motion events, exactly as --drop_unclassified_motion
+// does: camera AI events, line crossings, field rules without a class and
+// per-camera overrides are still recorded.
+static void test_default_object_type_motion() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  CHECK(rec_or.ok(), "default_type_motion: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(0);
+  recorder.set_drop_unclassified_motion(false);  // motion alone must do it
+  recorder.set_default_object_type("Motion");
+
+  recorder.on_event(make_cell_motion_event("192.168.1.234"));
+  recorder.on_event(make_motion_alarm_event("192.168.1.235"));
+  CHECK(bptr->events.empty(),
+        "default_type_motion: unclassified motion must not be recorded, got " +
+            std::to_string(bptr->events.size()));
+
+  // Camera AI event: recorded with the camera's class.
+  onvif::OnvifEvent ai;
+  ai.camera_ip   = "192.168.1.236";
+  ai.topic       = "tns1:RuleEngine/MyRuleDetector/VehicleDetect";
+  ai.event_time  = "2026-03-24T14:01:00Z";
+  ai.property_op = "Changed";
+  ai.data["State"] = "true";
+  recorder.on_event(ai);
+  CHECK(bptr->events.size() == 1 &&
+            bptr->events.back().sdt_json == "[\"vehicle\"]",
+        "default_type_motion: camera AI vehicle must be recorded as vehicle");
+
+  // Line crossing without a class: recorded, as person.
+  onvif::OnvifEvent cross;
+  cross.camera_ip   = "192.168.1.237";
+  cross.topic       = "tns1:RuleEngine/LineDetector/Crossed";
+  cross.event_time  = "2026-03-24T14:02:00Z";
+  cross.property_op = "Changed";
+  cross.data["ObjectId"] = "4";
+  recorder.on_event(cross);
+  CHECK(bptr->events.size() == 2 &&
+            bptr->events.back().sdt_json == "[\"person\"]",
+        "default_type_motion: line crossing must be recorded as person");
+
+  // Field rule whose name carries no class: recorded, as person.
+  onvif::OnvifEvent field;
+  field.camera_ip   = "192.168.1.238";
+  field.topic       = "tns1:RuleEngine/FieldDetector/ObjectsInside";
+  field.event_time  = "2026-03-24T14:03:00Z";
+  field.property_op = "Changed";
+  field.source["Rule"]   = "MyFieldDetector1";
+  field.data["IsInside"] = "true";
+  recorder.on_event(field);
+  CHECK(bptr->events.size() == 3 &&
+            bptr->events.back().sdt_json == "[\"person\"]",
+        "default_type_motion: field rule must be recorded as person");
+
+  // A per-camera override still applies to that camera's motion.
+  recorder.set_camera_object_type("192.168.1.239", "animal");
+  recorder.on_event(make_cell_motion_event("192.168.1.239"));
+  CHECK(bptr->events.size() == 4 &&
+            bptr->events.back().sdt_json == "[\"animal\"]",
+        "default_type_motion: per-camera override must still be recorded");
+
+  for (const auto& sdo : bptr->sdos) {
+    CHECK(sdo.obj_type != "motion",
+          "default_type_motion: motion is never written as an object type");
+  }
+}
+
+// NanoDet-M from the model files Bazel names in NANODET_PARAM and
+// NANODET_BIN.  Null when they are not set, as when the binary is run by
+// hand; the caller then skips its checks.
+static std::unique_ptr<object_detect::ObjectDetector> load_nanodet() {
+  const char* param = std::getenv("NANODET_PARAM");
+  const char* bin   = std::getenv("NANODET_BIN");
+  if (param == nullptr || bin == nullptr) return nullptr;
+  auto det_or = object_detect::ObjectDetector::Load(param, bin);
+  CHECK(det_or.ok(), "NanoDet-M failed to load: " +
+                         std::string(det_or.status().message()));
+  if (!det_or.ok()) return nullptr;
+  return std::move(*det_or);
+}
+
+// With default_object_type=motion, generic motion that NanoDet-M
+// classifies is recorded with the inferred class, and motion it cannot
+// classify is not recorded.  Under the default "person" the same two
+// snapshots are both recorded.
+static void test_default_object_type_motion_nanodet(
+    const std::string& ubv_dir) {
+  auto detector = load_nanodet();
+  if (!detector) {
+    std::cout << "  (skipped: NANODET_PARAM / NANODET_BIN not set)\n";
+    return;
+  }
+  // security_cam_vehicle.jpg holds a car; snapshot_108.jpg holds nothing
+  // NanoDet-M reports.
+  SnapshotSyntheticEmulator car_cam("192.168.1.240", {},
+      load_file(source_dir() + "testdata/security_cam_vehicle.jpg"));
+  SnapshotSyntheticEmulator empty_cam("192.168.1.241", {},
+      load_file(source_dir() + "testdata/snapshot_108.jpg"));
+  car_cam.start();
+  empty_cam.start();
+
+  // Runs one motion event per camera; returns camera -> smartDetectTypes.
+  auto run = [&](const char* default_type) {
+    auto backend = std::make_unique<MockBackend>();
+    MockBackend* bptr = backend.get();
+    auto rec_or =
+        onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+    CHECK(rec_or.ok(), "motion_nanodet: CreateWithBackend failed");
+    onvif::DetectionRecorder& recorder = **rec_or;
+    recorder.set_ubv_dir(ubv_dir);
+    recorder.set_coalesce_window(0);
+    recorder.set_detector(detector.get());
+    recorder.set_default_object_type(default_type);
+    for (SnapshotSyntheticEmulator* emu : {&car_cam, &empty_cam}) {
+      onvif::CameraConfig cfg;
+      cfg.ip           = emu->local_address();
+      cfg.user         = "admin";
+      cfg.password     = "password";
+      cfg.snapshot_url = emu->snapshot_url();
+      recorder.set_snapshot(cfg);
+    }
+    recorder.on_event(make_cell_motion_event(car_cam.local_address()));
+    recorder.on_event(make_cell_motion_event(empty_cam.local_address()));
+    std::map<std::string, std::string> by_camera;
+    for (const auto& e : bptr->events) by_camera[e.camera_ip] = e.sdt_json;
+    return by_camera;
+  };
+  const std::string car = car_cam.local_address();
+  const std::string empty = empty_cam.local_address();
+
+  const auto motion = run("motion");
+  CHECK(motion.count(car) == 1 && motion.at(car) == "[\"vehicle\"]",
+        "motion_nanodet: motion NanoDet-M classifies must be recorded as "
+        "vehicle");
+  CHECK(motion.count(empty) == 0,
+        "motion_nanodet: motion NanoDet-M cannot classify must not be "
+        "recorded");
+
+  const auto person = run("person");
+  CHECK(person.count(car) == 1 && person.at(car) == "[\"vehicle\"]",
+        "motion_nanodet: the person default still takes NanoDet-M's class");
+  CHECK(person.count(empty) == 1 && person.at(empty) == "[\"person\"]",
+        "motion_nanodet: the person default records unclassified motion "
+        "as person");
+}
+
 static void test_coalesce_window() {
   auto backend = std::make_unique<MockBackend>();
   MockBackend* bptr = backend.get();
@@ -3963,6 +4165,12 @@ int main() {
            [] { test_drop_unclassified_spares_line_crossing(); });
   run_test("drop_unclassified_without_snapshot",
            [] { test_drop_unclassified_without_snapshot(); });
+  run_test("default_object_type_each_value",
+           [] { test_default_object_type_each_value(); });
+  run_test("default_object_type_motion",
+           [] { test_default_object_type_motion(); });
+  run_test("default_object_type_motion_nanodet",
+           [&] { test_default_object_type_motion_nanodet(dir()); });
   run_test("uos_notify_payload_and_retry",
            [] { test_uos_notify_payload_and_retry(); });
   run_test("momentary_does_not_close_stateful_event",

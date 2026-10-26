@@ -8,6 +8,7 @@
 
 #include "runtime_config.hpp"
 
+#include <cctype>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -70,7 +71,8 @@ const std::vector<Entry>& Schema() {
      "such as line crossing are unaffected.  Cuts false-positive clutter from "
      "AI cameras (e.g. Reolink) that also emit noisy basic-motion events.  "
      "Recommended on Protect 7.1+, which records basic motion for "
-     "third-party cameras itself.",
+     "third-party cameras itself.  default_object_type=motion does the "
+     "same.",
      "Detection"},
     {"momentary_event_sec", Type::Int,
      "Synthetic duration for momentary ONVIF events -- topics that fire "
@@ -87,12 +89,19 @@ const std::vector<Entry>& Schema() {
      "How far back to scan during the startup coalesce pass.",
      "Detection"},
     {"default_object_type", Type::String,
-     "Default object type for events that arrive without a class "
-     "(e.g. 'motion', 'person', 'vehicle').",
+     "Object type recorded for events that arrive without a class, such as "
+     "generic motion that NanoDet-M cannot classify: person (default), "
+     "vehicle, animal, package or motion.  motion records no smart "
+     "detection for unclassified generic motion and leaves it to "
+     "Protect's own motion events, as drop_unclassified_motion does.  "
+     "Protect older than 7.1 creates no motion events for third-party "
+     "cameras, so there motion leaves that motion unrecorded.",
      "Detection"},
     {"camera_object_types", Type::String,
      "Per-camera type overrides as comma-separated ip=type pairs, e.g. "
-     "192.168.1.108=person,192.168.1.109=vehicle.",
+     "192.168.1.108=person,192.168.1.109=vehicle.  Applies to every event "
+     "from that camera, camera AI events included.  Types: person, "
+     "vehicle, animal, package.",
      "Detection"},
     {"disabled_object_types", Type::String,
      "Object types never recorded for third-party cameras, comma-separated "
@@ -297,6 +306,12 @@ std::string json_escape(const std::string& s) {
   return out;
 }
 
+std::string trim(const std::string& s) {
+  const size_t b = s.find_first_not_of(" \t");
+  if (b == std::string::npos) return {};
+  return s.substr(b, s.find_last_not_of(" \t") - b + 1);
+}
+
 std::string read_file(const std::string& path) {
   std::ifstream f(path);
   if (!f.is_open()) return {};
@@ -371,6 +386,51 @@ absl::Status WriteToFile(const std::string& path,
   }
   if (std::rename(tmp.c_str(), path.c_str()) != 0)
     return absl::InternalError("rename " + tmp + " -> " + path + " failed");
+  return absl::OkStatus();
+}
+
+std::string NormalizeObjectType(const std::string& type) {
+  std::string t = trim(type);
+  for (char& c : t)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return t;
+}
+
+absl::Status ValidateObjectType(const std::string& type, bool allow_motion) {
+  const std::string t = NormalizeObjectType(type);
+  if (t == "person" || t == "vehicle" || t == "animal" || t == "package")
+    return absl::OkStatus();
+  if (t == "motion" && allow_motion) return absl::OkStatus();
+  std::string msg = "unknown object type \"" + type + "\"; valid values: "
+                    "person, vehicle, animal, package";
+  msg += allow_motion ? ", motion"
+                      : " (motion applies to default_object_type only)";
+  return absl::InvalidArgumentError(msg);
+}
+
+absl::Status ValidateValue(const std::string& name, const std::string& value) {
+  if (value.empty()) return absl::OkStatus();
+  if (name == "default_object_type")
+    return ValidateObjectType(value, /*allow_motion=*/true);
+  if (name != "camera_object_types") return absl::OkStatus();
+  size_t pos = 0;
+  while (pos <= value.size()) {
+    size_t comma = value.find(',', pos);
+    if (comma == std::string::npos) comma = value.size();
+    const std::string pair = trim(value.substr(pos, comma - pos));
+    pos = comma + 1;
+    if (pair.empty()) continue;
+    const size_t eq = pair.find('=');
+    if (eq == std::string::npos || eq == 0)
+      return absl::InvalidArgumentError("\"" + pair +
+                                        "\" is not an ip=type pair");
+    const std::string type = pair.substr(eq + 1);
+    if (trim(type).empty()) continue;  // ip= sets no override
+    absl::Status s = ValidateObjectType(type, /*allow_motion=*/false);
+    if (!s.ok())
+      return absl::InvalidArgumentError(pair.substr(0, eq) + ": " +
+                                        std::string(s.message()));
+  }
   return absl::OkStatus();
 }
 

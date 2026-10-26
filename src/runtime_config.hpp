@@ -50,6 +50,21 @@ std::map<std::string, std::string> ReadFromFile(const std::string& path);
 absl::Status WriteToFile(const std::string& path,
                          const std::map<std::string, std::string>& values);
 
+// @p type lower-cased and without surrounding spaces, the form object
+// types are compared in.
+std::string NormalizeObjectType(const std::string& type);
+
+// Checks one object type: person, vehicle, animal or package, plus motion
+// when @p allow_motion (default_object_type only).  Case and surrounding
+// spaces are ignored.  The error message names the valid values.
+absl::Status ValidateObjectType(const std::string& type, bool allow_motion);
+
+// Checks @p value against the values setting @p name accepts beyond what
+// its flag type allows: default_object_type takes one object type, and
+// camera_object_types takes ip=type pairs.  OK for every other setting
+// and for an empty value, which clears the setting.
+absl::Status ValidateValue(const std::string& name, const std::string& value);
+
 }  // namespace runtime_config
 
 #endif  // SRC_RUNTIME_CONFIG_HPP_

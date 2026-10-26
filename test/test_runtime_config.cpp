@@ -19,6 +19,7 @@
 #include <string>
 
 #include "absl/flags/flag.h"
+#include "absl/status/status.h"
 
 #include "runtime_config.hpp"
 
@@ -197,6 +198,91 @@ static void test_event_proxy_entry() {
         "protect_event_proxy_cameras set to the saved CSV");
 }
 
+// ---------------------------------------------------------------
+// Test: object types.  default_object_type takes the four Protect types
+// plus motion; a camera_object_types override takes the four types only.
+// ---------------------------------------------------------------
+static void test_validate_object_type() {
+  using runtime_config::ValidateObjectType;
+  for (const char* t : {"person", "vehicle", "animal", "package"}) {
+    check(ValidateObjectType(t, /*allow_motion=*/true).ok(),
+          std::string(t) + " is a valid default_object_type");
+    check(ValidateObjectType(t, /*allow_motion=*/false).ok(),
+          std::string(t) + " is a valid camera override");
+  }
+  check(ValidateObjectType("motion", /*allow_motion=*/true).ok(),
+        "motion is a valid default_object_type");
+  check(ValidateObjectType(" Vehicle ", /*allow_motion=*/false).ok(),
+        "case and surrounding spaces are ignored");
+  check(runtime_config::NormalizeObjectType("  MoTion\t") == "motion",
+        "NormalizeObjectType lower-cases and trims");
+
+  const absl::Status motion_override =
+      ValidateObjectType("motion", /*allow_motion=*/false);
+  check(!motion_override.ok(), "motion is not a valid camera override");
+  check(std::string(motion_override.message()).find("default_object_type") !=
+            std::string::npos,
+        "the camera override error says where motion applies: " +
+            std::string(motion_override.message()));
+
+  const absl::Status dog = ValidateObjectType("dog", /*allow_motion=*/true);
+  check(!dog.ok(), "dog is rejected");
+  check(dog.code() == absl::StatusCode::kInvalidArgument,
+        "unknown type is InvalidArgument");
+  check(std::string(dog.message()).find(
+            "person, vehicle, animal, package, motion") != std::string::npos,
+        "the error names the valid values: " + std::string(dog.message()));
+  check(!ValidateObjectType("", /*allow_motion=*/true).ok(),
+        "an empty type is not an object type");
+  check(!ValidateObjectType("human", /*allow_motion=*/true).ok(),
+        "only the documented names are accepted");
+}
+
+// ---------------------------------------------------------------
+// Test: ValidateValue checks the object-type settings and passes every
+// other setting through.
+// ---------------------------------------------------------------
+static void test_validate_value() {
+  using runtime_config::ValidateValue;
+  check(ValidateValue("default_object_type", "motion").ok(),
+        "default_object_type=motion accepted");
+  check(ValidateValue("default_object_type", "animal").ok(),
+        "default_object_type=animal accepted");
+  check(ValidateValue("default_object_type", "").ok(),
+        "clearing default_object_type accepted");
+  const absl::Status bad_default =
+      ValidateValue("default_object_type", "cat");
+  check(!bad_default.ok(), "default_object_type=cat rejected");
+  check(std::string(bad_default.message()).find("\"cat\"") !=
+            std::string::npos,
+        "the error names the rejected value: " +
+            std::string(bad_default.message()));
+
+  check(ValidateValue("camera_object_types",
+                      "192.168.1.108=animal,192.168.1.109=Package").ok(),
+        "valid camera overrides accepted");
+  check(ValidateValue("camera_object_types",
+                      "192.168.1.108=animal, ,192.168.1.110=,").ok(),
+        "empty entries and ip= (no override) accepted");
+  const absl::Status motion_cam =
+      ValidateValue("camera_object_types",
+                    "192.168.1.108=animal,192.168.1.109=motion");
+  check(!motion_cam.ok(), "a camera override of motion is rejected");
+  check(std::string(motion_cam.message()).find("192.168.1.109") !=
+            std::string::npos,
+        "the error names the camera: " + std::string(motion_cam.message()));
+  check(!ValidateValue("camera_object_types", "192.168.1.108=dog").ok(),
+        "an unknown camera override is rejected");
+  check(!ValidateValue("camera_object_types", "192.168.1.108").ok(),
+        "an entry without = is rejected");
+  check(!ValidateValue("camera_object_types", "=animal").ok(),
+        "an entry without an ip is rejected");
+
+  check(ValidateValue("first_party_fallback_class", "anything").ok(),
+        "other settings are not checked here");
+  check(ValidateValue("verbose", "true").ok(), "bool settings pass through");
+}
+
 int main(int /*argc*/, char* argv[]) {
   // ParseCommandLine is not strictly required for SetFlag/GetFlag, but
   // calling it ensures any platform-specific absl init runs.
@@ -209,6 +295,8 @@ int main(int /*argc*/, char* argv[]) {
   test_missing_file();
   test_write_then_read();
   test_event_proxy_entry();
+  test_validate_object_type();
+  test_validate_value();
 
   std::cout << "test_runtime_config: " << g_pass << " passed, "
             << g_fail << " failed\n";
