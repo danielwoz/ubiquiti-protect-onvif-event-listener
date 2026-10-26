@@ -236,6 +236,19 @@ onvif-recorder holds the only subscription and passes the events on to Protect; 
 [Sharing a camera's events with Protect](#sharing-a-cameras-events-with-protect). A Reolink
 camera can show the same status for a different reason; see below.
 
+**Third-party camera records nothing after Protect restarts?** Protect decides whether to
+record each camera when it starts. A third-party camera in Events Only (or Adaptive) mode
+whose motion detection shows as misconfigured at that moment, and for which Protect has not
+loaded onvif-recorder's smart detection setting, is not recorded, and Protect does not check
+again when motion detection becomes available. Its motion events are then dropped until
+Protect restarts. onvif-recorder checks for this every minute once Protect has run for five
+minutes: when the same camera is still not recording a minute later while other cameras
+record, it re-applies the camera's smart detection setting and restarts Protect
+(`[healer] recording-stuck` in the log; not with
+`--auto_heal_protect=false`, and within the limit of 4 Protect restarts a day). To fix it by
+hand, once Protect shows the camera's motion detection as available, switch the camera's
+recording mode to Always and back, or restart Protect.
+
 **Duplicate motion and "person" events?** From Protect 7.1, Protect subscribes to a
 third-party camera's ONVIF motion itself and creates the basic motion events.
 onvif-recorder never writes plain motion events, but by default it records motion

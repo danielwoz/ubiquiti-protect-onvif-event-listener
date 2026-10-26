@@ -91,11 +91,20 @@ cc_library(
 )
 
 cc_library(
+    name = "json_value",
+    srcs = ["src/json_value.cpp"],
+    hdrs = ["src/json_value.hpp"],
+    strip_include_prefix = "src",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "wedge_healer",
     srcs = ["src/wedge_healer.cpp"],
     hdrs = ["src/wedge_healer.hpp"],
     strip_include_prefix = "src",
     deps = [
+        ":json_value",
         ":pg_stats",
         "@com_google_absl//absl/log:log",
     ],

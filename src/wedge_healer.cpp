@@ -17,11 +17,14 @@
 #include <fstream>
 #include <ctime>
 #include <cstdlib>
+#include <iterator>
 #include <mutex>  // NOLINT(build/c++11)
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/log/log.h"
+#include "json_value.hpp"
 #include "pg_stats.hpp"
 
 namespace onvif {
@@ -43,13 +46,17 @@ constexpr const char* kRestartCmdFlagDrift = "systemctl restart unifi-protect.se
 // Patched service.js is read only when the Protect process starts.
 constexpr const char* kRestartCmdPatchReload = "systemctl restart unifi-protect.service";  // NOLINT(whitespace/line_length)
 
+// Protect decides whether to record each camera when it starts.
+constexpr const char* kRestartCmdRecordingStuck = "systemctl restart unifi-protect.service";  // NOLINT(whitespace/line_length)
+
 const char* reason_str(WedgeHealer::Reason r) {
   switch (r) {
-    case WedgeHealer::Reason::kDbWedge:     return "DB";
-    case WedgeHealer::Reason::kMsrWedge:    return "MSR";
-    case WedgeHealer::Reason::kFlagDrift:   return "featureFlags-drift";
-    case WedgeHealer::Reason::kPatchReload: return "patch-reload";
-    default:                                return "none";
+    case WedgeHealer::Reason::kDbWedge:        return "DB";
+    case WedgeHealer::Reason::kMsrWedge:       return "MSR";
+    case WedgeHealer::Reason::kFlagDrift:      return "featureFlags-drift";
+    case WedgeHealer::Reason::kPatchReload:    return "patch-reload";
+    case WedgeHealer::Reason::kRecordingStuck: return "recording-stuck";
+    default:                                   return "none";
   }
 }
 
@@ -204,9 +211,10 @@ WedgeHealer::FireResult WedgeHealer::fire_restart(Reason r) {
   }
 
   const char* cmd_c = kRestartCmdMsrWedge;
-  if (r == Reason::kDbWedge)          cmd_c = kRestartCmdDbWedge;
-  else if (r == Reason::kFlagDrift)   cmd_c = kRestartCmdFlagDrift;
-  else if (r == Reason::kPatchReload) cmd_c = kRestartCmdPatchReload;
+  if (r == Reason::kDbWedge)             cmd_c = kRestartCmdDbWedge;
+  else if (r == Reason::kFlagDrift)      cmd_c = kRestartCmdFlagDrift;
+  else if (r == Reason::kPatchReload)    cmd_c = kRestartCmdPatchReload;
+  else if (r == Reason::kRecordingStuck) cmd_c = kRestartCmdRecordingStuck;
   const std::string cmd = cmd_c;
   if (r == Reason::kFlagDrift) {
     LOG(ERROR) << "[healer] " << reason_str(r)
@@ -217,6 +225,11 @@ WedgeHealer::FireResult WedgeHealer::fire_restart(Reason r) {
     LOG(ERROR) << "[healer] " << reason_str(r)
                << ": Protect started before service.js was patched and "
                   "only loads it at start-up -- running: " << cmd;
+  } else if (r == Reason::kRecordingStuck) {
+    LOG(ERROR) << "[healer] " << reason_str(r)
+               << ": Protect has not started recording a third-party camera "
+                  "it would now record, and decides that only at start-up "
+                  "-- running: " << cmd;
   } else {
     LOG(ERROR) << "[healer] " << reason_str(r)
                << " wedged for >" << kWindowSec
@@ -373,6 +386,57 @@ WedgeHealer::Reason WedgeHealer::check_patch_reload_for_testing() {
   return maybe_check_patch_reload(/*force=*/true);
 }
 
+WedgeHealer::Reason WedgeHealer::maybe_check_recording_stuck(bool force) {
+  if (!recording_stuck_) return Reason::kNone;
+  const auto now = std::chrono::steady_clock::now();
+  if (now < stuck_resume_at_) return Reason::kNone;
+  const bool checked_before =
+      stuck_checked_at_ != std::chrono::steady_clock::time_point();
+  if (!force && checked_before &&
+      now - stuck_checked_at_ < std::chrono::seconds(kRecordingStuckCheckSec)) {
+    return Reason::kNone;
+  }
+  stuck_checked_at_ = now;
+
+  std::vector<std::string> stuck = recording_stuck_();
+  std::sort(stuck.begin(), stuck.end());
+  stuck.erase(std::unique(stuck.begin(), stuck.end()), stuck.end());
+  // Only a camera reported on two checks in a row counts, so one that
+  // Protect is about to start recording anyway is not acted on.
+  std::vector<std::string> repeated;
+  std::set_intersection(stuck.begin(), stuck.end(), stuck_prev_.begin(),
+                        stuck_prev_.end(), std::back_inserter(repeated));
+  stuck_prev_ = std::move(stuck);
+  if (repeated.empty()) return Reason::kNone;
+
+  std::string ids;
+  for (const auto& id : repeated) {
+    if (!ids.empty()) ids += ", ";
+    ids += id;
+  }
+  LOG(WARNING) << "[healer] Protect has still not started recording "
+               << repeated.size() << " camera(s) it would record: " << ids;
+  const FireResult fr = fire_restart(Reason::kRecordingStuck);
+  if (fr == FireResult::kRan) {
+    stuck_prev_.clear();
+  } else if (fr == FireResult::kGaveUp) {
+    // Pause instead of retrying every minute against a cap that lifts
+    // only as earlier restarts age out of the 24 h window.
+    stuck_prev_.clear();
+    stuck_resume_at_ = now + std::chrono::seconds(kRecordingStuckBackoffSec);
+    LOG(WARNING) << "[healer] Protect is still not recording " << ids
+                 << " but the restart cap is reached; checking again in "
+                 << kRecordingStuckBackoffSec / 60
+                 << " min. Switch the camera's recording mode to Always and "
+                    "back, or restart unifi-protect, to start it now.";
+  }
+  return Reason::kRecordingStuck;
+}
+
+WedgeHealer::Reason WedgeHealer::check_recording_stuck_for_testing() {
+  return maybe_check_recording_stuck(/*force=*/true);
+}
+
 void WedgeHealer::run() {
   // Sleep in 1-second slices so stop() is prompt.  Tick cadence: 10 s.
   constexpr int kTickSec = 10;
@@ -393,7 +457,8 @@ void WedgeHealer::run() {
       continue;  // one action per tick
     }
     if (maybe_check_flag_drift(/*force=*/false) != Reason::kNone) continue;
-    maybe_check_patch_reload(/*force=*/false);
+    if (maybe_check_patch_reload(/*force=*/false) != Reason::kNone) continue;
+    maybe_check_recording_stuck(/*force=*/false);
   }
 }
 
@@ -476,6 +541,83 @@ bool protect_holds_cleared_license_plate(
   return sdt != std::string::npos && api_body[sdt] == '[' &&
          array_lists_license_plate(api_body, sdt) &&
          db_smart_detect_types.find(kLicensePlate) == std::string::npos;
+}
+
+namespace {
+
+bool member_true(const json::Value& obj, const char* name) {
+  const json::Value* v = obj.member(name);
+  return v != nullptr && v->is_true();
+}
+
+ProtectRecordingState recording_state_of(const json::Value& cam) {
+  ProtectRecordingState st;
+  if (cam.type != json::Value::Type::kObject) return st;
+  st.valid = true;
+  const json::Value* state = cam.member("state");
+  st.connected = state != nullptr && state->is_string("CONNECTED");
+  st.recording_started = member_true(cam, "hasRecordingStarted");
+  st.paired_with_ai_port = member_true(cam, "isPairedWithAiPort");
+
+  const json::Value* started = cam.member("hasRecordingStarted");
+  if (started == nullptr || !started->is_false()) return st;
+  if (!member_true(cam, "isThirdPartyCamera") ||
+      !member_true(cam, "isAdopted") || !st.connected) {
+    return st;
+  }
+  const json::Value* mode = cam.find({"recordingSettings", "mode"});
+  if (mode == nullptr || mode->type != json::Value::Type::kString ||
+      mode->text == "never") {
+    return st;
+  }
+  // With geofencing "allAway" Protect stops recording while someone is
+  // home, which the camera body does not show.
+  const json::Value* geo = cam.find({"recordingSettings", "geofencing"});
+  if (geo != nullptr && geo->is_string("allAway")) return st;
+  if (member_true(cam, "isRecordingsPaused")) return st;
+  // Protect starts no recording for a camera without channels.
+  const json::Value* channels = cam.member("channels");
+  if (channels == nullptr || channels->type != json::Value::Type::kArray ||
+      channels->items.empty()) {
+    return st;
+  }
+  const json::Value* flags = cam.member("featureFlags");
+  const bool recordable =
+      mode->text == "always" || mode->text == "schedule" ||
+      (flags != nullptr && (member_true(*flags, "hasMotionDetection") ||
+                            member_true(*flags, "hasSmartDetect"))) ||
+      st.paired_with_ai_port;
+  st.stuck = recordable;
+  return st;
+}
+
+}  // namespace
+
+ProtectRecordingState read_protect_recording_state(
+    const std::string& api_body) {
+  json::Value cam;
+  if (!json::parse(api_body, &cam)) return {};
+  return recording_state_of(cam);
+}
+
+bool protect_lists_recording_camera(
+    const std::string& api_body, const std::vector<std::string>& ignore_ids) {
+  json::Value cams;
+  if (!json::parse(api_body, &cams) ||
+      cams.type != json::Value::Type::kArray) {
+    return false;
+  }
+  for (const auto& cam : cams.items) {
+    const json::Value* id = cam.member("id");
+    if (id == nullptr || id->type != json::Value::Type::kString) continue;
+    if (std::find(ignore_ids.begin(), ignore_ids.end(), id->text) !=
+        ignore_ids.end()) {
+      continue;
+    }
+    const ProtectRecordingState st = recording_state_of(cam);
+    if (st.connected && st.recording_started) return true;
+  }
+  return false;
 }
 
 }  // namespace onvif

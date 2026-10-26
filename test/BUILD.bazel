@@ -430,7 +430,10 @@ cc_test(
     name = "test_wedge_healer",
     srcs = ["test_wedge_healer.cpp"],
     linkstatic = True,
-    deps = ["//:wedge_healer"],
+    deps = [
+        "//:json_value",
+        "//:wedge_healer",
+    ],
 )
 
 filegroup(

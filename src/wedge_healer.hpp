@@ -27,8 +27,8 @@ namespace onvif {
 
 // Background thread that watches for wedged Protect state and issues a
 // targeted `systemctl restart` when it fires.  Besides the featureFlags
-// drift and patch-reload checks below, there are two independent wedge
-// signals:
+// drift, patch-reload and recording-stuck checks below, there are two
+// independent wedge signals:
 //
 //   * DB wedge   -- pg_stats has seen at least one query timeout in the
 //                    last kWindowSec and zero successful queries in the
@@ -83,6 +83,7 @@ class WedgeHealer {
     kMsrWedge,
     kFlagDrift,
     kPatchReload,
+    kRecordingStuck,
   };
 
   // How often the patch-reload check runs.  A restart needs two positive
@@ -97,6 +98,18 @@ class WedgeHealer {
   // a file we patched (service.js written after Protect started), so only a
   // restart loads the patch.  Called on the monitor thread.
   using PatchReloadFn = std::function<bool()>;
+
+  // How often the recording-stuck check runs.  A restart needs the same
+  // camera reported on two checks in a row.
+  static constexpr int kRecordingStuckCheckSec = 60;
+  // Pause after the daily cap stops a recording-stuck restart.
+  static constexpr int kRecordingStuckBackoffSec = 60 * 60;
+
+  // Callback that returns the IDs of cameras Protect would record but has
+  // not started recording (see read_protect_recording_state()).  Protect
+  // decides this only at start-up, so only a restart clears it (#70).
+  // Called on the monitor thread.
+  using RecordingStuckFn = std::function<std::vector<std::string>()>;
 
   // Callback that compares what we wrote into Postgres against what
   // Protect's API reports in memory, for the given camera IDs.  Returns
@@ -121,6 +134,9 @@ class WedgeHealer {
   void set_flag_drift_fn(FlagDriftFn fn) { flag_drift_ = std::move(fn); }
   void set_patch_reload_fn(PatchReloadFn fn) {
     patch_reload_ = std::move(fn);
+  }
+  void set_recording_stuck_fn(RecordingStuckFn fn) {
+    recording_stuck_ = std::move(fn);
   }
 
   /// Persist restart timestamps to @p path so the cooldown and the
@@ -173,6 +189,11 @@ class WedgeHealer {
   // restart, whether or not a safeguard then suppressed it.
   Reason check_patch_reload_for_testing();
 
+  // Exposed for unit tests: run the recording-stuck check immediately,
+  // bypassing its interval.  Returns kRecordingStuck when it asked for a
+  // restart, whether or not a safeguard then suppressed it.
+  Reason check_recording_stuck_for_testing();
+
   // Exposed for unit tests: behave as if the warmup period had passed.
   void end_warmup_for_testing() {
     boot_ = std::chrono::steady_clock::now() -
@@ -181,6 +202,9 @@ class WedgeHealer {
 
   // Exposed for unit tests: end a patch-reload pause after the daily cap.
   void end_patch_reload_backoff_for_testing() { patch_resume_at_ = {}; }
+
+  // Exposed for unit tests: end a recording-stuck pause after the daily cap.
+  void end_recording_stuck_backoff_for_testing() { stuck_resume_at_ = {}; }
 
  private:
   void run();
@@ -195,10 +219,14 @@ class WedgeHealer {
   // the last one (or @p force).  Returns kPatchReload if it requested a
   // restart.
   Reason maybe_check_patch_reload(bool force);
+  // Runs the recording-stuck check if kRecordingStuckCheckSec has passed
+  // since the last one (or @p force).  Returns kRecordingStuck if it
+  // requested a restart.
+  Reason maybe_check_recording_stuck(bool force);
   // Why a restart attempt did or didn't run.  The distinction matters for
-  // the flag-drift and patch-reload paths: warmup and cooldown lift within
-  // minutes and are worth retrying, while the daily cap lifts only as
-  // earlier restarts age out of the 24 h window.
+  // the flag-drift, patch-reload and recording-stuck paths: warmup and
+  // cooldown lift within minutes and are worth retrying, while the daily
+  // cap lifts only as earlier restarts age out of the 24 h window.
   enum class FireResult {
     kRan,          // command executed
     kWaitAndRetry, // warmup or cooldown -- try again later
@@ -214,6 +242,12 @@ class WedgeHealer {
   std::chrono::steady_clock::time_point patch_checked_at_{};
   int                               patch_stale_streak_ = 0;
   std::chrono::steady_clock::time_point patch_resume_at_{};
+  // Recording-stuck check state; only touched by the monitor thread.
+  // stuck_prev_ holds the sorted IDs the previous check reported.
+  RecordingStuckFn                  recording_stuck_;
+  std::chrono::steady_clock::time_point stuck_checked_at_{};
+  std::vector<std::string>          stuck_prev_;
+  std::chrono::steady_clock::time_point stuck_resume_at_{};
   // Pending one-shot drift check, guarded by drift_mu_.  armed_at_ is
   // default-constructed when nothing is pending.
   mutable std::mutex                drift_mu_;
@@ -263,6 +297,34 @@ std::string describe_protect_flag_drift(
 /// no longer does.
 bool protect_holds_cleared_license_plate(
     const std::string& api_body, const std::string& db_smart_detect_types);
+
+/// A camera's recording state as Protect reports it in its
+/// `GET /api/cameras/<id>` body.
+struct ProtectRecordingState {
+  bool valid = false;              // the body is a JSON object
+  bool connected = false;          // state "CONNECTED"
+  bool recording_started = false;  // hasRecordingStarted
+  bool paired_with_ai_port = false;
+  // Protect would record this third-party camera now but has not started
+  // recording it.  Protect decides whether to record a camera at start-up
+  // and when its recording mode changes.  A third-party camera in a mode
+  // other than always, never or schedule counts as "never record" unless
+  // featureFlags.hasMotionDetection, featureFlags.hasSmartDetect or
+  // isPairedWithAiPort is true, and Protect does not re-check when one of
+  // those becomes true later, so the camera stays unrecorded until Protect
+  // restarts (#70).  Set when the camera is third-party, adopted,
+  // CONNECTED, has channels, is not paused or held back by geofencing,
+  // its recordingSettings.mode is not "never", Protect would record it now
+  // (mode always or schedule, or one of the three flags true), and
+  // hasRecordingStarted is false.
+  bool stuck = false;
+};
+ProtectRecordingState read_protect_recording_state(const std::string& api_body);
+
+/// Whether Protect's `GET /api/cameras` body lists a connected camera whose
+/// recording has started, other than those in @p ignore_ids.
+bool protect_lists_recording_camera(const std::string& api_body,
+                                    const std::vector<std::string>& ignore_ids);
 
 }  // namespace onvif
 

@@ -36,6 +36,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>  // NOLINT(build/c++11)
 #include <set>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
@@ -381,8 +382,10 @@ ABSL_FLAG(bool, auto_heal_protect, true,
     "AND no successful queries in the same window) restarts "
     "msp+msr+unifi-protect; MSR wedge (MSR StoreSnapshots failing "
     "continuously) restarts msr only; Protect still reporting stale camera "
-    "featureFlags 60 s after we wrote them, or Protect having started "
-    "before we last patched service.js, restarts unifi-protect only. "
+    "featureFlags 60 s after we wrote them, Protect having started "
+    "before we last patched service.js, or Protect not having started "
+    "recording a managed third-party camera it would now record (two "
+    "checks a minute apart), restarts unifi-protect only. "
     "Safeguards: no restart in the first "
     "5 min after start, 5 min cooldown between restarts, hard cap of 4 "
     "restarts per 24 h. Every restart is logged at ERROR level and "
@@ -1722,6 +1725,13 @@ int main(int argc, char* argv[]) {
     motion_poller->start();
   }
 
+  // Third-party cameras the recorder manages, including those the rescan
+  // thread adds later.  Read by the healer's recording-stuck check.
+  std::mutex managed_ids_mu;
+  std::set<std::string> managed_ids;
+  for (const auto& c : managed)
+    if (!c.id.empty()) managed_ids.insert(c.id);
+
   // Auto-heal: monitor pg_stats + msr for wedged Protect services and
   // issue targeted `systemctl restart` if the wedge persists >60 s.
   // See --auto_heal_protect flag docs for signal + safeguards.
@@ -1746,7 +1756,7 @@ int main(int argc, char* argv[]) {
     const std::string protect_url_for_drift =
         absl::GetFlag(FLAGS_protect_url);
     healer->set_flag_drift_fn(
-        [protect_url_for_drift, &protect_user_id_provider, cam_db,
+        [protect_url_for_drift, &protect_user_id_provider, cam_db, cam_log,
          first_party = first_party_managed_ids,
          excluded = std::set<std::string>(excluded_ids.begin(),
                                           excluded_ids.end())](
@@ -1762,14 +1772,39 @@ int main(int argc, char* argv[]) {
         LOG(WARNING) << "[healer] drift check: " << db_or.status().message();
         return drifted;
       }
-      for (const auto& [cam_id, db_json] : *db_or) {
-        // We only care about cameras we actually enabled.  An empty
-        // array in the DB means we never pinned this one, so there is
-        // nothing for Protect to be stale about.
-        if (db_json.empty() || db_json == "[]") continue;
+      for (const auto& [cam_id, stored_json] : *db_or) {
+        std::string db_json = stored_json;
+        // An empty array on a first-party or excluded camera means we never
+        // pinned it, so there is nothing for Protect to be stale about.
+        const bool cleared = db_json.empty() || db_json == "[]";
+        if (cleared && (first_party.count(cam_id) || excluded.count(cam_id)))
+          continue;
         const std::string body = onvif::AlarmNotifier::protect_api_get(
             protect_url_for_drift + "/api/cameras/" + cam_id, user_id);
         if (body.empty()) continue;  // API unreachable; not evidence of drift
+        if (cleared) {
+          // On a managed third-party camera the setting the recorder wrote
+          // has been overwritten, typically by Protect saving the flags it
+          // holds in memory.  Write it again so the restart below loads it
+          // (#70).  A camera since paired with an AI Port is Protect's.
+          const auto rec = onvif::read_protect_recording_state(body);
+          if (!rec.valid || rec.paired_with_ai_port) continue;
+          onvif::CameraConfig cam;
+          cam.id = cam_id;
+          if (auto s = unifi::enable_smart_detect(
+                  std::vector<onvif::CameraConfig>{cam}, cam_db, cam_log);
+              !s.ok()) {
+            LOG(WARNING) << "[healer] drift check: " << s.message();
+            continue;
+          }
+          auto again = unifi::read_smart_detect_flags({cam_id}, cam_db);
+          if (!again.ok() || again->empty() || again->begin()->second == "[]")
+            continue;
+          db_json = again->begin()->second;
+          LOG(WARNING) << "[healer] camera " << cam_id
+                       << " had lost its smart detection setting in postgres;"
+                          " re-applied";
+        }
         // For an excluded camera only a licensePlate entry we removed
         // matters.  First-party flags are re-synced from the device, so
         // licensePlate is compared for third-party cameras only.
@@ -1795,6 +1830,79 @@ int main(int argc, char* argv[]) {
     // takes effect only after a restart.
     if (patch_protect)
       healer->set_patch_reload_fn(&protect_ui::protect_predates_service_js);
+    // Recording-stuck check (#70): Protect decides whether to record a
+    // camera at start-up, and an Events-only third-party camera whose
+    // motion detection becomes available later stays unrecorded until
+    // Protect restarts.
+    healer->set_recording_stuck_fn(
+        [protect_url_for_drift, &protect_user_id_provider, cam_db, cam_log,
+         &managed_ids_mu, &managed_ids, protect_pid = pid_t{0},
+         pid_seen_at = std::chrono::steady_clock::time_point{}]() mutable
+            -> std::vector<std::string> {
+      std::vector<std::string> stuck;
+      if (protect_url_for_drift.empty()) return stuck;
+      const std::string user_id = protect_user_id_provider.current();
+      if (user_id.empty()) return stuck;
+      // Protect starts recording its cameras within a minute or two of
+      // starting; leave it 5 min before counting a camera as stuck.
+      const pid_t pid = protect_ui::protect_main_pid();
+      const auto now = std::chrono::steady_clock::now();
+      if (pid != protect_pid) {
+        protect_pid = pid;
+        pid_seen_at = now;
+      }
+      if (pid <= 0 || now - pid_seen_at < std::chrono::minutes(5))
+        return stuck;
+
+      std::vector<std::string> ids;
+      {
+        std::lock_guard<std::mutex> lk(managed_ids_mu);
+        ids.assign(managed_ids.begin(), managed_ids.end());
+      }
+      std::vector<std::string> candidates;
+      bool other_recording = false;
+      for (const auto& id : ids) {
+        const std::string body = onvif::AlarmNotifier::protect_api_get(
+            protect_url_for_drift + "/api/cameras/" + id, user_id);
+        if (body.empty()) return stuck;  // API unreachable; judge nothing
+        const auto st = onvif::read_protect_recording_state(body);
+        // A camera paired with an AI Port is Protect's to manage.
+        if (st.stuck && !st.paired_with_ai_port) {
+          candidates.push_back(id);
+        } else if (st.connected && st.recording_started) {
+          other_recording = true;
+        }
+      }
+      if (candidates.empty()) return stuck;
+      // Count a camera only while Protect records another one, so a
+      // recording outage such as MSR being down is not taken for this.
+      if (!other_recording) {
+        other_recording = onvif::protect_lists_recording_camera(
+            onvif::AlarmNotifier::protect_api_get(
+                protect_url_for_drift + "/api/cameras", user_id),
+            candidates);
+      }
+      if (!other_recording) {
+        LOG(INFO) << "[healer] " << candidates.size()
+                  << " camera(s) not recording, but neither is any other "
+                     "camera; not treating it as recording-stuck";
+        return stuck;
+      }
+      // Re-apply the smart detection setting, so the restart also loads
+      // hasSmartDetect=true and the camera stays recordable at later
+      // start-ups.
+      std::vector<onvif::CameraConfig> cams;
+      for (const auto& id : candidates) {
+        LOG(INFO) << "[healer] camera " << id
+                  << ": Protect would record it but has not started";
+        onvif::CameraConfig cam;
+        cam.id = id;
+        cams.push_back(std::move(cam));
+      }
+      if (auto s = unifi::enable_smart_detect(cams, cam_db, cam_log); !s.ok())
+        LOG(WARNING) << "[healer] recording-stuck: " << s.message();
+      return candidates;
+    });
     healer->start();
     LOG(INFO) << "[healer] auto-heal enabled (window="
               << onvif::WedgeHealer::kWindowSec << "s, warmup="
@@ -1927,6 +2035,10 @@ int main(int argc, char* argv[]) {
           !s.ok())
         LOG(WARNING) << "[rescan] ensure_smart_detect_zones: "
                      << s.message();
+      {
+        std::lock_guard<std::mutex> lk(managed_ids_mu);
+        for (const auto& c : fresh) managed_ids.insert(c.id);
+      }
       for (auto cam : fresh) {
         cam.max_consecutive_failures = 3;
         known_ids.insert(cam.id);
