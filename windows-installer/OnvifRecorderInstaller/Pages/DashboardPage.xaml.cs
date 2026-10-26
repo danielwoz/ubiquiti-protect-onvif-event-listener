@@ -53,7 +53,9 @@ public partial class DashboardPage : Page {
     }
 
     private void Reinstall_Click(object sender, RoutedEventArgs e) {
-        _main.Go(new InstallPage(_main, InstallPage.Mode.Install));
+        // Through the channel page, so a re-install pins or follows Protect's
+        // channel by the same rule as the first install.
+        _main.Go(new ChannelPage(_main, fromDashboard: true));
     }
 
     private void OpenAdmin_Click(object sender, RoutedEventArgs e) {

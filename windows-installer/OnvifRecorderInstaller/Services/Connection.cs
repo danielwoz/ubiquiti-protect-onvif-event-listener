@@ -21,6 +21,9 @@ public sealed class Connection {
     public string? PrivateKeyPassphrase { get; set; }
     public string? HostFingerprint { get; set; }
     public string Channel { get; set; } = "stable";
+    // Whether the next install pins Channel on the device. Set by the
+    // channel page before every install; not persisted.
+    public bool PinChannel { get; set; }
     public string? LastInstalledVersion { get; set; }
 
     public bool HasCredentials =>

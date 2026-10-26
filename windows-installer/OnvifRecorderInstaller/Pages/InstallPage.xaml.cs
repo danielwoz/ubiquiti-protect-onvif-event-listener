@@ -33,7 +33,7 @@ public partial class InstallPage : Page {
         AppendLine($"$ # {_mode} on {_main.Connection.Host}");
         string script = _mode switch {
             Mode.Install => InstallScripts.BuildInstallScript(
-                _main.Connection.Channel),
+                _main.Connection.Channel, _main.Connection.PinChannel),
             Mode.Upgrade => InstallScripts.BuildUpgradeScript(),
             Mode.Uninstall => InstallScripts.BuildUninstallScript(),
             _ => throw new InvalidOperationException(),

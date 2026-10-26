@@ -11,13 +11,25 @@ public static class InstallScripts {
     public const string SourcesFile =
         "/etc/apt/sources.list.d/onvif-recorder.list";
     public const string ChannelFile = "/etc/onvif-recorder/channel";
+    public const string PinnedChannelFile = "/etc/onvif-recorder/channel.pinned";
     public const string RunnablesYaml = "/data/unifi-core/config/runnables.yaml";
 
     public static readonly IReadOnlyList<string> ValidChannels =
         new[] { "stable", "rc", "early-access" };
 
-    public static string BuildInstallScript(string channel) {
+    // pinChannel writes channel.pinned with the same content as the admin
+    // page's channel Apply, so detect-channel.sh (run by postinst and the
+    // daily channel timer) keeps the channel instead of resetting it to
+    // Protect's. Without it any earlier pin is removed and the device
+    // follows Protect's channel.
+    public static string BuildInstallScript(string channel, bool pinChannel) {
         ValidateChannel(channel);
+        var pinCommand = pinChannel
+            ? $"echo \"{channel}\" > {PinnedChannelFile}"
+            : $"rm -f {PinnedChannelFile}";
+        var pinMessage = pinChannel
+            ? $"echo \"==> Channel: {channel} (pinned)\""
+            : $"echo \"==> Channel: {channel} (follows the Protect release channel)\"";
         return $$"""
             set -e
             export DEBIAN_FRONTEND=noninteractive
@@ -30,6 +42,8 @@ public static class InstallScripts {
 
             mkdir -p /etc/onvif-recorder
             echo "{{channel}}" > {{ChannelFile}}
+            {{pinCommand}}
+            {{pinMessage}}
 
             echo "deb [arch=arm64 signed-by={{Keyring}}] {{RepoUrl}} {{channel}} main" \
               > {{SourcesFile}}
@@ -102,8 +116,43 @@ public static class InstallScripts {
             """;
     }
 
+    // Prints the channel pinned on the device by the admin page or an
+    // earlier install, or nothing when it is not pinned.
+    public static string BuildReadPinnedChannelScript() {
+        return $"cat {PinnedChannelFile} 2>/dev/null | tr -d '[:space:]'";
+    }
+
     public static string BuildVersionScript() {
         return "dpkg-query -W -f='${Version}' onvif-recorder 2>/dev/null || echo ''";
+    }
+
+    // Returns the channel named in a script's output, or null when the
+    // output is empty or not one of ValidChannels.
+    public static string? ParseChannel(string? output) {
+        var channel = (output ?? "").Trim();
+        foreach (var v in ValidChannels) {
+            if (v == channel) return v;
+        }
+        return null;
+    }
+
+    // The channel the channel page selects first: the one already pinned on
+    // the device, then Protect's, then the one chosen in the last install.
+    public static string DefaultChannel(
+            string? pinnedChannel, string? protectChannel, string savedChannel) {
+        return pinnedChannel ?? protectChannel ?? ParseChannel(savedChannel) ?? "stable";
+    }
+
+    // An install pins the chosen channel when it differs from Protect's,
+    // when Protect's channel could not be read (null), or when the device is
+    // already pinned to it, so the choice survives postinst and the daily
+    // channel timer. Choosing Protect's channel otherwise leaves the device
+    // following Protect.
+    public static bool ShouldPinChannel(
+            string channel, string? protectChannel, string? pinnedChannel) {
+        return protectChannel == null
+            || channel != protectChannel
+            || channel == pinnedChannel;
     }
 
     public static void ValidateChannel(string channel) {

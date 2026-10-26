@@ -23,10 +23,15 @@ and run it. The GUI:
 1. Walks you through enabling SSH on your router
    (**UniFi OS → System → Advanced → SSH**).
 2. Tests the connection with the root password you set.
-3. Adds the apt repository + installs the package, streaming progress live.
-4. Saves the credentials (password encrypted with Windows DPAPI) in
+3. Selects the release channel matching your Protect channel. Keep it and
+   onvif-recorder follows Protect when you change Protect's channel; pick
+   another and onvif-recorder stays on that one until you change it on the
+   admin page.
+4. Adds the apt repository + installs the package, streaming progress live.
+5. Saves the credentials (password encrypted with Windows DPAPI) in
    `HKCU\Software\OnvifRecorderInstaller` so subsequent launches offer
-   one-click upgrade, re-install, or uninstall.
+   one-click upgrade or uninstall, and re-install after confirming the
+   channel.
 
 The installer is unsigned, so Windows SmartScreen will prompt the first
 time — click **More info → Run anyway**.

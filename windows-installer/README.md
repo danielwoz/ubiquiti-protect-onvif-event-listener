@@ -39,7 +39,7 @@ OnvifRecorderInstaller/
     WelcomePage                  # Intro + overview
     EnableSshPage                # Guide user through enabling SSH in UniFi OS
     ConnectPage                  # Host/user/password form, test connection
-    ChannelPage                  # Auto-detects Protect channel; user confirms
+    ChannelPage                  # Detects Protect channel + device pin; user confirms
     InstallPage                  # Streams install/upgrade/uninstall over SSH
     DonePage                     # Shown after fresh install
     DashboardPage                # Shown on subsequent launches (creds saved)
@@ -54,6 +54,24 @@ OnvifRecorderInstaller.Tests/
   InstallScriptsTests            # Verify script generation
   CredentialStoreTests           # Verify DPAPI + registry round-trip
 ```
+
+## Release channel
+
+The channel page (shown for a first install and for **Re-install** on the
+dashboard) reads Protect's release channel from
+`/data/unifi-core/config/runnables.yaml` and any channel already pinned in
+`/etc/onvif-recorder/channel.pinned`, and preselects the pinned channel,
+else Protect's.
+
+- Choosing Protect's channel, unless it is the one already pinned, removes
+  any pin, so the device keeps following Protect: `detect-channel.sh` (run
+  by `postinst` and the daily `onvif-recorder-channel.timer`) moves it
+  along when Protect's channel changes.
+- Choosing a different channel, choosing any channel when Protect's could
+  not be read, or keeping the channel already pinned writes
+  `channel.pinned` exactly as the admin page's channel **Apply** does, so
+  upgrades and the channel timer leave it alone. The admin page can change
+  it later.
 
 ## Where credentials live
 
