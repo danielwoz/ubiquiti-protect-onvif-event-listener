@@ -904,13 +904,15 @@ async function scenarioH(c) {
   }
 }
 
-// I: Protect's own event loop stalls for longer than the 4 s limit while
-// requests to the recorder are in flight, with two shared cameras that
-// would accept Protect's own subscription too.  I1: 6 s from just before
-// camera a's Renew is sent.  I2: 6 s from just after camera a's Pull is
-// sent, with a motion on, so the recorder's answer waits unread.  I3: 12 s
-// from just before camera a's Renew, which Protect's own 10 s request
-// timeout then cuts off.
+// I: Protect's own event loop stalls while requests to the recorder are in
+// flight, with two shared cameras that would accept Protect's own
+// subscription too.  I1: 6 s from just before camera a's Renew is sent.
+// I2: 6 s from just after camera a's Pull is sent, with a motion on, so the
+// recorder's answer waits unread.  I4: 4.5 s from just before both
+// cameras' Renews are sent.  I5: 3.5 s from just before both cameras'
+// Pulls are sent, so the recorder's 1 s hold ends after the 4 s limit has
+// passed on the clock.  I3: 12 s from just before camera a's Renew, which
+// Protect's own 10 s request timeout then cuts off.
 async function scenarioI(c) {
   const cams = await startCameras({ slots: 2, second: 2 });
   const rec = await startRecorder(cams, { stateDir: stateDir() });
@@ -976,6 +978,40 @@ async function scenarioI(c) {
   c.ok('I1, I2: no error counted on either camera', errors.a === 0 && errors.b === 0, errors);
   c.ok('I1, I2: the subscriptions are still the same',
     subA.subscriptionPath === pathA && subB.subscriptionPath === pathB);
+
+  // I4: 4.5 s from just before camera a's Renew, with camera b's Renew due
+  // in the same poll, so the stall ends after the 4 s limit but less than
+  // 1 s past it, before either Renew has reached the recorder.
+  const prefixB = recorderPrefix(cams, 1);
+  const R4 = rt.requests.length;
+  const renew4 = atNextRequest(rt, toA('Renew'), () => process.nextTick(() => stallProtect(4500)));
+  subA.terminationTime = Date.now() + 5000;
+  subB.terminationTime = Date.now() + 5000;
+  const r4 = await renew4;
+  await sched.waitTicks(2);
+  const r4b = rt.requests.slice(R4).find((r) => r.op === 'Renew' && r.path.startsWith(prefixB));
+  c.num('I4_renews', brief([r4, r4b].filter(Boolean)));
+  c.ok('I4: both Renews held up by a 4.5 s stall are answered by the recorder',
+    r4.status === 200 && r4b && r4b.status === 200, brief([r4, r4b].filter(Boolean)));
+
+  // I5: 3.5 s from just before camera a's Pull, with camera b's Pull in the
+  // same poll: the recorder holds each Pull up to 1 s, so its answers
+  // arrive after the 4 s limit has passed on the clock.
+  const R5 = rt.requests.length;
+  const pull5 = atNextRequest(rt, toA('PullMessages'),
+    () => process.nextTick(() => stallProtect(3500)));
+  const r5 = await pull5;
+  await sched.waitTicks(2);
+  const r5b = rt.requests.slice(R5).find((r) => r.op === 'PullMessages' &&
+    r.path.startsWith(prefixB) && r.t <= r5.t + 50);
+  c.num('I5_pulls', brief([r5, r5b].filter(Boolean)));
+  c.ok('I5: both Pulls held up by a 3.5 s stall are answered by the recorder',
+    r5.status === 200 && r5b && r5b.status === 200, brief([r5, r5b].filter(Boolean)));
+  c.ok('I4, I5: no error counted on either camera', errors.a === 0 && errors.b === 0, errors);
+  c.ok('I4, I5: both cameras keep their subscriptions on the recorder',
+    subA.subscriptionPath === pathA && subB.subscriptionPath === pathB &&
+      where(ctx, a.mac) === 'PROXY' && where(ctx, b.mac) === 'PROXY',
+    { a: where(ctx, a.mac), b: where(ctx, b.mac) });
 
   // I3: Protect's own 10 s timeout ends the Renew.
   const R3 = rt.requests.length;

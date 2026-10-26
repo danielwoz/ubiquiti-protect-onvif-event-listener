@@ -173,23 +173,26 @@ static const char* route_patch_refusal(const std::string& content,
 //     Renew and Unsubscribe on a subscription the recorder created) go to
 //     the recorder, also limited to 4 s, or 1 s for Unsubscribe, whose
 //     result Protect ignores.
-//   - A request whose limit has passed fails only after Protect's event
-//     loop has read its sockets once more, so an answer that has already
-//     arrived is used.  When the limit's timer runs more than 1 s late,
-//     Protect's event loop itself was blocked (a long garbage collection,
-//     say) and the request may not even have been sent yet, so the limit
-//     starts again from then.
+//   - A limit counts only time in which Protect's event loop runs on
+//     time.  It is measured in steps of at most 500 ms, and a step counts
+//     no more than its own length however late its timer runs, so time in
+//     which Protect's event loop itself was blocked (a long garbage
+//     collection, say), and the request perhaps not even sent yet, is left
+//     out.  When the limit is reached the request fails only after
+//     Protect's event loop has read its sockets once more, so an answer
+//     that has already arrived is used.
 //   - For 500 ms after a request for a camera times out, further requests
 //     to the recorder for that camera fail at once; other cameras' requests
 //     are not affected.  One Protect poll can chain several of them (a
 //     Renew, then the Create that replaces the subscription, then an
 //     Unsubscribe), so a recorder that has stopped answering holds a
 //     camera's poll for about 4 s, not 4 s per request; the next poll, at
-//     least about 1 s later, waits the full 4 s again.  An Unsubscribe
-//     never opens the window, and neither does a stall in Protect itself,
-//     so a stall does not send the Create that follows a failed Renew to
-//     the camera.  The window is measured on performance.now(), which
-//     wall-clock changes do not move.
+//     least about 1 s later, waits the full 4 s again.
+//   - An Unsubscribe, whose result Protect ignores, never opens the window.
+//     Nor does a stall in Protect, whose time is not counted, so a stall
+//     does not send the Create that follows a failed Renew to the camera.
+//     The window is measured on performance.now(), which wall-clock
+//     changes do not move.
 //   - A Renew of a subscription held directly on the camera first asks the
 //     recorder's /status whether it serves that camera now; if so the Renew
 //     fails, so Protect creates its next subscription through the recorder.
@@ -213,14 +216,14 @@ static const Patch kBackendPatchRoute = {
 "encodeURIComponent(e.port),"
 "__onvrW=__onvrSoapRaw.w||(__onvrSoapRaw.w=new Map),"
 "__onvrR=(q,u)=>{const n=Error(\"onvif-recorder: no answer\"),"
-"l=u?1e3:4e3;"
-"if(performance.now()<(__onvrW.get(__onvrK)||0))return Promise.reject(n);"
-"let h,d=0;return Promise.race([__onvrSoapRaw(q,1).finally(()=>{d=1}),"
-"new Promise((_,j)=>{const a=s=>{h=setTimeout(()=>{"
-"const z=performance.now()-s>l+1e3;setImmediate(()=>{if(d)return;"
-"if(z)return a(performance.now());"
-"u||__onvrW.set(__onvrK,performance.now()+500);j(n)})},l)};"
-"a(performance.now())})]).finally(()=>clearTimeout(h))};"
+"c=performance.now(),l=u?1e3:4e3;"
+"if(c<(__onvrW.get(__onvrK)||0))return Promise.reject(n);"
+"let h,d=0,g=0;return Promise.race([__onvrSoapRaw(q,1).finally(()=>{d=1}),"
+"new Promise((_,j)=>{const a=b=>{const k=Math.min(l-g,500);"
+"h=setTimeout(()=>{const t=performance.now();g+=Math.min(t-b,k);"
+"if(g<l)return a(t);setImmediate(()=>{if(d)return;"
+"u||__onvrW.set(__onvrK,performance.now()+500);j(n)})},k)};"
+"a(c)})]).finally(()=>clearTimeout(h))};"
 "if(e.path.startsWith(__onvrP))"
 "return __onvrR(__onvrO,__onvrB.Unsubscribe);"
 "if(__onvrB.CreatePullPointSubscription)try{"
