@@ -290,7 +290,8 @@ class ProtectClient {
   }
 
   // Pull in a loop, renewing every 3 s, until stop_loop().  A transport
-  // error waits 2 s before the next request, as Protect's next poll would.
+  // error, on a pull or a renew, waits 2 s before the next request, as
+  // Protect's next poll would.
   void start_loop() {
     stop_ = false;
     thread_ = std::thread([this] {
@@ -307,8 +308,12 @@ class ProtectClient {
           continue;
         }
         if (steady_clock::now() - last_renew >= seconds(3)) {
-          renew();
+          const bool lost = renew().transport_error;
           last_renew = steady_clock::now();
+          if (lost) {
+            sleep_interruptible(milliseconds(2000));
+            continue;
+          }
         }
         sleep_interruptible(milliseconds(50));
       }
