@@ -381,6 +381,7 @@ cc_test(
     env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},
     deps = [
         "//:admin_server",
+        "@com_google_absl//absl/flags:flag",
     ],
 )
 

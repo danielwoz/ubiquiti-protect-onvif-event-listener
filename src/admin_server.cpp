@@ -1559,6 +1559,21 @@ std::pair<int, std::string> handle_config(const Ctx& ctx,
   // empty, so saving one section silently wiped the others (issue #46).
   std::map<std::string, std::string> values =
       runtime_config::ReadFromFile(ctx.config_path);
+  // Settings that take a fixed set of values (object types) are checked
+  // beyond what the flag type allows, for the whole request before any
+  // flag is parsed below: a rejected save then leaves the running
+  // process's flags as they were.  The rescan thread reads some of them
+  // (coalesce_window_sec, poll_interval_sec, ...) after start-up, and
+  // GET /api/config reports their current values.
+  for (const auto& e : runtime_config::Schema()) {
+    auto raw_opt = json_string_field_opt(body, e.name);
+    if (!raw_opt.has_value() || raw_opt->empty()) continue;
+    absl::Status valid = runtime_config::ValidateValue(e.name, *raw_opt);
+    if (!valid.ok()) {
+      return {400, std::string("invalid ") + e.name + ": " +
+                       std::string(valid.message())};
+    }
+  }
   for (const auto& e : runtime_config::Schema()) {
     auto raw_opt = json_string_field_opt(body, e.name);
     if (!raw_opt.has_value()) continue;  // absent -> keep existing value
@@ -1568,14 +1583,6 @@ std::pair<int, std::string> handle_config(const Ctx& ctx,
     if (!raw.empty()) {
       auto* flag = absl::FindCommandLineFlag(e.name);
       if (flag == nullptr) continue;  // schema/flag mismatch -- skip
-      // Settings that take a fixed set of values (object types) are
-      // checked beyond what the flag type allows, before the flag is
-      // touched.
-      absl::Status valid = runtime_config::ValidateValue(e.name, raw);
-      if (!valid.ok()) {
-        return {400, std::string("invalid ") + e.name + ": " +
-                         std::string(valid.message())};
-      }
       std::string err;
       // ParseFrom mutates the flag, but we only call it for validation.
       // The change is overwritten on the next process restart by

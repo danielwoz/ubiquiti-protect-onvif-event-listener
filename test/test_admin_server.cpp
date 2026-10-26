@@ -18,7 +18,9 @@
  * Boots AdminServer on a loopback ephemeral port and exercises the two GET
  * endpoints: /api/status (JSON) and / (HTML).  POST endpoints are not covered
  * because they shell out to systemctl / apt-get which are not available in
- * the test environment; handler dispatch is exercised via the GET paths.
+ * the test environment, or restart the service; handler dispatch is
+ * exercised via the GET paths.  The one exception is POST /api/config
+ * requests that are refused, which return before anything is written.
  */
 
 #include <arpa/inet.h>
@@ -26,15 +28,26 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#include "absl/flags/flag.h"
+
 #include "admin_server.hpp"
+
+// Stand-ins for the binary's flags of the same names, which POST
+// /api/config parses.  coalesce_window_sec precedes the object-type
+// settings in the schema.
+ABSL_FLAG(int32_t, coalesce_window_sec, 30, "test");
+ABSL_FLAG(std::string, default_object_type, "person", "test");
+ABSL_FLAG(std::string, camera_object_types, "", "test");
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -179,8 +192,75 @@ static void test_camera_health_event_proxy() {
   ::unlink(cfg.c_str());
 }
 
+// POST /api/config refuses an unknown object type before any flag is
+// parsed or the saved file is written, and a saved value it would refuse
+// still loads on GET, so the admin page can show it for correcting.
+static void test_config_rejects_unknown_object_types() {
+  const std::string channel_path =
+      temp_dir() + "/admin_server_test_object_types_channel";
+  check(write_text(channel_path, "stable\n"), "write channel file");
+  const std::string cfg = temp_dir() + "/admin_server_test_object_types.json";
+  const std::string saved =
+      "{\n  \"camera_object_types\": \"192.168.1.109=motion\"\n}\n";
+  check(write_text(cfg, saved), "write object type config");
+
+  onvif::AdminServer server;
+  if (!server.start("9.9.9-test", channel_path, 0, cfg)) {
+    check(false, "object type server starts");
+    return;
+  }
+  const uint16_t port = server.port();
+  auto post_config = [port](const std::string& json) {
+    return http_exchange(port,
+                         "POST /api/config HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Content-Type: application/json\r\n"
+                         "Content-Length: " + std::to_string(json.size()) +
+                         "\r\n"
+                         "Connection: close\r\n\r\n" + json);
+  };
+
+  const std::string get = http_get(port, "/api/config");
+  check(get.find("HTTP/1.1 200") != std::string::npos,
+        "GET /api/config returns 200 with a refused saved value");
+  check(get.find("\"override\":\"192.168.1.109=motion\"") !=
+            std::string::npos,
+        "GET /api/config shows the refused saved value for correcting");
+
+  // Save & Restart posts every field, coalesce_window_sec among them,
+  // which the schema lists before default_object_type.
+  std::string resp = post_config(
+      "{\"coalesce_window_sec\":\"90\",\"default_object_type\":\"cars\"}");
+  check(resp.find("HTTP/1.1 400") != std::string::npos,
+        "unknown default_object_type returns 400");
+  std::string body = http_body(resp);
+  check(body.find("invalid default_object_type") != std::string::npos &&
+            body.find("person, vehicle, animal, package, motion") !=
+                std::string::npos,
+        "the 400 names the setting and its valid values");
+  check(absl::GetFlag(FLAGS_coalesce_window_sec) == 30,
+        "a refused save leaves the running flags untouched");
+
+  resp = post_config("{\"camera_object_types\":\"192.168.1.109=motion\"}");
+  check(resp.find("HTTP/1.1 400") != std::string::npos,
+        "camera_object_types override of motion returns 400");
+  body = http_body(resp);
+  check(body.find("invalid camera_object_types: 192.168.1.109") !=
+            std::string::npos,
+        "the 400 names the camera");
+
+  server.stop();
+  std::ifstream f(cfg);
+  std::stringstream now;
+  now << f.rdbuf();
+  check(now.str() == saved, "a refused save leaves config.json as it was");
+  ::unlink(cfg.c_str());
+  ::unlink(channel_path.c_str());
+}
+
 int main() {
   test_camera_health_event_proxy();
+  test_config_rejects_unknown_object_types();
 
   // Set up a channel file so /api/status has something to read.
   const std::string channel_path = temp_dir() + "/admin_server_test_channel";
