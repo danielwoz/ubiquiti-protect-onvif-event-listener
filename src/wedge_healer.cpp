@@ -117,6 +117,39 @@ void WedgeHealer::persist_state() {
   }
 }
 
+void WedgeHealer::set_recording_stuck_state_path(const std::string& path) {
+  stuck_state_path_ = path;
+  stuck_restarted_.clear();
+  if (path.empty()) return;
+  std::ifstream f(path);
+  if (!f.is_open()) return;  // no recording-stuck restart yet
+  std::string id;
+  int64_t t = 0;
+  while (f >> id >> t) stuck_restarted_[id] = t;
+  if (!stuck_restarted_.empty()) {
+    LOG(INFO) << "[healer] " << stuck_restarted_.size()
+              << " camera(s) had a recording-stuck restart and have not "
+                 "been seen recording since (" << path << ")";
+  }
+}
+
+void WedgeHealer::persist_stuck_state() const {
+  if (stuck_state_path_.empty()) return;
+  const std::string tmp = stuck_state_path_ + ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::trunc);
+    if (!f.is_open()) {
+      LOG(WARNING) << "[healer] cannot write " << tmp;
+      return;
+    }
+    for (const auto& [id, t] : stuck_restarted_) f << id << " " << t << "\n";
+  }
+  if (std::rename(tmp.c_str(), stuck_state_path_.c_str()) != 0) {
+    LOG(WARNING) << "[healer] cannot rename " << tmp << " -> "
+                 << stuck_state_path_;
+  }
+}
+
 int WedgeHealer::restarts_in_window_locked() const {
   const int64_t cutoff = now_epoch_sec() - kDaySec;
   int n = 0;
@@ -398,7 +431,17 @@ WedgeHealer::Reason WedgeHealer::maybe_check_recording_stuck(bool force) {
   }
   stuck_checked_at_ = now;
 
-  std::vector<std::string> stuck = recording_stuck_();
+  RecordingCheck check = recording_stuck_();
+  // A camera Protect records again ends its episode: should it get stuck
+  // later, it is worth another restart.
+  bool forgot = false;
+  for (const auto& id : check.recording) {
+    if (stuck_restarted_.erase(id) > 0) forgot = true;
+    stuck_warned_.erase(id);
+  }
+  if (forgot) persist_stuck_state();
+
+  std::vector<std::string>& stuck = check.stuck;
   std::sort(stuck.begin(), stuck.end());
   stuck.erase(std::unique(stuck.begin(), stuck.end()), stuck.end());
   // Only a camera reported on two checks in a row counts, so one that
@@ -407,18 +450,37 @@ WedgeHealer::Reason WedgeHealer::maybe_check_recording_stuck(bool force) {
   std::set_intersection(stuck.begin(), stuck.end(), stuck_prev_.begin(),
                         stuck_prev_.end(), std::back_inserter(repeated));
   stuck_prev_ = std::move(stuck);
-  if (repeated.empty()) return Reason::kNone;
+
+  // A camera still not recording after the restart issued for it has a
+  // cause a restart does not fix; restarting again would only use up the
+  // daily cap the other reasons need.
+  std::vector<std::string> fresh;
+  for (const auto& id : repeated) {
+    if (stuck_restarted_.count(id) == 0) {
+      fresh.push_back(id);
+    } else if (stuck_warned_.insert(id).second) {
+      LOG(WARNING) << "[healer] Protect is still not recording camera " << id
+                   << " after the restart issued for it; not restarting "
+                      "Protect for it again until it records. Switch the "
+                      "camera's recording mode to Always and back, or "
+                      "restart unifi-protect, to start it.";
+    }
+  }
+  if (fresh.empty()) return Reason::kNone;
 
   std::string ids;
-  for (const auto& id : repeated) {
+  for (const auto& id : fresh) {
     if (!ids.empty()) ids += ", ";
     ids += id;
   }
   LOG(WARNING) << "[healer] Protect has still not started recording "
-               << repeated.size() << " camera(s) it would record: " << ids;
+               << fresh.size() << " camera(s) it would record: " << ids;
   const FireResult fr = fire_restart(Reason::kRecordingStuck);
   if (fr == FireResult::kRan) {
     stuck_prev_.clear();
+    const int64_t at = now_epoch_sec();
+    for (const auto& id : fresh) stuck_restarted_[id] = at;
+    persist_stuck_state();
   } else if (fr == FireResult::kGaveUp) {
     // Pause instead of retrying every minute against a cap that lifts
     // only as earlier restarts age out of the 24 h window.

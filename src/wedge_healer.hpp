@@ -17,7 +17,9 @@
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <mutex>  // NOLINT(build/c++11)
+#include <set>
 #include <string>
 #include <thread>  // NOLINT(build/c++11)
 #include <utility>
@@ -105,11 +107,19 @@ class WedgeHealer {
   // Pause after the daily cap stops a recording-stuck restart.
   static constexpr int kRecordingStuckBackoffSec = 60 * 60;
 
-  // Callback that returns the IDs of cameras Protect would record but has
-  // not started recording (see read_protect_recording_state()).  Protect
-  // decides this only at start-up, so only a restart clears it (#70).
-  // Called on the monitor thread.
-  using RecordingStuckFn = std::function<std::vector<std::string>()>;
+  // What the recording-stuck callback found among the cameras it checked.
+  struct RecordingCheck {
+    // Cameras Protect would record now but has not started recording
+    // (see read_protect_recording_state()).
+    std::vector<std::string> stuck;
+    // Cameras whose recording Protect has started.
+    std::vector<std::string> recording;
+  };
+  // Callback for the recording-stuck check.  Protect decides whether to
+  // record a camera at start-up and when its recording settings change, so
+  // a camera it skipped stays unrecorded until it restarts (#70).  Called
+  // on the monitor thread.
+  using RecordingStuckFn = std::function<RecordingCheck()>;
 
   // Callback that compares what we wrote into Postgres against what
   // Protect's API reports in memory, for the given camera IDs.  Returns
@@ -148,6 +158,14 @@ class WedgeHealer {
   /// process-local by design; it is about OUR uptime.
   /// Must be called before start().  Empty path disables persistence.
   void set_state_path(const std::string& path);
+
+  /// Keep in @p path the cameras a recording-stuck restart was issued for.
+  /// Each camera gets one such restart until Protect is seen recording it,
+  /// so a camera that a restart does not fix cannot use up the daily cap
+  /// the other reasons share, also across restarts of this service (which
+  /// restarts itself after Protect does).  Must be called before start().
+  /// Empty path keeps the list in memory only.
+  void set_recording_stuck_state_path(const std::string& path);
 
   // Arm a one-shot featureFlags drift check for @p camera_ids.  Call this
   // right after writing their featureFlags into Postgres.
@@ -248,6 +266,14 @@ class WedgeHealer {
   std::chrono::steady_clock::time_point stuck_checked_at_{};
   std::vector<std::string>          stuck_prev_;
   std::chrono::steady_clock::time_point stuck_resume_at_{};
+  // Cameras a recording-stuck restart was issued for, with its wall-clock
+  // time (epoch seconds).  A camera leaves the map once Protect is seen
+  // recording it.  stuck_warned_ holds the ones already logged as still
+  // not recording in this run.
+  std::map<std::string, int64_t>    stuck_restarted_;
+  std::set<std::string>             stuck_warned_;
+  std::string                       stuck_state_path_;
+  void persist_stuck_state() const;
   // Pending one-shot drift check, guarded by drift_mu_.  armed_at_ is
   // default-constructed when nothing is pending.
   mutable std::mutex                drift_mu_;

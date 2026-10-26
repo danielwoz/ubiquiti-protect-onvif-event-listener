@@ -245,9 +245,11 @@ Protect restarts. onvif-recorder checks for this every minute once Protect has r
 minutes: when the same camera is still not recording a minute later while other cameras
 record, it re-applies the camera's smart detection setting and restarts Protect
 (`[healer] recording-stuck` in the log; not with
-`--auto_heal_protect=false`, and within the limit of 4 Protect restarts a day). To fix it by
-hand, once Protect shows the camera's motion detection as available, switch the camera's
-recording mode to Always and back, or restart Protect.
+`--auto_heal_protect=false`, and within the limit of 4 Protect restarts a day). It does this
+once per camera: if the camera is still not recording after that restart, onvif-recorder
+logs it and waits until Protect records the camera again before it would restart Protect
+for it another time. To fix it by hand, once Protect shows the camera's motion detection as
+available, switch the camera's recording mode to Always and back, or restart Protect.
 
 **Duplicate motion and "person" events?** From Protect 7.1, Protect subscribes to a
 third-party camera's ONVIF motion itself and creates the basic motion events.

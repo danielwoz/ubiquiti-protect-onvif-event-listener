@@ -489,7 +489,7 @@ int main() {
     int calls = 0;
     h.set_recording_stuck_fn([&] {
       ++calls;
-      return std::vector<std::string>{};
+      return WedgeHealer::RecordingCheck{};
     });
     assert(h.check_recording_stuck_for_testing() == WedgeHealer::Reason::kNone);
     assert(h.check_recording_stuck_for_testing() == WedgeHealer::Reason::kNone);
@@ -506,7 +506,9 @@ int main() {
     h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
     h.end_warmup_for_testing();
     std::vector<std::string> report;
-    h.set_recording_stuck_fn([&] { return report; });
+    h.set_recording_stuck_fn([&] {
+      return WedgeHealer::RecordingCheck{report, {}};
+    });
     using R = WedgeHealer::Reason;
     report = {"cam1", "cam1"};
     assert(h.check_recording_stuck_for_testing() == R::kNone);
@@ -523,7 +525,8 @@ int main() {
     assert(cmds[0] == "systemctl restart unifi-protect.service");
 
     // The restart starts the count again, and the cooldown holds the next
-    // restart back while the check keeps running.
+    // restart, for another camera, back while the check keeps running.
+    report = {"cam4"};
     assert(h.check_recording_stuck_for_testing() == R::kNone);
     assert(h.check_recording_stuck_for_testing() == R::kRecordingStuck);
     assert(h.check_recording_stuck_for_testing() == R::kRecordingStuck);
@@ -540,7 +543,7 @@ int main() {
     h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
     h.set_recording_stuck_fn([&] {
       ++calls;
-      return std::vector<std::string>{"cam1"};
+      return WedgeHealer::RecordingCheck{{"cam1"}, {}};
     });
     assert(h.check_recording_stuck_for_testing() ==
            WedgeHealer::Reason::kNone);
@@ -573,7 +576,7 @@ int main() {
     h.end_warmup_for_testing();
     h.set_recording_stuck_fn([&] {
       ++calls;
-      return std::vector<std::string>{"cam1"};
+      return WedgeHealer::RecordingCheck{{"cam1"}, {}};
     });
     h.check_recording_stuck_for_testing();
     assert(h.check_recording_stuck_for_testing() ==
@@ -598,7 +601,8 @@ int main() {
     h.set_exec_fn([&](const std::string& c) { cmds.push_back(c); return 0; });
     h.set_state_path(path);
     h.end_warmup_for_testing();
-    h.set_recording_stuck_fn([] { return std::vector<std::string>{"cam1"}; });
+    h.set_recording_stuck_fn(
+        [] { return WedgeHealer::RecordingCheck{{"cam1"}, {}}; });
     h.check_recording_stuck_for_testing();
     h.check_recording_stuck_for_testing();
     assert(cmds.size() == 1);
@@ -612,11 +616,116 @@ int main() {
     std::vector<std::string> cmds2;
     h2.set_exec_fn([&](const std::string& c) { cmds2.push_back(c); return 0; });
     h2.end_warmup_for_testing();
-    h2.set_recording_stuck_fn([] { return std::vector<std::string>{"cam1"}; });
+    h2.set_recording_stuck_fn(
+        [] { return WedgeHealer::RecordingCheck{{"cam2"}, {}}; });
     h2.check_recording_stuck_for_testing();
     h2.check_recording_stuck_for_testing();
     assert(cmds2.empty());
     std::remove(path.c_str());
+  }
+
+  // Case 22: one recording-stuck restart per camera until Protect is seen
+  // recording it, kept across restarts of this service, so a camera that a
+  // restart does not fix cannot use up the cap the other reasons share.
+  {
+    using R = WedgeHealer::Reason;
+    const std::string restarts = temp_path("healer_restarts_episode");
+    const std::string episodes = temp_path("healer_stuck_episode");
+    std::remove(restarts.c_str());
+    std::remove(episodes.c_str());
+    // Lets the cooldown after a restart pass: one restart, long enough ago.
+    auto age_restarts = [&] {
+      std::ofstream f(restarts, std::ios::trunc);
+      f << (static_cast<int64_t>(std::time(nullptr)) -
+            WedgeHealer::kCooldownSec - 10) << "\n";
+    };
+    auto read_episodes = [&] {
+      std::ifstream f(episodes);
+      std::vector<std::string> ids;
+      std::string id;
+      int64_t t = 0;
+      while (f >> id >> t) ids.push_back(id);
+      return ids;
+    };
+    WedgeHealer::RecordingCheck report;
+    auto attach = [&](WedgeHealer* h, std::vector<std::string>* cmds) {
+      h->set_exec_fn([cmds](const std::string& c) {
+        cmds->push_back(c);
+        return 0;
+      });
+      h->set_state_path(restarts);
+      h->set_recording_stuck_state_path(episodes);
+      h->end_warmup_for_testing();
+      h->set_recording_stuck_fn([&] { return report; });
+    };
+
+    {
+      WedgeHealer h;
+      std::vector<std::string> cmds;
+      attach(&h, &cmds);
+      report = {{"cam1"}, {"cam9"}};
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(h.check_recording_stuck_for_testing() == R::kRecordingStuck);
+      assert(cmds.size() == 1);
+      assert(read_episodes() == std::vector<std::string>{"cam1"});
+      // Still stuck after the restart: no further restart is asked for.
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(cmds.size() == 1);
+    }
+    {
+      // The next run of the service remembers cam1; another camera that
+      // gets stuck still gets its restart.
+      age_restarts();
+      WedgeHealer h;
+      std::vector<std::string> cmds;
+      attach(&h, &cmds);
+      report = {{"cam1"}, {}};
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      report = {{"cam2", "cam1"}, {}};
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(h.check_recording_stuck_for_testing() == R::kRecordingStuck);
+      assert(cmds.size() == 1);
+      assert((read_episodes() == std::vector<std::string>{"cam1", "cam2"}));
+    }
+    {
+      // Seen recording ends a camera's episode, and a later stuck spell
+      // gets a restart again.
+      age_restarts();
+      WedgeHealer h;
+      std::vector<std::string> cmds;
+      attach(&h, &cmds);
+      report = {{"cam1"}, {"cam2"}};
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(read_episodes() == std::vector<std::string>{"cam1"});
+      report = {{}, {"cam1"}};
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(read_episodes().empty());
+      report = {{"cam1"}, {}};
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(h.check_recording_stuck_for_testing() == R::kRecordingStuck);
+      assert(cmds.size() == 1);
+      assert(read_episodes() == std::vector<std::string>{"cam1"});
+    }
+    {
+      // An unreadable file remembers nothing.
+      age_restarts();
+      {
+        std::ofstream f(episodes, std::ios::trunc);
+        f << "cam1 not-a-time\n";
+      }
+      WedgeHealer h;
+      std::vector<std::string> cmds;
+      attach(&h, &cmds);
+      report = {{"cam1"}, {}};
+      h.check_recording_stuck_for_testing();
+      assert(h.check_recording_stuck_for_testing() == R::kRecordingStuck);
+      assert(cmds.size() == 1);
+    }
+    std::remove(restarts.c_str());
+    std::remove(episodes.c_str());
   }
 
   // Protect recording-state parser (#70).

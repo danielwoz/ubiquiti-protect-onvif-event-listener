@@ -385,7 +385,8 @@ ABSL_FLAG(bool, auto_heal_protect, true,
     "featureFlags 60 s after we wrote them, Protect having started "
     "before we last patched service.js, or Protect not having started "
     "recording a managed third-party camera it would now record (two "
-    "checks a minute apart), restarts unifi-protect only. "
+    "checks a minute apart; once per camera until Protect records it), "
+    "restarts unifi-protect only. "
     "Safeguards: no restart in the first "
     "5 min after start, 5 min cooldown between restarts, hard cap of 4 "
     "restarts per 24 h. Every restart is logged at ERROR level and "
@@ -1742,6 +1743,8 @@ int main(int argc, char* argv[]) {
     // own restarts -- the admin page's Save & Restart exits the process,
     // so without this every config save reset the cap to zero.
     healer->set_state_path(state_dir + "/healer-restarts");
+    healer->set_recording_stuck_state_path(state_dir +
+                                           "/healer-recording-stuck");
     healer->set_msr_snapshot_fn([&det_rec]() {
       const auto s = det_rec.msr_snapshot();
       return onvif::WedgeHealer::MsrSnapshot{
@@ -1838,11 +1841,11 @@ int main(int argc, char* argv[]) {
         [protect_url_for_drift, &protect_user_id_provider, cam_db, cam_log,
          &managed_ids_mu, &managed_ids, protect_pid = pid_t{0},
          pid_seen_at = std::chrono::steady_clock::time_point{}]() mutable
-            -> std::vector<std::string> {
-      std::vector<std::string> stuck;
-      if (protect_url_for_drift.empty()) return stuck;
+            -> onvif::WedgeHealer::RecordingCheck {
+      onvif::WedgeHealer::RecordingCheck out;
+      if (protect_url_for_drift.empty()) return out;
       const std::string user_id = protect_user_id_provider.current();
-      if (user_id.empty()) return stuck;
+      if (user_id.empty()) return out;
       // Protect starts recording its cameras within a minute or two of
       // starting; leave it 5 min before counting a camera as stuck.
       const pid_t pid = protect_ui::protect_main_pid();
@@ -1852,7 +1855,7 @@ int main(int argc, char* argv[]) {
         pid_seen_at = now;
       }
       if (pid <= 0 || now - pid_seen_at < std::chrono::minutes(5))
-        return stuck;
+        return out;
 
       std::vector<std::string> ids;
       {
@@ -1864,8 +1867,9 @@ int main(int argc, char* argv[]) {
       for (const auto& id : ids) {
         const std::string body = onvif::AlarmNotifier::protect_api_get(
             protect_url_for_drift + "/api/cameras/" + id, user_id);
-        if (body.empty()) return stuck;  // API unreachable; judge nothing
+        if (body.empty()) return out;  // API unreachable; judge nothing
         const auto st = onvif::read_protect_recording_state(body);
+        if (st.recording_started) out.recording.push_back(id);
         // A camera paired with an AI Port is Protect's to manage.
         if (st.stuck && !st.paired_with_ai_port) {
           candidates.push_back(id);
@@ -1873,7 +1877,7 @@ int main(int argc, char* argv[]) {
           other_recording = true;
         }
       }
-      if (candidates.empty()) return stuck;
+      if (candidates.empty()) return out;
       // Count a camera only while Protect records another one, so a
       // recording outage such as MSR being down is not taken for this.
       if (!other_recording) {
@@ -1886,7 +1890,7 @@ int main(int argc, char* argv[]) {
         LOG(INFO) << "[healer] " << candidates.size()
                   << " camera(s) not recording, but neither is any other "
                      "camera; not treating it as recording-stuck";
-        return stuck;
+        return out;
       }
       // Re-apply the smart detection setting, so the restart also loads
       // hasSmartDetect=true and the camera stays recordable at later
@@ -1901,7 +1905,8 @@ int main(int argc, char* argv[]) {
       }
       if (auto s = unifi::enable_smart_detect(cams, cam_db, cam_log); !s.ok())
         LOG(WARNING) << "[healer] recording-stuck: " << s.message();
-      return candidates;
+      out.stuck = std::move(candidates);
+      return out;
     });
     healer->start();
     LOG(INFO) << "[healer] auto-heal enabled (window="
