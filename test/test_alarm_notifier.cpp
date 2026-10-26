@@ -69,6 +69,9 @@ struct AlarmNotifierTest {
   static Plan plan(const Entry& entry, const Clock& clock) {
     return AlarmNotifier::plan_notification(entry, clock);
   }
+  static bool alarm_open(const Entry& entry, const Clock& clock) {
+    return AlarmNotifier::alarm_schedule_open(entry, clock);
+  }
   static std::string payload(const Entry& entry, const Clock& clock) {
     return AlarmNotifier::build_notify_payload(
         entry.id, "person", "cam-uuid", "evt-1", 1700000000000ULL,
@@ -495,6 +498,31 @@ static void test_alarm_schedule() {
   check(weekend.receivers.empty(), "alarm schedule: Saturday is outside");
   check(contains(weekend.skip_reason, "schedules"),
         "outside schedule -> skip reason names schedules");
+
+  // Whether the alarm fires at all: only its own schedules count, not
+  // the recipients'.
+  check(AlarmNotifierTest::alarm_open(a, at(kMonday, 9, 0)),
+        "alarm open inside its schedule");
+  check(!AlarmNotifierTest::alarm_open(a, at(kMonday, 17, 0)) &&
+            !AlarmNotifierTest::alarm_open(a, at(kSaturday, 9, 0)),
+        "alarm closed outside its schedule");
+  const auto unscheduled = parse_one(alarm(
+      "unscheduled", "[" + receiver("pk", "ucore", R"(["push"])", kWeekends) +
+                         "]"));
+  check(AlarmNotifierTest::alarm_open(unscheduled, at(kMonday, 9, 0)),
+        "alarm without a schedule is open whatever its recipients' say");
+  // An alarm-level "everyone away" may hold now: open, and the recipients
+  // get all_admins.  An alarm-level "I am away" never holds.
+  const auto all_away = parse_one(alarm(
+      "open-all-away", "[" + receiver("pk", "ucore", R"(["push"])") + "]",
+      R"([{"schedule":{"type":"is","unit":"location","values":["allAway"]}}])"));
+  check(AlarmNotifierTest::alarm_open(all_away, at(kMonday, 9, 0)),
+        "alarm-level allAway is open");
+  const auto away = parse_one(alarm(
+      "closed-away", "[" + receiver("pk", "ucore", R"(["push"])") + "]",
+      R"([{"schedule":{"type":"is","unit":"location","values":["away"]}}])"));
+  check(!AlarmNotifierTest::alarm_open(away, at(kMonday, 9, 0)),
+        "alarm-level away is closed");
 }
 
 static void test_receiver_schedule() {
@@ -738,6 +766,10 @@ class CaptureSink : public absl::LogSink {
 };
 
 static void test_notify_skips_but_records() {
+  const std::string never =
+      R"([{"schedule":{"type":"is","unit":"never","values":[]}}])";
+  // "never" has a recipient out of schedule: the alarm fires, nobody is
+  // notified.  "closed" is out of its own schedule: it does not fire.
   const std::string automations =
       "[" +
       alarm("push-on", "[" + receiver(kOwnerPk, kOwner, R"(["push"])") + "]") +
@@ -747,8 +779,11 @@ static void test_notify_skips_but_records() {
           "no-notify",
           R"([{"type":"PLAY_SPEAKER","metadata":{"volume":80},"order":0}])") +
       "," +
-      alarm("never", "[" + receiver(kOwnerPk, kOwner, R"(["push"])") + "]",
-            R"([{"schedule":{"type":"is","unit":"never","values":[]}}])") +
+      alarm("never",
+            "[" + receiver(kOwnerPk, kOwner, R"(["push"])", never) + "]") +
+      "," +
+      alarm("closed", "[" + receiver(kOwnerPk, kOwner, R"(["push"])") + "]",
+            never) +
       "]";
   UosEmulator protect;
   protect.set_alarms_json(automations);
@@ -766,7 +801,7 @@ static void test_notify_skips_but_records() {
     notifier.refresh_alarms();
     notifier.notify("person", "AABBCCDDEEFF", "evt-1", 1700000000000ULL);
 
-    check(protect.register_bodies().size() == 4,
+    check(protect.register_bodies().size() == 5,
           "every enabled alarm registered");
     const auto notifies = protect.notify_bodies();
     check(notifies.size() == 1, "one notify call, for the push-on alarm");
@@ -782,12 +817,16 @@ static void test_notify_skips_but_records() {
     }
     check(protect.posted_events().empty(), "legacy run path not used");
     check(sink.count("history DB connect failed") == 4,
-          "history recorded for all four alarms, sent or not");
+          "history recorded for the four alarms that fired, sent or not");
     const auto fired = AlarmNotifierTest::last_fired(&notifier);
     check(fired.size() == 4 && fired.count("push-off") == 1 &&
               fired.count("no-notify") == 1 && fired.count("never") == 1 &&
               fired.at("push-off") == 1700000000000ULL,
           "cooldown updated for skipped alarms too");
+    check(fired.count("closed") == 0,
+          "an alarm outside its own schedule starts no cooldown");
+    check(sink.count("automation closed: outside the alarm's schedule") == 1,
+          "an alarm outside its own schedule is logged as not fired");
   }
   absl::RemoveLogSink(&sink);
 }

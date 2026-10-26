@@ -61,7 +61,9 @@ namespace onvif {
  * checkScheduleConditions rules).  Schedule conditions on whether people are
  * away become the route's geofence_restriction.  No call is made when the
  * alarm has no SEND_NOTIFICATION action or no recipient is left; the
- * history row and the cooldown are recorded either way.  The legacy
+ * history row and the cooldown are recorded either way.  Outside the
+ * alarm's own schedule the alarm does not fire at all, as in Protect: no
+ * call, no history row, no cooldown.  The legacy
  * /api/automations/<id>/run path runs Protect's own alarm, which applies
  * the recipients itself.
  *
@@ -246,6 +248,9 @@ class AlarmNotifier {
   static bool schedule_matches(const Schedule& schedule,
                                const ScheduleClock& clock,
                                bool user_away, bool all_away);
+  // Whether @p automation's own schedules let it fire at @p clock.
+  static bool alarm_schedule_open(const AutomationEntry& automation,
+                                  const ScheduleClock& clock);
   static ScheduleClock local_clock(std::time_t t);
   // The receivers of the notify call for @p automation at @p clock.
   static NotifyPlan plan_notification(const AutomationEntry& automation,

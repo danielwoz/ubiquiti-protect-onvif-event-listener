@@ -534,6 +534,16 @@ bool AlarmNotifier::schedules_match(const std::vector<Schedule>& schedules,
   return false;
 }
 
+bool AlarmNotifier::alarm_schedule_open(const AutomationEntry& automation,
+                                        const ScheduleClock& clock) {
+  // Protect tests the alarm's own schedules with the user taken as at
+  // home.  Whether every user is away is only known to Protect, so the
+  // alarm counts as open if it matches either way; a match only while
+  // everyone is away becomes the recipients' geofence_restriction.
+  return schedules_match(automation.schedules, clock, false, false) ||
+         schedules_match(automation.schedules, clock, false, true);
+}
+
 AlarmNotifier::ScheduleClock AlarmNotifier::local_clock(std::time_t t) {
   std::tm tm{};
   localtime_r(&t, &tm);
@@ -1192,6 +1202,22 @@ void AlarmNotifier::notify(const std::string& obj_type,
       }
     }
 
+    bool use_uos;
+    {
+      absl::MutexLock lk(&mu_);
+      use_uos = notify_via_uos_ && !uos_unavailable_;
+    }
+    const ScheduleClock clock = local_clock(std::time(nullptr));
+
+    // Outside its own schedule a Protect alarm does not fire at all: no
+    // actions, no history row, and its cooldown does not start, so a hit
+    // just before the schedule opens cannot suppress one just after.
+    if (use_uos && !alarm_schedule_open(automation, clock)) {
+      LOG(INFO) << "[alarm] automation " << automation.id
+                << ": outside the alarm's schedule, not fired";
+      continue;
+    }
+
     LOG(INFO) << "[alarm] triggering automation " << automation.id
               << " for " << obj_type << " on " << camera_mac
               << " event_id=" << event_id;
@@ -1207,18 +1233,11 @@ void AlarmNotifier::notify(const std::string& obj_type,
           url + "/internal/automationManager/external/actions/notify";
       std::string payload;
 
-      bool use_uos;
-      {
-        absl::MutexLock lk(&mu_);
-        use_uos = notify_via_uos_ && !uos_unavailable_;
-      }
-
       long code = 0;  // NOLINT(runtime/int)
       if (use_uos) {
         // The route notifies exactly the receivers named, so they come
         // from the alarm's own recipients, channels and schedules.
-        const NotifyPlan plan =
-            plan_notification(automation, local_clock(std::time(nullptr)));
+        const NotifyPlan plan = plan_notification(automation, clock);
         if (plan.location_approximated &&
             first_warning("location:" + automation.id)) {
           LOG(WARNING) << "[alarm] automation " << automation.id << " (\""

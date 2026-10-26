@@ -117,7 +117,9 @@ unlock door, light, PTZ preset) configured in **Protect → Alarms**.
    Protect's own detections. "When away" schedules are left to Protect, which
    checks them when it sends. An alarm with no notification action, or whose
    recipients all have notifications off or are outside their schedule, sends
-   nothing but still records the hit in its history.
+   nothing but still records the hit in its history. Outside the alarm's own
+   schedule the alarm does not fire at all: no history entry, and its
+   "ignore repeated" cooldown does not start.
 
 **Setup:**
 
