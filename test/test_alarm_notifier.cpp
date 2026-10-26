@@ -889,6 +889,84 @@ static void test_legacy_path_without_alarm_manager() {
   check(notifies == 0, "no alarm manager: no UOS notify call");
 }
 
+// A fake Protect that also answers GET /api/users.
+class UsersProtect : public UosEmulator {
+ public:
+  explicit UsersProtect(std::string users) : users_(std::move(users)) {}
+  ~UsersProtect() override { stop(); }
+
+  int users_requests() {
+    std::lock_guard<std::mutex> lk(users_mu_);
+    return users_requests_;
+  }
+
+ protected:
+  std::pair<int, std::string> handle(const std::string& path,
+                                     const std::string& soap_action,
+                                     const std::string& body) override {
+    if (path == "/api/users") {
+      std::lock_guard<std::mutex> lk(users_mu_);
+      ++users_requests_;
+      return {200, users_};
+    }
+    return UosEmulator::handle(path, soap_action, body);
+  }
+
+ private:
+  std::mutex users_mu_;
+  std::string users_;
+  int users_requests_ = 0;
+};
+
+// A recipient saved without its UniFi OS user id is notified under the id
+// GET /api/users gives its Protect user; the user list is fetched only
+// when such a recipient exists.
+static void test_recipient_resolved_through_users() {
+  const std::string users =
+      R"([{"id":"6aae34e6025eea03e40084e1",)"
+      R"("ucoreUserId":"bae7433e-c596-453a-90e4-a4befe35d460"},)"
+      R"({"id":"699bf3d301fa4a03e400040b","isOwner":true,)"
+      R"("ucoreUserId":"21f4450a-3b42-4be4-9d05-852776e70e77"}])";
+  onvif::ProtectUserIdProvider provider("owner-user-id", "");
+  {
+    UsersProtect protect(users);
+    protect.set_alarms_json(
+        "[" +
+        alarm("no-ucore", "[" + receiver(kOwnerPk, "", R"(["push"])") + "]") +
+        "]");
+    protect.start();
+    {
+      onvif::AlarmNotifier notifier(protect.base_url(), &provider);
+      notifier.refresh_alarms();
+      notifier.notify("person", "AABBCCDDEEFF", "evt-3", 1700000000000ULL);
+    }
+    check(protect.users_requests() == 1,
+          "recipient without ucoreUser: user list fetched once");
+    const auto bodies = protect.notify_bodies();
+    check(bodies.size() == 1 &&
+              contains(bodies[0], R"("receivers":[{"user_id":")" +
+                                      std::string(kOwner) + R"(","push":true)"),
+          "recipient without ucoreUser notified under its UniFi OS id");
+  }
+  {
+    UsersProtect protect(users);
+    protect.set_alarms_json(
+        "[" +
+        alarm("known", "[" + receiver(kOwnerPk, kOwner, R"(["push"])") + "]") +
+        "]");
+    protect.start();
+    {
+      onvif::AlarmNotifier notifier(protect.base_url(), &provider);
+      notifier.refresh_alarms();
+      notifier.notify("person", "AABBCCDDEEFF", "evt-4", 1700000000000ULL);
+    }
+    check(protect.users_requests() == 0,
+          "every recipient has ucoreUser: user list not fetched");
+    check(protect.notify_bodies().size() == 1,
+          "every recipient has ucoreUser: notified");
+  }
+}
+
 int main() {
   test_parse_basics();
   test_parse_real_alarm_push_off();
@@ -902,6 +980,7 @@ int main() {
   test_local_clock();
   test_notify_skips_but_records();
   test_legacy_path_without_alarm_manager();
+  test_recipient_resolved_through_users();
 
   std::cerr << "PASS " << g_pass << " / FAIL " << g_fail << '\n';
   return g_fail == 0 ? 0 : 1;
