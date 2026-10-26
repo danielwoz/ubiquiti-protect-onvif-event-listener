@@ -46,7 +46,7 @@ bundle you pass when you run it. Never commit a `service.js`, a Protect
 | Node.js | 20.18 or newer, which undici 7 requires. Protect 7.3.70 itself runs Node 24. |
 | `//test:pullpoint_demo`, `//test:patch_service_js` | Built by `run.sh` with `scripts/bz build --config=x86`. |
 
-Port 7892 on 127.0.0.1 must be free, and 7893 for scenario H. The route
+Port 7892 on 127.0.0.1 must be free, and 7893 for scenarios H and J. The route
 patch sends Protect's requests to 7892. `e2e.cjs --port=N` rewrites that one number in the patched
 copy, for a machine where 7892 is taken.
 
@@ -96,6 +96,8 @@ The exit status is 0 when every check passed.
 | F hung recorder | A server accepts on 7892 and never answers. | F1: Create falls back after about 4 s. F2: with a proxied camera and a direct camera, no poll tick takes longer than about 6 s, so the direct camera keeps being polled. F3: as F2, with the proxied subscription's Renew due when the recorder hangs. F4: as F2, with a one-slot proxied camera whose slot the recorder's kept subscription holds, and Protect's Renew due right after its second failed pull. |
 | G Protect restart | Protect stops its subscription (Unsubscribe) and a fresh Protect runtime starts. | The old pull point faults. The new Create goes through the recorder, and the new subscriber gets the current state (motion on) as Initialized. The camera still has only the recorder's subscription. |
 | H recorder stall | A relay on 7892 forwards to the recorder (on 7893) but holds the connections that arrive in one 4.6 s window. | One Protect pull times out (one error), then Protect carries on through the recorder: no Deactivated, still subscribed via the recorder. |
+| I Protect stall | Two shared cameras that would also accept Protect's own subscription. The harness blocks its event loop, and with it Protect's, while a request to the recorder is in flight: I1 for 6 s from just before a Renew is sent; I2 for 6 s from just after a Pull is sent, with a motion on; I3 for 12 s from just before a Renew, which Protect's own 10 s request timeout then ends. | I1, I2: the Renew and the Pull succeed, no error is counted on either camera, and the motion reaches Protect once. I3: both cameras stay subscribed via the recorder. Protect never subscribes at the cameras, and nothing is Deactivated. |
+| J one camera's timeout | Two shared cameras. A relay on 7892 forwards to the recorder (on 7893) but, while told to, holds every request for camera a. Protect's own client renews the subscriptions directly. | J1: an Unsubscribe for camera a gives up after about 1 s, and camera a's next request still goes to the recorder. J2: camera a's Renew times out after about 4 s; camera b's Renew right after it is answered; camera a's next request within 500 ms fails at once, and one 500 ms later goes to the recorder again. |
 
 Every scenario also checks everything Protect logged, debug lines
 included:

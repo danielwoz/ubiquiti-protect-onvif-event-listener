@@ -56,8 +56,9 @@ function opOf(body) {
   return m ? m[1] : '';
 }
 
-// undici with every request Protect makes recorded in @p log.
-function recordingUndici(real, log) {
+// undici with every request Protect makes recorded in @p log.  When set,
+// @p hooks.request is called with each entry as its request starts.
+function recordingUndici(real, log, hooks) {
   return {
     ...real,
     request: async (url, opts = {}) => {
@@ -70,6 +71,7 @@ function recordingUndici(real, log) {
         wsaAction: /Action[^>]*>[^<]*</.test(String(opts.body || '')),
       };
       log.push(entry);
+      if (hooks.request) hooks.request(entry);
       try {
         const r = await real.request(url, opts);
         entry.status = r.statusCode;
@@ -89,12 +91,13 @@ function formatArg(x) {
   return String(x);
 }
 
-// @returns {m, logs, published, cameraStates, requests, bundle}
+// @returns {m, logs, published, cameraStates, requests, hooks, bundle}
 function buildProtect(text, { nmDir, fxpDir }) {
   const logs = [];
   const published = [];
   const cameraStates = [];
   const requests = [];
+  const hooks = {};
   const handlers = {};
   const logger = (name) => {
     const at = (lvl) => (...a) =>
@@ -135,7 +138,7 @@ function buildProtect(text, { nmDir, fxpDir }) {
     writeIoCameraState: async () => {},
     RelayInputState: { CIRCUIT_CLOSED: 'closed', CIRCUIT_OPEN: 'open' },
   };
-  const undici = recordingUndici(require(path.join(nmDir, 'undici')), requests);
+  const undici = recordingUndici(require(path.join(nmDir, 'undici')), requests, hooks);
   const bundle = new Bundle(text, { nmDir, fxpDir, stubs, packages: { undici } });
   const ids = {};
   for (const [k, needle] of Object.entries(NEEDLES)) {
@@ -148,7 +151,7 @@ function buildProtect(text, { nmDir, fxpDir }) {
   bundle.markReal(...Object.values(ids));
   const m = {};
   for (const [k, id] of Object.entries(ids)) m[k] = bundle.require(id);
-  return { m, ids, logs, published, cameraStates, requests, handlers, bundle };
+  return { m, ids, logs, published, cameraStates, requests, hooks, handlers, bundle };
 }
 
 // A third-party camera row as Protect's store holds it.

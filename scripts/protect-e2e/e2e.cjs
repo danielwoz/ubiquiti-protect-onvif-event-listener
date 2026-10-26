@@ -228,6 +228,88 @@ function recorderWarnings(rec, fromT = 0) {
   return rec ? rec.logLines(/^[WE]\d{4} .*\[event_proxy\]/, fromT).map((l) => l.slice(0, 220)) : [];
 }
 
+// Start of the path of every request the route patch sends to the recorder
+// for camera @p i.
+function recorderPrefix(cams, i) {
+  const [host, p] = cams.info.cameras[i].address.split(':');
+  return `/onvif-recorder/pullpoint/${encodeURIComponent(host)}/${encodeURIComponent(p)}/`;
+}
+
+// Blocks this process, and with it the Protect runtime, for @p ms, as a
+// long garbage collection blocks Protect's event loop.
+function stallProtect(ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    // busy
+  }
+}
+
+// Calls @p fn as Protect's next request that @p pred accepts starts;
+// resolves with that request's entry, which gets its status when it ends.
+function atNextRequest(rt, pred, fn) {
+  return new Promise((resolve) => {
+    rt.hooks.request = (entry) => {
+      if (!pred(entry)) return;
+      rt.hooks.request = null;
+      fn(entry);
+      resolve(entry);
+    };
+  });
+}
+
+// Renews @p sub through Protect's own client; never throws.
+async function renewVia(rt, conn, sub) {
+  const t = Date.now();
+  try {
+    await rt.m.events.renewSubscription(conn, sub.subscriptionPath, sub.referenceParameters);
+    return { ok: true, ms: Date.now() - t };
+  } catch (e) {
+    return { ok: false, ms: Date.now() - t, error: e.message };
+  }
+}
+
+// A relay on 127.0.0.1:@p from that forwards each connection to @p to,
+// except one whose HTTP request line @p hold accepts: that one is read and
+// never answered.
+async function holdingRelay(from, to, hold) {
+  const net = require('net');
+  const socks = new Set();
+  const server = net.createServer((cl) => {
+    socks.add(cl);
+    cl.on('close', () => socks.delete(cl));
+    cl.on('error', () => {});
+    let head = Buffer.alloc(0);
+    const onData = (chunk) => {
+      head = Buffer.concat([head, chunk]);
+      const eol = head.indexOf('\r\n');
+      if (eol < 0) return;
+      cl.removeListener('data', onData);
+      if (hold(head.subarray(0, eol).toString('latin1'))) {
+        cl.on('data', () => {});
+        return;
+      }
+      const up = net.connect(to, '127.0.0.1');
+      socks.add(up);
+      up.on('close', () => socks.delete(up));
+      up.on('error', () => cl.destroy());
+      up.write(head);
+      cl.pipe(up);
+      up.pipe(cl);
+    };
+    cl.on('data', onData);
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(from, '127.0.0.1', resolve);
+  });
+  return {
+    close: () => new Promise((r) => {
+      for (const sk of socks) sk.destroy();
+      server.close(() => r());
+    }),
+  };
+}
+
 // ------------------------------------------------------------- scenarios
 
 // A: steady state through the recorder.
@@ -822,8 +904,173 @@ async function scenarioH(c) {
   }
 }
 
+// I: Protect's own event loop stalls for longer than the 4 s limit while
+// requests to the recorder are in flight, with two shared cameras that
+// would accept Protect's own subscription too.  I1: 6 s from just before
+// camera a's Renew is sent.  I2: 6 s from just after camera a's Pull is
+// sent, with a motion on, so the recorder's answer waits unread.  I3: 12 s
+// from just before camera a's Renew, which Protect's own 10 s request
+// timeout then cuts off.
+async function scenarioI(c) {
+  const cams = await startCameras({ slots: 2, second: 2 });
+  const rec = await startRecorder(cams, { stateDir: stateDir() });
+  for (const cam of cams.info.cameras) await waitUp(rec, cam.key);
+  const rt = newProtect();
+  const a = cameraRow(cams, 0, 'camIa', 'AABBCCDD0009');
+  const b = cameraRow(cams, 1, 'camIb', 'AABBCCDD000A');
+  const ctx = makeContext(rt, [a, b]);
+  await rt.m.reconcile.reconcileMotionState(ctx, a.pk);
+  await rt.m.reconcile.reconcileMotionState(ctx, b.pk);
+  await settle(ctx);
+  if (where(ctx, a.mac) !== 'PROXY' || where(ctx, b.mac) !== 'PROXY') {
+    throw new Error(`setup: a ${where(ctx, a.mac)}, b ${where(ctx, b.mac)}`);
+  }
+  const subA = ctx.eventSubscriptions.get(a.mac);
+  const subB = ctx.eventSubscriptions.get(b.mac);
+  const pathA = subA.subscriptionPath;
+  const pathB = subB.subscriptionPath;
+  const errors = { a: 0, b: 0 };
+  const sched = new Scheduler(rt, ctx, {
+    onTick: () => {
+      for (const [k, cam] of [['a', a], ['b', b]]) {
+        const s = ctx.eventSubscriptions.get(cam.mac);
+        errors[k] = Math.max(errors[k], s ? s.consecutiveErrors : 99);
+      }
+    },
+  });
+  sched.start();
+  await sched.waitTicks(2);
+  const prefixA = recorderPrefix(cams, 0);
+  const toA = (op) => (r) => r.op === op && r.host === RECORDER && r.path.startsWith(prefixA);
+  const marks = [(await stats(cams, 0)).requests, (await stats(cams, 1)).requests];
+  const R = rt.requests.length;
+
+  // I1: the Renew is sent only once the stall is over.
+  const renew1 = atNextRequest(rt, toA('Renew'), () => process.nextTick(() => stallProtect(6000)));
+  subA.terminationTime = Date.now() + 5000;
+  const r1 = await renew1;
+  await sched.waitTicks(2);
+  c.ok('I1: the Renew held up by a 6 s stall is answered by the recorder', r1.status === 200,
+    brief([r1]));
+  c.ok('I1: both cameras keep their subscriptions on the recorder',
+    subA.subscriptionPath === pathA && subB.subscriptionPath === pathB &&
+      where(ctx, a.mac) === 'PROXY' && where(ctx, b.mac) === 'PROXY',
+    { a: where(ctx, a.mac), b: where(ctx, b.mac) });
+
+  // I2: the recorder answers the Pull during the stall.
+  const starts = count(rt, 'events.cameras.motionStart');
+  let asked = null;
+  const pull2 = atNextRequest(rt, toA('PullMessages'), () => {
+    asked = motion(cams, 0, true);
+    setTimeout(() => stallProtect(6000), 30);
+  });
+  const r2 = await pull2;
+  const tMotion = (await asked).t;
+  const startMs = await waitPublished(rt, 'events.cameras.motionStart', 1, tMotion);
+  await sched.waitTicks(1);
+  c.num('I2_motion_start_latency_ms', startMs);
+  c.ok('I2: the Pull answered during a 6 s stall succeeds', r2.status === 200, brief([r2]));
+  c.ok('I2: the motion reaches Protect once',
+    startMs !== null && count(rt, 'events.cameras.motionStart') === starts + 1,
+    { latency: startMs, starts: count(rt, 'events.cameras.motionStart') - starts });
+  c.ok('I1, I2: no error counted on either camera', errors.a === 0 && errors.b === 0, errors);
+  c.ok('I1, I2: the subscriptions are still the same',
+    subA.subscriptionPath === pathA && subB.subscriptionPath === pathB);
+
+  // I3: Protect's own 10 s timeout ends the Renew.
+  const R3 = rt.requests.length;
+  const renew3 = atNextRequest(rt, toA('Renew'), () => process.nextTick(() => stallProtect(12000)));
+  subA.terminationTime = Date.now() + 5000;
+  const r3 = await renew3;
+  await sched.waitTicks(3);
+  await sched.stop();
+  const after3 = rt.requests.slice(R3).filter((r) => r.op !== 'PullMessages');
+  c.num('I3_requests', brief(after3));
+  c.num('I3_renew', brief([r3]));
+  c.ok('I3: after a 12 s stall both cameras are still subscribed via the recorder',
+    where(ctx, a.mac) === 'PROXY' && where(ctx, b.mac) === 'PROXY',
+    { a: where(ctx, a.mac), b: where(ctx, b.mac) });
+  const protectOps = [...await requestsSince(cams, 0, marks[0]),
+                      ...await requestsSince(cams, 1, marks[1])]
+    .filter((r) => r.from === 'protect').map((r) => r.op);
+  c.ok('Protect never subscribes at the cameras',
+    protectOps.every((o) => o === 'GetEventProperties'), protectOps);
+  const w = warns(rt);
+  c.ok('no Deactivated and no circuit breaker in Protect',
+    !w.some((x) => /Deactivated|circuit-breaker/.test(x)), w);
+  c.ok('Protect\'s error count stays below its limit', errors.a < 3 && errors.b < 3, errors);
+  c.num('max_consecutive_errors', errors);
+  c.num('failed_requests', brief(rt.requests.slice(R).filter((r) => r.error || r.status !== 200)));
+  c.num('tick_ms', sched.ticks.map((x) => x.ms));
+  c.num('recorder_warnings', recorderWarnings(rec));
+}
+
+// J: the recorder stops answering for one camera only.  A relay on the
+// PullPoint port forwards to the recorder (on port + 1), but while told to
+// it holds every request for camera a.  Protect's own client renews the
+// subscriptions of cameras a and b directly, without the poll.
+async function scenarioJ(c) {
+  const cams = await startCameras({ slots: 2, second: 2 });
+  const inner = port + 1;
+  if (await portInUse(inner)) throw new Error(`127.0.0.1:${inner} is in use`);
+  const rec = await startRecorder(cams, { stateDir: stateDir(), recPort: inner });
+  for (const cam of cams.info.cameras) await waitUp(rec, cam.key);
+  const prefixA = recorderPrefix(cams, 0);
+  let holdA = false;
+  const relay = await holdingRelay(port, inner, (line) => holdA && line.includes(` ${prefixA}`));
+  try {
+    const rt = newProtect();
+    const a = cameraRow(cams, 0, 'camJa', 'AABBCCDD000B');
+    const b = cameraRow(cams, 1, 'camJb', 'AABBCCDD000C');
+    const ctx = makeContext(rt, [a, b]);
+    await rt.m.reconcile.reconcileMotionState(ctx, a.pk);
+    await rt.m.reconcile.reconcileMotionState(ctx, b.pk);
+    await settle(ctx);
+    if (where(ctx, a.mac) !== 'PROXY' || where(ctx, b.mac) !== 'PROXY') {
+      throw new Error(`setup: a ${where(ctx, a.mac)}, b ${where(ctx, b.mac)}`);
+    }
+    const subA = ctx.eventSubscriptions.get(a.mac);
+    const subB = ctx.eventSubscriptions.get(b.mac);
+    const connA = await rt.handlers['onvif.getConnection'](a);
+    const connB = await rt.handlers['onvif.getConnection'](b);
+
+    // J1: an Unsubscribe for camera a gets no answer within its 1 s.
+    holdA = true;
+    const tU = Date.now();
+    await rt.m.events.unsubscribe(connA, subA.subscriptionPath, subA.referenceParameters);
+    const unsubMs = Date.now() - tU;
+    holdA = false;
+    const j1 = await renewVia(rt, connA, subA);
+    c.num('J1_unsubscribe_ms', unsubMs);
+    c.num('J1_renew_a', j1);
+    c.ok('J1: Protect gives up on the Unsubscribe after about 1 s',
+      unsubMs >= 900 && unsubMs < 2000, unsubMs);
+    c.ok('J1: camera a\'s next request still goes to the recorder', j1.ok, j1);
+
+    // J2: a Renew for camera a gets no answer within its 4 s.
+    holdA = true;
+    const j2a = await renewVia(rt, connA, subA);
+    const j2b = await renewVia(rt, connB, subB);
+    const j2a2 = await renewVia(rt, connA, subA);
+    holdA = false;
+    await sleep(600);
+    const j2a3 = await renewVia(rt, connA, subA);
+    c.num('J2', { a: j2a, b: j2b, a_again: j2a2, a_later: j2a3 });
+    c.ok('J2: camera a\'s Renew times out after about 4 s',
+      !j2a.ok && j2a.ms >= 3900 && j2a.ms < 5500, j2a);
+    c.ok('J2: camera b\'s Renew right after it is answered by the recorder', j2b.ok, j2b);
+    c.ok('J2: camera a\'s next request within 500 ms fails at once',
+      !j2a2.ok && j2a2.ms < 200, j2a2);
+    c.ok('J2: 500 ms later camera a\'s requests go to the recorder again', j2a3.ok, j2a3);
+    c.ok('no warn logs from Protect', warns(rt).length === 0, warns(rt));
+    c.num('recorder_warnings', recorderWarnings(rec));
+  } finally {
+    await relay.close();
+  }
+}
+
 const SCENARIOS = { A: scenarioA, B: scenarioB, C: scenarioC, D: scenarioD, E: scenarioE,
-                    F: scenarioF, G: scenarioG, H: scenarioH };
+                    F: scenarioF, G: scenarioG, H: scenarioH, I: scenarioI, J: scenarioJ };
 
 async function main() {
   if (await portInUse(port)) {
