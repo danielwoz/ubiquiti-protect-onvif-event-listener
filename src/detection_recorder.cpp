@@ -100,6 +100,13 @@ bool is_known_non_detection_topic(const std::string& topic) {
   return topic == "tns1:Device";
 }
 
+// Some cameras send an empty NotificationMessage -- no Topic and an empty
+// Message -- alongside their motion notifications.  There is no topic to
+// add support for, so it is dropped without the unhandled-topic warning.
+bool is_empty_notification(const OnvifEvent& ev) {
+  return ev.topic.empty() && ev.source.empty() && ev.data.empty();
+}
+
 // Map an ONVIF tt:ClassType token to our internal detection type.
 // Returns empty when the value is absent or something we don't model.
 //
@@ -1625,7 +1632,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // of looking silently dead.  The data keys go in the same line
     // because they are what a handler for the topic would need.
     if (ev.property_op != "Initialized" &&
-        !is_known_non_detection_topic(ev.topic)) {
+        !is_known_non_detection_topic(ev.topic) &&
+        !is_empty_notification(ev)) {
       std::string key = ev.camera_ip + "|" + ev.topic;
       if (key.size() > kMaxTopicKeyLen) key.resize(kMaxTopicKeyLen);
       bool first = false;

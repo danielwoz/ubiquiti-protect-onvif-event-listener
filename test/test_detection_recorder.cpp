@@ -69,6 +69,9 @@
 #include <utility>
 #include <vector>
 
+#include "absl/log/log_entry.h"
+#include "absl/log/log_sink.h"
+#include "absl/log/log_sink_registry.h"
 #include "alarm_notifier.hpp"
 #include "detection_recorder.hpp"
 #include "onvif_listener.hpp"
@@ -2425,6 +2428,84 @@ static void test_unhandled_topic_records_nothing() {
             std::to_string(bptr->events.size()));
 }
 
+// Collects log lines so a test can check what reached the journal.
+class CaptureSink : public absl::LogSink {
+ public:
+  void Send(const absl::LogEntry& entry) override {
+    std::lock_guard<std::mutex> lk(mu_);
+    lines_.emplace_back(entry.text_message());
+  }
+  int count(const std::string& needle) {
+    std::lock_guard<std::mutex> lk(mu_);
+    int n = 0;
+    for (const std::string& l : lines_)
+      if (l.find(needle) != std::string::npos) ++n;
+    return n;
+  }
+
+ private:
+  std::mutex mu_;
+  std::vector<std::string> lines_;
+};
+
+// Some cameras send an empty NotificationMessage (no Topic, empty Message)
+// alongside motion.  It must be dropped without the unhandled-topic
+// warning, while a real unknown topic -- or a topic-less message that does
+// carry data -- is still reported.
+static void test_empty_notification_is_silent() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("empty_notification: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+
+  CaptureSink sink;
+  absl::AddLogSink(&sink);
+
+  onvif::OnvifEvent empty;
+  empty.camera_ip  = "192.168.1.211";
+  empty.event_time = "2026-03-31T10:00:00Z";
+  recorder.on_event(empty);
+  recorder.on_event(empty);
+
+  onvif::OnvifEvent unknown;
+  unknown.camera_ip   = "192.168.1.211";
+  unknown.topic       = "tns1:RuleEngine/CountAggregation/Counter";
+  unknown.event_time  = "2026-03-31T10:00:01Z";
+  unknown.property_op = "Changed";
+  unknown.data["Count"] = "3";
+  recorder.on_event(unknown);
+
+  onvif::OnvifEvent topicless;
+  topicless.camera_ip   = "192.168.1.211";
+  topicless.event_time  = "2026-03-31T10:00:02Z";
+  topicless.property_op = "Changed";
+  topicless.data["State"] = "true";
+  recorder.on_event(topicless);
+
+  absl::RemoveLogSink(&sink);
+
+  CHECK(sink.count("unhandled ONVIF topic \"\" -- no detection recorded. "
+                   "Data: (no data fields)") == 0,
+        "an empty notification must not be reported");
+  CHECK(sink.count("unhandled ONVIF topic") == 2,
+        "expected 2 unhandled-topic warnings (unknown topic, topic-less data), "
+        "got " + std::to_string(sink.count("unhandled ONVIF topic")));
+  CHECK(sink.count("unhandled ONVIF topic \"tns1:RuleEngine/CountAggregation/"
+                   "Counter\"") == 1,
+        "a real unknown topic must still be reported");
+  CHECK(sink.count("unhandled ONVIF topic \"\" -- no detection recorded. "
+                   "Data: State=true") == 1,
+        "a topic-less message with data must still be reported");
+  CHECK(bptr->events.empty(),
+        "empty or unhandled notifications must not record events, got " +
+            std::to_string(bptr->events.size()));
+}
+
 // detectionLabels rows carry the labels as they exist when the detection
 // is written.  Protect's hourly cleanupLabels deletes labels that no
 // event-level row refers to (including camera:<id>, which lists a
@@ -3819,6 +3900,8 @@ int main() {
   run_test("alt_port_camera",            [&] { test_alt_port_camera(dir()); });
   run_test("unhandled_topic_records_nothing",
            [] { test_unhandled_topic_records_nothing(); });
+  run_test("empty_notification_is_silent",
+           [] { test_empty_notification_is_silent(); });
   run_test("detection_labels_follow_label_cleanup",
            [] { test_detection_labels_follow_label_cleanup(); });
   run_test("pg_text_array", [] { test_pg_text_array(); });
