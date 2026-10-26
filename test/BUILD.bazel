@@ -585,6 +585,8 @@ cc_test(
         "//:pullpoint_hub",
         "//:notification_fragments",
         "//:upstream_event",
+        "@com_google_absl//absl/log:globals",
+        "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/log:log_entry",
         "@com_google_absl//absl/log:log_sink",
         "@com_google_absl//absl/log:log_sink_registry",

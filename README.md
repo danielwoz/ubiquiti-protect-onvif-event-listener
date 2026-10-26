@@ -169,10 +169,13 @@ cameras' MAC addresses, comma-separated (case and `:` or `-` separators don't ma
   camera.
 - When onvif-recorder restarts for a settings change or a package update, it keeps its
   subscription to the camera, so in most cases Protect should see no gap in events.
-- The Camera health card shows a short status under each ticked camera, such as
-  `via onvif-recorder` once Protect gets the camera's events that way, or
-  `Protect restart pending`. Log lines about sharing start with `[event_proxy]`
-  (`journalctl -u onvif-recorder`).
+- The Camera health card shows under each ticked camera where Protect gets its events
+  from right now: `via onvif-recorder` while Protect pulls them from onvif-recorder, or
+  `direct (…)` with the reason while Protect is subscribed to the camera itself, such as
+  `direct (Protect restart pending)` or `direct (handed back: silent)`. Log lines about
+  sharing start with `[event_proxy]` (`journalctl -u onvif-recorder`); the warnings among
+  them, such as a hand-back or Protect moving to onvif-recorder, are logged even without
+  `--verbose`.
 
 **Limitations:**
 
@@ -185,9 +188,10 @@ cameras' MAC addresses, comma-separated (case and `:` or `-` separators don't ma
   paired with an AI Port can't be shared.
 - If onvif-recorder can't get events from the camera for a while (from a few minutes up to
   about half an hour, depending on how it fails), it hands the camera back to Protect, which
-  then subscribes to the camera directly again. The status shows `handed back: …` and the
-  log has a warning. onvif-recorder should take the camera back once its own subscription
-  has worked again for about five minutes; a restart of onvif-recorder does not reset this.
+  then subscribes to the camera directly again. The status shows `direct (handed back: …)`
+  and the log has a warning. onvif-recorder should take the camera back once its own
+  subscription has worked again for about five minutes; a restart of onvif-recorder does
+  not reset this.
 - Turning sharing off for one camera while others stay shared puts that camera back to how
   it was before, including the subscriber conflict on a single-subscriber camera.
 - onvif-recorder serves Protect on port 7892 of the loopback address only. If another

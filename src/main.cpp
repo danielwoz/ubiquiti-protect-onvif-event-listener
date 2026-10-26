@@ -114,7 +114,8 @@ ABSL_FLAG(int32_t, momentary_event_sec, 4,
     "clips feel too short to review.");
 ABSL_FLAG(bool, verbose, false,
     "Enable verbose logging (INFO level): subscription lifecycle, "
-    "events received, and renewals. Default logs errors only.");
+    "events received, and renewals. Default logs errors only, plus "
+    "event-sharing warnings.");
 ABSL_FLAG(int32_t, cpu_profile_hz, 0,
     "Frequency (Hz) at which the CPU profiler samples the call "
     "stacks of all threads via SIGRTMIN+1.  0 disables sampling. "
@@ -614,6 +615,10 @@ int main(int argc, char* argv[]) {
     absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
   } else {
     absl::SetStderrThreshold(absl::LogSeverityAtLeast::kError);
+    // Event-sharing warnings (hand-backs, Protect moving between the
+    // recorder and the camera, declines) reach the journal regardless.
+    static onvif::pullpoint::WarningSink event_proxy_warnings;
+    absl::AddLogSink(&event_proxy_warnings);
   }
 
   const std::string db_conn     = absl::GetFlag(FLAGS_db_conn);
@@ -803,6 +808,8 @@ int main(int argc, char* argv[]) {
   if (proxy_mode != ep::Mode::kOff) {
     PullPointHub::Options hub_opts;
     hub_opts.state_path = state_dir + "/" + ep::kHubStateFile;
+    hub_opts.max_pull_points_total =
+        onvif::pullpoint::max_pull_points_total_for(proxy.macs.size());
     hub = std::make_shared<PullPointHub>(hub_opts);
     pp_server = std::make_unique<PullPointServer>(hub.get());
     if (pp_server->start(PullPointServer::kDefaultPort, 10)) {

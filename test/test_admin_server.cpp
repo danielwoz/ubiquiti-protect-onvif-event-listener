@@ -378,6 +378,14 @@ int main() {
           "config form skips protect_event_proxy_cameras");
     check(page.find("colspan=\"8\"") == std::string::npos,
           "no camera health row still spans the old column count");
+    // Each shared camera's status says where Protect's events come from:
+    // through onvif-recorder while a pull point was pulled recently, else
+    // directly from the camera, with the hub's reason.
+    check(page.find("p.last_pull_age_s <= VIA_RECORDER_PULL_AGE_S") != std::string::npos,
+          "share status: via onvif-recorder only while Protect pulls");
+    check(page.find("s('direct (' + why + ')'") != std::string::npos &&
+              page.find("direct('handed back: ' + handedBack)") != std::string::npos,
+          "share status: direct, with the reason or hand-back");
   }
 
   // GET /api/event_proxy without a status provider reports sharing off.

@@ -17,12 +17,15 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "absl/log/log_entry.h"
+#include "absl/log/log_sink.h"
 #include "upstream_event.hpp"
 
 namespace onvif {
@@ -58,6 +61,26 @@ class Clock {
 };
 Clock* real_clock();
 
+// Options::max_pull_points_total for @p shared_cameras shared cameras:
+// 4 per shared camera, at least 64.  Protect keeps one pull point per
+// camera, plus a second while it moves one and those whose Create it gave
+// up on; over the cap every new pull point evicts the least recently
+// pulled one, with the events queued for it.
+size_t max_pull_points_total_for(size_t shared_cameras);
+
+// Without --verbose only errors reach stderr, and so the journal.  This
+// sink copies event-sharing warnings ("[event_proxy] ..." lines) to
+// @p out as well, unless the stderr threshold already lets them through.
+// Register it with absl::AddLogSink().
+class WarningSink : public absl::LogSink {
+ public:
+  explicit WarningSink(std::FILE* out = stderr) : out_(out) {}
+  void Send(const absl::LogEntry& entry) override;
+
+ private:
+  std::FILE* const out_;
+};
+
 struct HubCamera {
   std::string ip;        // CameraConfig::ip
   std::string mac;       // upper-case hex without colons; may be empty
@@ -90,7 +113,12 @@ class PullPointHub {
     size_t max_cache_entries = 256;
     size_t max_cache_bytes = 1024 * 1024;
     size_t max_pull_points_per_camera = 8;
+    // See max_pull_points_total_for().
     size_t max_pull_points_total = 64;
+    // A pull point is kept this long after its last pull, also past the
+    // TerminationTime it reported, so a pause in Protect's polling does
+    // not lose the events queued for it.
+    std::chrono::seconds pull_point_grace{180};
   };
 
   // Result of a CreatePullPointSubscription.

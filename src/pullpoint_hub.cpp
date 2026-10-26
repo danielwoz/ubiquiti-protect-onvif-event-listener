@@ -43,7 +43,11 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/log_severity.h"
+#include "absl/log/globals.h"
 #include "absl/log/log.h"
+#include "absl/strings/match.h"
+#include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "notification_fragments.hpp"
@@ -79,6 +83,8 @@ constexpr seconds kPersistGranularity{600};
 constexpr int64_t kPersistGranularityMs = kPersistGranularity.count() * 1000;
 constexpr seconds kDeclineLogInterval{300};
 constexpr seconds kOverflowLogInterval{60};
+constexpr seconds kEvictionWarnInterval{600};
+constexpr seconds kMoveWarnInterval{600};
 constexpr std::chrono::hours kSummaryInterval{1};
 constexpr size_t kMaxTombstones = 1024;
 constexpr size_t kMaxDetailBytes = 300;
@@ -421,6 +427,7 @@ struct Counters {
   uint64_t drops = 0;
   uint64_t adoptions = 0;
   uint64_t expiries = 0;
+  uint64_t evictions = 0;
   uint64_t handbacks = 0;
   uint64_t nudges = 0;
   uint64_t resubscribes = 0;
@@ -504,6 +511,8 @@ struct CameraState {
   std::optional<SteadyTime> resubscribe_planned_at;
   std::optional<SteadyTime> nudged_at;
   std::optional<SteadyTime> overflow_logged_at;
+  std::optional<SteadyTime> move_warned_at;
+  uint64_t moves_since_warning = 0;
 
   // Property cache, most recently updated first.
   std::list<CacheEntry> cache;
@@ -537,7 +546,8 @@ void write_counters(std::ostringstream* o, const Counters& c) {
      << ",\"renews\":" << c.renews << ",\"renew_faults\":" << c.renew_faults
      << ",\"pulls\":" << c.pulls << ",\"msgs_out\":" << c.msgs_out
      << ",\"drops\":" << c.drops << ",\"adoptions\":" << c.adoptions
-     << ",\"expiries\":" << c.expiries << ",\"handbacks\":" << c.handbacks
+     << ",\"expiries\":" << c.expiries << ",\"evictions\":" << c.evictions
+     << ",\"handbacks\":" << c.handbacks
      << ",\"nudges\":" << c.nudges << ",\"resubscribes\":" << c.resubscribes
      << ",\"fragments\":" << c.fragments
      << ",\"oversize_dropped\":" << c.oversize_dropped << '}';
@@ -593,6 +603,21 @@ Clock* real_clock() {
   return clock;
 }
 
+size_t max_pull_points_total_for(size_t shared_cameras) {
+  constexpr size_t kMinTotal = 64;
+  constexpr size_t kPerCamera = 4;
+  return std::max(kMinTotal, kPerCamera * shared_cameras);
+}
+
+void WarningSink::Send(const absl::LogEntry& entry) {
+  if (entry.log_severity() != absl::LogSeverity::kWarning) return;
+  if (entry.log_severity() >= absl::StderrThreshold()) return;   // printed already
+  if (!absl::StartsWith(entry.text_message(), "[event_proxy]")) return;
+  const absl::string_view line = entry.text_message_with_prefix_and_newline();
+  std::fwrite(line.data(), 1, line.size(), out_);
+  std::fflush(out_);
+}
+
 namespace internal {
 
 void set_fragment_ops_for_testing(const FragmentOps& ops) {
@@ -628,6 +653,10 @@ struct PullPointHub::Impl {
   std::deque<std::pair<std::string, SteadyTime>> tombstone_order;
   std::map<std::string, SteadyTime> decline_logged;
   std::map<std::string, Persisted> loaded;      // state file, by MAC
+  // Adoptions for cameras not registered yet, by camera key; counted on
+  // the camera once it is registered.
+  std::map<std::string, uint64_t> early_adoptions;
+  std::optional<SteadyTime> eviction_warned_at;
   Counters hourly;
   std::function<void(const std::string&)> nudge_fn;
   std::function<void(const std::string&)> resubscribe_fn;
@@ -762,8 +791,11 @@ struct PullPointHub::Impl {
     if (it != decline_logged.end() && now - it->second < kDeclineLogInterval) return;
     if (decline_logged.size() >= kMaxDeclineLogKeys) decline_logged.clear();
     decline_logged[k] = now;
-    LOG(INFO) << "[event_proxy] " << label(c, key) << " declined Protect's " << what
-              << ": " << reason;
+    // Declines for a shared camera send Protect to the camera itself.
+    LOG(LEVEL(c != nullptr && c->proxied ? absl::LogSeverity::kWarning
+                                         : absl::LogSeverity::kInfo))
+        << "[event_proxy] " << label(c, key) << " declined Protect's " << what << ": "
+        << reason;
   }
 
   // Append to a pull point's queue.  Over the caps, the oldest message
@@ -851,25 +883,37 @@ struct PullPointHub::Impl {
   }
 
   // Remove the least recently pulled pull point (of @p key when given).
-  bool evict_one(const std::string* key) {
+  // Evictions over the total cap are warned about every
+  // kEvictionWarnInterval: they mean the cap is too small for the cameras
+  // Protect pulls through the recorder.
+  bool evict_one(const std::string* key, SteadyTime now) {
     std::shared_ptr<PullPoint> victim;
     for (const auto& kv : pull_points) {
       if (key != nullptr && kv.second->key != *key) continue;
       if (!victim || kv.second->last_pull < victim->last_pull) victim = kv.second;
     }
     if (!victim) return false;
-    LOG(INFO) << "[event_proxy] " << label(camera_by_key(victim->key), victim->key)
-              << " dropped Protect subscription pp=" << id8(victim->id)
-              << " (too many subscriptions)";
+    CameraState* c = camera_by_key(victim->key);
+    count(c, &Counters::evictions);
+    const bool warn = key == nullptr && (!eviction_warned_at ||
+                                         now - *eviction_warned_at >= kEvictionWarnInterval);
+    if (warn) eviction_warned_at = now;
+    LOG(LEVEL(warn ? absl::LogSeverity::kWarning : absl::LogSeverity::kInfo))
+        << "[event_proxy] " << label(c, victim->key) << " dropped Protect subscription pp="
+        << id8(victim->id) << " (pulled " << whole_seconds(now - victim->last_pull)
+        << "s ago; too many subscriptions"
+        << (key == nullptr ? ", over " + std::to_string(opts.max_pull_points_total) + " in total"
+                           : std::string(" for this camera"))
+        << ')';
     remove_pull_point(victim->id);
     return true;
   }
 
   std::shared_ptr<PullPoint> add_pull_point(const std::string& key, const std::string& id,
                                             bool adopted, SteadyTime now, seconds ttl) {
-    while (pull_point_count(key) >= opts.max_pull_points_per_camera && evict_one(&key)) {
+    while (pull_point_count(key) >= opts.max_pull_points_per_camera && evict_one(&key, now)) {
     }
-    while (pull_points.size() >= opts.max_pull_points_total && evict_one(nullptr)) {
+    while (pull_points.size() >= opts.max_pull_points_total && evict_one(nullptr, now)) {
     }
     auto pp = std::make_shared<PullPoint>();
     pp->id = id;
@@ -892,6 +936,10 @@ struct PullPointHub::Impl {
     if (st == PpState::kServing && c != nullptr && c->up) snapshot = seed(pp.get(), c, now);
     if (c != nullptr && c->proxied && !c->up) maybe_nudge(c, now, act);
     count(c, &Counters::adoptions);
+    if (c == nullptr) {
+      if (early_adoptions.size() >= kMaxDeclineLogKeys) early_adoptions.clear();
+      ++early_adoptions[key];
+    }
     LOG(INFO) << "[event_proxy] " << label(c, key) << " adopted Protect subscription pp="
               << id8(id) << " (" << pp_state_name(st) << ", snapshot=" << snapshot << ')';
     return pp;
@@ -1144,6 +1192,13 @@ void PullPointHub::register_camera(const HubCamera& cam) {
   const std::string key = camera_key_from_ip(cam.ip);
   auto ins = m.cameras.try_emplace(key);
   CameraState& c = ins.first->second;
+  if (ins.second) {
+    auto early = m.early_adoptions.find(key);
+    if (early != m.early_adoptions.end()) {
+      c.counters.adoptions += early->second;
+      m.early_adoptions.erase(early);
+    }
+  }
   const bool was_proxied = c.proxied;
   c.key = key;
   c.ip = cam.ip;
@@ -1185,7 +1240,8 @@ void PullPointHub::set_ready() {
     if (kv.second.proxied) ++shared;
   }
   LOG(INFO) << "[event_proxy] ready: " << impl_->cameras.size() << " camera(s), " << shared
-            << " shared with Protect";
+            << " shared with Protect, up to " << impl_->opts.max_pull_points_total
+            << " Protect subscriptions";
 }
 
 bool PullPointHub::ready() const {
@@ -1342,8 +1398,23 @@ bool PullPointHub::status_probe(const std::string& key, std::string* reason) {
         c->resubscribe_due = now + m.opts.resubscribe_after_status;
       }
       m.count(c, &Counters::status_yes);
-      LOG(WARNING) << "[event_proxy] " << c->ip
-                   << " Protect moving its subscription from the camera to the recorder";
+      // A warning per camera every kMoveWarnInterval, INFO in between, so
+      // a camera that keeps moving back is visible without flooding the
+      // journal.
+      const bool warn = !c->move_warned_at || now - *c->move_warned_at >= kMoveWarnInterval;
+      LOG(LEVEL(warn ? absl::LogSeverity::kWarning : absl::LogSeverity::kInfo))
+          << "[event_proxy] " << c->ip
+          << " Protect moving its subscription from the camera to the recorder"
+          << (warn && c->moves_since_warning > 0
+                  ? " (" + std::to_string(c->moves_since_warning) +
+                        " more since the last warning)"
+                  : std::string());
+      if (warn) {
+        c->move_warned_at = now;
+        c->moves_since_warning = 0;
+      } else {
+        ++c->moves_since_warning;
+      }
     } else {
       m.count(c, &Counters::status_no);
     }
@@ -1494,9 +1565,15 @@ void PullPointHub::tick() {
     Impl& m = *impl_;
     const SteadyTime now = m.clock->steady_now();
 
+    // A pull point outlives the TerminationTime it reported by up to
+    // pull_point_grace after its last pull: Protect sometimes pauses
+    // polling for about a minute and then pulls the same id again.
     std::vector<std::shared_ptr<PullPoint>> expired;
     for (const auto& kv : m.pull_points) {
-      if (now > kv.second->expiry) expired.push_back(kv.second);
+      const PullPoint& pp = *kv.second;
+      if (now > std::max(pp.expiry, pp.last_pull + m.opts.pull_point_grace)) {
+        expired.push_back(kv.second);
+      }
     }
     for (const auto& pp : expired) {
       CameraState* c = m.camera_by_key(pp->key);
@@ -1536,7 +1613,7 @@ void PullPointHub::tick() {
                 << " renew_faults=" << h.renew_faults << " pulls=" << h.pulls
                 << " msgs_out=" << h.msgs_out << " drops=" << h.drops
                 << " adoptions=" << h.adoptions << " expiries=" << h.expiries
-                << " handbacks=" << h.handbacks;
+                << " handbacks=" << h.handbacks << " evictions=" << h.evictions;
       m.hourly = Counters();
       m.summary_at = now;
     }

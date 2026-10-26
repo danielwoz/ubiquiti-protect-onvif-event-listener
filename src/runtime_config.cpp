@@ -245,7 +245,7 @@ const std::vector<Entry>& Schema() {
     // ---- Logging ----
     {"verbose", Type::Bool,
      "Verbose log level (INFO and above).  Disabled by default writes only "
-     "errors.",
+     "errors, plus event-sharing warnings.",
      "Logging"},
 
     // ---- Auto-recovery (events from on-device backups) ----

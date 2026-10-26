@@ -44,6 +44,8 @@
 #include <utility>
 #include <vector>
 
+#include "absl/log/globals.h"
+#include "absl/log/log.h"
 #include "absl/log/log_entry.h"
 #include "absl/log/log_sink.h"
 #include "absl/log/log_sink_registry.h"
@@ -173,13 +175,24 @@ class CaptureSink : public absl::LogSink {
  public:
   void Send(const absl::LogEntry& entry) override {
     std::lock_guard<std::mutex> lk(mu_);
-    lines_.emplace_back(entry.text_message());
+    lines_.emplace_back(entry.log_severity(), std::string(entry.text_message()));
   }
   size_t count(const std::string& needle) {
     std::lock_guard<std::mutex> lk(mu_);
     size_t n = 0;
-    for (const std::string& l : lines_) {
-      if (l.find(needle) != std::string::npos) ++n;
+    for (const auto& l : lines_) {
+      if (l.second.find(needle) != std::string::npos) ++n;
+    }
+    return n;
+  }
+  // Lines with @p needle logged at WARNING.
+  size_t warnings(const std::string& needle) {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t n = 0;
+    for (const auto& l : lines_) {
+      if (l.first == absl::LogSeverity::kWarning && l.second.find(needle) != std::string::npos) {
+        ++n;
+      }
     }
     return n;
   }
@@ -190,7 +203,7 @@ class CaptureSink : public absl::LogSink {
 
  private:
   std::mutex mu_;
-  std::vector<std::string> lines_;
+  std::vector<std::pair<absl::LogSeverity, std::string>> lines_;
 };
 
 CaptureSink* g_logs = nullptr;
@@ -313,6 +326,16 @@ int64_t json_int(const std::string& json, const std::string& name, size_t from =
   const size_t at = json.find(pat, from);
   if (at == std::string::npos) return -1;
   return std::strtoll(json.c_str() + at + pat.size(), nullptr, 10);
+}
+
+// Sum of every integer member @p name in a JSON text.
+int64_t json_sum(const std::string& json, const std::string& name) {
+  int64_t sum = 0;
+  const std::string pat = "\"" + name + "\":";
+  for (size_t at = json.find(pat); at != std::string::npos; at = json.find(pat, at + 1)) {
+    sum += std::strtoll(json.c_str() + at + pat.size(), nullptr, 10);
+  }
+  return sum;
 }
 
 // ---------------------------------------------------------------------
@@ -514,8 +537,11 @@ void test_create_declines() {
   Rig r;
   r.add(kIp, true, kMac);
   r.add(kIp2, false);
+  g_logs->clear();
   auto c = r.hub->create(kKey, std::nullopt);
   check(!c.accepted && c.reason == "starting", "decline: not ready");
+  check(g_logs->warnings(std::string(kIp) + " declined Protect's subscription: starting") == 1,
+        "a shared camera's decline is a warning");
   std::string why;
   check(!r.hub->status_probe(kKey, &why) && why == "starting", "status no: not ready");
   r.hub->set_ready();
@@ -524,6 +550,11 @@ void test_create_declines() {
   check(!c.accepted && c.reason == "unknown camera", "decline: unknown camera");
   c = r.hub->create(kKey2, std::nullopt);
   check(!c.accepted && c.reason == "not shared", "decline: not shared");
+  check(g_logs->count("10.9.9.9 declined Protect's subscription: unknown camera") == 1 &&
+            g_logs->count(std::string(kIp2) + " declined Protect's subscription: not shared") ==
+                1 &&
+            g_logs->warnings("unknown camera") == 0 && g_logs->warnings("not shared") == 0,
+        "declines of cameras that are not shared stay INFO");
   c = r.hub->create(kKey, std::nullopt);
   check(c.accepted, "accepted while upstream not yet up");
   check(r.nudge_count() == 1, "create while not up nudges");
@@ -617,19 +648,57 @@ void test_ttl_and_expiry() {
 
   auto d = r->hub->create(kKey, std::nullopt);
   r->clock.advance(seconds(59));
-  r->pull(d.id);               // extends to now + 60 s
+  auto pd = r->pull(d.id);     // TerminationTime now + 60 s
+  check(secs_from_now(r->clock, pd.termination) == 60, "pull reports now + 60 s");
   r->clock.advance(seconds(59));
   r->hub->tick();
   check(r->hub->snapshot_json().find(d.id.substr(0, 8)) != std::string::npos,
         "pull extends expiry");
+
+  // Past its TerminationTime a pull point stays, with its queue, until
+  // 180 s after its last pull: Protect pausing for about a minute and
+  // then pulling the same id again loses nothing.
+  feed(r->hub.get(), kIp, {event("<during-pause/>")});
+  auto e = r->hub->create(kKey, std::nullopt);
+  feed(r->hub.get(), kIp, {event("<for-e/>")});
+  r->clock.advance(seconds(100));
+  r->hub->tick();
+  auto pe = r->pull(e.id);
+  check(pe.status == PullPointHub::PullResult::Status::kOk && join(texts(pe)) == "<for-e/>",
+        "pulled 100 s after its last pull, past its TerminationTime: queue kept");
+  check(secs_from_now(r->clock, pe.termination) == 60,
+        "the TerminationTime reported after a pause is still now + 60 s");
+  check(json_int(r->hub->snapshot_json(), "adoptions") == 0, "no adoption after the pause");
+  r->clock.advance(seconds(20));   // 179 s after d's last pull
+  r->hub->tick();
+  std::string snap = r->hub->snapshot_json();
+  check(snap.find(d.id.substr(0, 8)) != std::string::npos,
+        "kept up to 180 s after the last pull");
   g_logs->clear();
   r->clock.advance(seconds(2));
   r->hub->tick();
-  const std::string snap = r->hub->snapshot_json();
+  snap = r->hub->snapshot_json();
   check(snap.find(d.id.substr(0, 8)) == std::string::npos, "expired pull point removed");
+  check(snap.find(e.id.substr(0, 8)) != std::string::npos,
+        "a pull point pulled since stays");
   check(json_int(snap, "expiries") >= 1, "expiry counted");
-  check(g_logs->count("Protect subscription expired (pp=" + d.id.substr(0, 8)) == 1,
+  check(g_logs->count("Protect subscription expired (pp=" + d.id.substr(0, 8) +
+                      ", last pull 181s ago)") == 1,
         "expiry logged");
+
+  // A grace below the TerminationTime leaves the TerminationTime in charge.
+  PullPointHub::Options o;
+  o.pull_point_grace = seconds(10);
+  auto g = ready_rig(o);
+  auto f = g->hub->create(kKey, seconds(120));
+  g->clock.advance(seconds(119));
+  g->hub->tick();
+  check(g->hub->snapshot_json().find(f.id.substr(0, 8)) != std::string::npos,
+        "kept until its TerminationTime");
+  g->clock.advance(seconds(2));
+  g->hub->tick();
+  check(g->hub->snapshot_json().find(f.id.substr(0, 8)) == std::string::npos,
+        "removed after its TerminationTime");
   r->subscribed();
   auto p = r->pull(d.id);
   check(p.status == PullPointHub::PullResult::Status::kOk, "expired id is adopted again");
@@ -715,6 +784,20 @@ void test_adoption_states() {
   check(!rn.ok && rn.reason == "unknown camera", "renew adopts unknown camera as draining");
   check(json_int(s->hub->snapshot_json(), "unregistered_pull_points") == 1,
         "unregistered camera's pull point reported");
+
+  // Adoptions before the camera is registered (Protect pulling while the
+  // camera list loads) count on the camera once it is.
+  Rig e;
+  e.pull(kAdoptId);
+  e.pull(kAdoptId2);
+  e.hub->unsubscribe(kKey, kAdoptId2);
+  e.add(kIp, true, kMac);
+  e.hub->set_ready();
+  check(json_int(e.hub->snapshot_json(), "adoptions") == 2,
+        "adoptions before registration counted on the camera");
+  e.add(kIp, true, kMac);
+  check(json_int(e.hub->snapshot_json(), "adoptions") == 2,
+        "registering again does not count them twice");
 }
 
 void test_snapshot_cache() {
@@ -798,7 +881,7 @@ void test_handback_rejected() {
   r->upstream(UpstreamEvent::kCreateFailed, kIp, 404, "Not Found");
   auto c = r->hub->create(kKey, std::nullopt);
   check(!c.accepted && c.reason == "handed back: rejected", "three rejections: handed back");
-  check(g_logs->count("handing Protect's event subscription back") == 1,
+  check(g_logs->warnings("handing Protect's event subscription back") == 1,
         "hand-back warning logged");
   auto rn = r->hub->renew(kKey, held.id, std::nullopt);
   check(!rn.ok && rn.reason == "handed back: rejected", "held subscription now drains");
@@ -866,7 +949,7 @@ void test_handback_blocked() {
   check(!r->hub->create(kKey, std::nullopt).accepted, "4 min 50 s up: still handed back");
   r->run_for(seconds(10), seconds(10), true, held.id);
   check(r->hub->create(kKey, std::nullopt).accepted, "5 min up: sharing again");
-  check(g_logs->count("sharing events with Protect again") == 1, "recovery logged");
+  check(g_logs->warnings("sharing events with Protect again") == 1, "recovery logged");
   check(r->hub->renew(kKey, held.id, std::nullopt).ok, "held subscription serves again");
 }
 
@@ -942,6 +1025,14 @@ void test_status_probe() {
   const std::string snap = r->hub->snapshot_json();
   check(json_int(snap, "status_yes") == 3 && json_int(snap, "status_no") == 1,
         "status counters");
+  const std::string moving = "Protect moving its subscription from the camera to the recorder";
+  check(g_logs->count(moving) == 3 && g_logs->warnings(moving) == 1,
+        "moves: one warning per camera per 10 min, INFO in between");
+  r->clock.advance(seconds(600));
+  r->pull_ok();
+  check(r->hub->status_probe(kKey, nullptr), "yes 10 min later");
+  check(g_logs->warnings(moving + " (2 more since the last warning)") == 1,
+        "the next warning counts the moves in between");
 }
 
 void test_nudge() {
@@ -1421,9 +1512,12 @@ void test_pull_point_caps() {
             snap.find(b.id.substr(0, 8)) == std::string::npos &&
             snap.find(c.id.substr(0, 8)) != std::string::npos,
         "per-camera cap evicts the least recently pulled");
+  check(g_logs->warnings("too many subscriptions") == 0,
+        "evictions over the per-camera cap stay INFO");
   r->clock.advance(seconds(1));
   r->pull(c.id);
   r->clock.advance(seconds(1));
+  g_logs->clear();
   auto d = r->hub->create(kKey2, std::nullopt);
   r->clock.advance(seconds(1));
   auto e = r->hub->create(kKey2, std::nullopt);
@@ -1433,6 +1527,113 @@ void test_pull_point_caps() {
             snap.find(d.id.substr(0, 8)) != std::string::npos &&
             snap.find(e.id.substr(0, 8)) != std::string::npos,
         "total cap evicts the least recently pulled of any camera");
+  r->clock.advance(seconds(1));
+  auto f = r->hub->create(kKey, std::nullopt);
+  snap = r->hub->snapshot_json();
+  check(snap.find(c.id.substr(0, 8)) == std::string::npos &&
+            snap.find(f.id.substr(0, 8)) != std::string::npos,
+        "total cap evicts again");
+  check(json_int(snap, "evictions", snap.find("\"key\":\"" + std::string(kKey))) == 3 &&
+            json_sum(snap, "evictions") == 3,
+        "evictions counted on the evicted pull points' camera");
+  check(g_logs->warnings("over 3 in total") == 1 && g_logs->count("over 3 in total") == 2,
+        "evictions over the total cap: one warning per 10 min, INFO in between");
+}
+
+// 83 shared cameras, one pull point each, pulled in turn the way Protect
+// polls them: with the cap main.cpp sets nothing is evicted or adopted and
+// every event arrives; with a fixed cap of 64 each pull found its pull
+// point evicted and the events queued for it gone.
+void test_many_shared_cameras() {
+  using onvif::pullpoint::max_pull_points_total_for;
+  check(max_pull_points_total_for(0) == 64 && max_pull_points_total_for(16) == 64 &&
+            max_pull_points_total_for(17) == 68 && max_pull_points_total_for(83) == 332,
+        "cap: 4 per shared camera, at least 64");
+  constexpr int kCameras = 83;
+  constexpr int kRounds = 4;
+  for (const size_t cap : {max_pull_points_total_for(kCameras), size_t{64}}) {
+    const std::string tag = "cap " + std::to_string(cap) + ": ";
+    PullPointHub::Options o;
+    o.max_pull_points_total = cap;
+    Rig r(o);
+    std::vector<std::string> ips;
+    for (int i = 0; i < kCameras; ++i) {
+      char mac[13];
+      std::snprintf(mac, sizeof(mac), "AA%010X", i);
+      ips.push_back("10.1.0." + std::to_string(i + 1));
+      r.add(ips.back(), true, mac);
+      r.subscribed(ips.back());
+    }
+    r.hub->set_ready();
+    g_logs->clear();
+    std::vector<std::string> ids;
+    bool created = true;
+    for (const std::string& ip : ips) {
+      auto c = r.hub->create(camera_key_from_ip(ip), std::nullopt);
+      created = created && c.accepted;
+      ids.push_back(c.id);
+    }
+    check(created, tag + "every camera's Create accepted");
+    int delivered = 0;
+    bool all_ok = true;
+    for (int round = 0; round < kRounds; ++round) {
+      for (int i = 0; i < kCameras; ++i) {
+        r.clock.advance(milliseconds(250));
+        r.pull_ok(ips[i]);
+        feed(r.hub.get(), ips[i], {event("<m" + std::to_string(round) + "/>")});
+        auto p = r.pull(ids[i], 10, 512 * 1024, camera_key_from_ip(ips[i]));
+        all_ok = all_ok && p.status == PullPointHub::PullResult::Status::kOk;
+        delivered += static_cast<int>(p.messages.size());
+        if (i % 4 == 0) r.hub->tick();
+      }
+    }
+    const std::string snap = r.hub->snapshot_json();
+    check(all_ok, tag + "every pull answered");
+    if (cap == max_pull_points_total_for(kCameras)) {
+      check(json_sum(snap, "evictions") == 0 && json_sum(snap, "adoptions") == 0 &&
+                json_sum(snap, "expiries") == 0,
+            tag + "no evictions, adoptions or expiries: " +
+                std::to_string(json_sum(snap, "evictions")));
+      check(delivered == kCameras * kRounds, tag + "every event delivered (" +
+                                                 std::to_string(delivered) + ")");
+      check(g_logs->count("too many subscriptions") == 0, tag + "no eviction logged");
+    } else {
+      check(json_sum(snap, "evictions") > kCameras && json_sum(snap, "adoptions") > kCameras,
+            tag + "thrashes: " + std::to_string(json_sum(snap, "evictions")) + " evictions");
+      check(delivered < kCameras, tag + "events lost (" + std::to_string(delivered) + ")");
+      check(g_logs->warnings("over 64 in total") == 1, tag + "the thrash is warned about once");
+    }
+  }
+}
+
+// WarningSink copies event-sharing warnings to its stream only while the
+// stderr threshold would hide them.
+void test_warning_sink() {
+  const absl::LogSeverityAtLeast saved = absl::StderrThreshold();
+  char* buf = nullptr;
+  size_t len = 0;
+  std::FILE* mem = open_memstream(&buf, &len);
+  {
+    onvif::pullpoint::WarningSink sink(mem);
+    absl::SetStderrThreshold(absl::LogSeverityAtLeast::kError);
+    LOG(WARNING).ToSinkOnly(&sink) << "[event_proxy] cam handing back";
+    LOG(INFO).ToSinkOnly(&sink) << "[event_proxy] cam adopted";
+    LOG(WARNING).ToSinkOnly(&sink) << "[10.0.0.7] renew error";
+    LOG(ERROR).ToSinkOnly(&sink) << "[event_proxy] cam on stderr already";
+    absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
+    LOG(WARNING).ToSinkOnly(&sink) << "[event_proxy] cam with --verbose";
+  }
+  absl::SetStderrThreshold(saved);
+  std::fclose(mem);
+  const std::string out(buf, len);
+  std::free(buf);
+  check(out.find("[event_proxy] cam handing back\n") != std::string::npos && out[0] == 'W',
+        "sink: an event-sharing warning is copied with its prefix");
+  check(out.find("adopted") == std::string::npos, "sink: INFO is not copied");
+  check(out.find("renew error") == std::string::npos, "sink: other warnings are not copied");
+  check(out.find("stderr already") == std::string::npos, "sink: errors are not copied twice");
+  check(out.find("--verbose") == std::string::npos,
+        "sink: nothing copied when the threshold lets warnings through");
 }
 
 void test_hourly_summary() {
@@ -1542,6 +1743,8 @@ int main() {
   test_snapshot_json();
   test_heartbeat_suffix();
   test_pull_point_caps();
+  test_many_shared_cameras();
+  test_warning_sink();
   test_hourly_summary();
   test_concurrency();
 

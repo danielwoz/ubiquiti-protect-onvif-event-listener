@@ -621,34 +621,44 @@ function handedBackReason(h){
     return String(h.reason || '').replace(/^handed back:\s*/, '') || 'unknown';
   return '';
 }
-// Short sharing status under a camera's tickbox as {text, title};
-// text is '' when there is nothing to show.
+// Protect gets a camera's events through onvif-recorder while it pulls
+// one of the camera's pull points at least this often.  It pulls every
+// few seconds, or about every half minute with many cameras shared.
+const VIA_RECORDER_PULL_AGE_S = 90;
+// Short sharing status under a camera's tickbox as {text, title}: where
+// Protect's events for the camera come from now, and why when it is the
+// camera itself.  text is '' when there is nothing to show.
 function shareStatus(ep, c, shared){
   if (!ep || !ep.mode || ep.mode === 'off') return {text: '', title: ''};
   const h = hubCameraFor(ep, c);
   const ready = !!(ep.hub && ep.hub.ready);
-  const serving = !!h && (h.pull_points || []).some(p => p.state === 'serving');
+  const via = !!h && (h.pull_points || []).some(
+      p => typeof p.last_pull_age_s === 'number'
+           && p.last_pull_age_s <= VIA_RECORDER_PULL_AGE_S);
   const detail = h && h.failure_detail ? String(h.failure_detail) : '';
   const s = (text, title) => ({text, title: title || detail});
   // Unticked cameras Protect still reaches through onvif-recorder until
   // its next restart picks up the removed patch.
-  if (!shared) return serving ? s('via onvif-recorder until Protect restarts')
-                              : s('');
-  if (serving) return s('via onvif-recorder');
+  if (!shared) return via ? s('via onvif-recorder until Protect restarts')
+                          : s('');
+  if (via) return s('via onvif-recorder',
+                    'Protect gets this camera\'s events through onvif-recorder.');
+  const direct = (why, title) => s('direct (' + why + ')',
+      ('Protect is subscribed to the camera itself. ' + (title || detail)).trim());
   const handedBack = h ? handedBackReason(h) : '';
-  if (handedBack)
-    return s('handed back: ' + handedBack,
-             ('Protect is using its own subscription to the camera again. '
-              + detail).trim());
-  if (ep.protect_restart_pending) return s('Protect restart pending');
+  if (handedBack) return direct('handed back: ' + handedBack);
+  if (ep.protect_restart_pending) return direct('Protect restart pending');
   if (!h && ready)
-    return s('not available',
-             "onvif-recorder isn't subscribed to this camera (disabled, "
-             + 'paired with an AI Port, or not found), so it has no events '
-             + 'to share.');
-  if (!h || !ready || h.reason === 'starting' || h.upstream !== 'up')
-    return s('starting');
-  return s('not used by Protect yet');
+    return direct('not available',
+                  "onvif-recorder isn't subscribed to this camera (disabled, "
+                  + 'paired with an AI Port, or not found), so it has no '
+                  + 'events to share.');
+  if (!h || !ready || h.reason === 'starting') return direct('starting');
+  if (h.reason) return direct(String(h.reason));
+  if (h.upstream !== 'up') return direct('camera subscription not up');
+  return direct('not moved yet',
+                'Protect moves to onvif-recorder when it next renews its '
+                + 'subscription, usually within a minute.');
 }
 function renderEventProxyNote(ep){
   const el = document.getElementById('event-proxy-note');

@@ -31,6 +31,9 @@
  *  - a client created late first receives the current state as
  *    Initialized messages;
  *  - a pull point faults once it has been unsubscribed;
+ *  - the recorder asks the camera for its current state
+ *    (SetSynchronizationPoint) once after creating its subscription and
+ *    once after resuming it;
  *  - a recorder restart (listener, hub and server stopped and started
  *    again on the same port, resume and state paths) keeps the clients'
  *    pull points working (adopted) with no new Create at the camera and at
@@ -412,6 +415,7 @@ class Recorder {
   bool start_service(uint16_t port) {
     PullPointHub::Options opts;
     opts.state_path = state_path_;
+    opts.max_pull_points_total = onvif::pullpoint::max_pull_points_total_for(1);
     hub_ = std::make_shared<PullPointHub>(opts);
     server_ = std::make_unique<PullPointServer>(hub_.get());
     if (!server_->start(port, 10)) return false;
@@ -716,6 +720,9 @@ void test_shared_camera(const std::string& capture) {
   // ---- Recorder restart: same port, same resume and state paths. ----
   const int creates_before = emu.creates_total();
   const int syncs_before = emu.sync_points_total();
+  check(syncs_before == 1,
+        "the new camera subscription asks the camera for its current state once (" +
+            std::to_string(syncs_before) + ")");
   const int a_err = a.transport_errors();
   const int b_err = b.transport_errors();
   const int d_err = d.transport_errors();
