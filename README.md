@@ -163,7 +163,9 @@ cameras' MAC addresses, comma-separated (case and `:` or `-` separators don't ma
   onvif-recorder. With `--auto_heal_protect=false`, restart Protect yourself.
 - When Protect subscribes to a shared camera's events, it asks onvif-recorder first. If
   onvif-recorder is not running, declines, or does not answer within a few seconds, Protect
-  subscribes to the camera itself, as it does without sharing.
+  subscribes to the camera itself, as it does without sharing. Time during which Protect
+  itself is stalled (by a long garbage collection, for example) does not count towards
+  those seconds, and a camera that gets no answer does not affect the others.
 - Only the event subscription goes through onvif-recorder. Protect's other requests to the
   camera (video, snapshots, PTZ, its check of the camera's event support) still go to the
   camera.

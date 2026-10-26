@@ -31,6 +31,7 @@ using namespace protect_ui;  // NOLINT(build/namespaces)
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -401,6 +402,28 @@ static void test_wsa_patch() {
 // The route replacement exactly as specified, kept as an independent copy
 // so an accidental edit of the patch table is caught.
 static const char kRoute[] =
+    R"js(t.soapRequestRaw=async function __onvrSoapRaw(e,__onvrRouted){/*onvif-reco)js"
+    R"js(rder:pullpoint*/if(!__onvrRouted&&e&&"string"==typeof e.path){const __onvr)js"
+    R"js(P="/onvif-recorder/pullpoint/",__onvrO={...e,hostname:"127.0.0.1",port:789)js"
+    R"js(2},__onvrB=e.body||{},__onvrK=__onvrP+encodeURIComponent(e.hostname)+"/"+e)js"
+    R"js(ncodeURIComponent(e.port),__onvrW=__onvrSoapRaw.w||(__onvrSoapRaw.w=new Ma)js"
+    R"js(p),__onvrR=(q,u)=>{const n=Error("onvif-recorder: no answer"),l=u?1e3:4e3;)js"
+    R"js(if(performance.now()<(__onvrW.get(__onvrK)||0))return Promise.reject(n);le)js"
+    R"js(t h,d=0;return Promise.race([__onvrSoapRaw(q,1).finally(()=>{d=1}),new Pro)js"
+    R"js(mise((_,j)=>{const a=s=>{h=setTimeout(()=>{const z=performance.now()-s>l+1)js"
+    R"js(e3;setImmediate(()=>{if(d)return;if(z)return a(performance.now());u||__onv)js"
+    R"js(rW.set(__onvrK,performance.now()+500);j(n)})},l)};a(performance.now())})]))js"
+    R"js(.finally(()=>clearTimeout(h))};if(e.path.startsWith(__onvrP))return __onvr)js"
+    R"js(R(__onvrO,__onvrB.Unsubscribe);if(__onvrB.CreatePullPointSubscription)try{)js"
+    R"js(return await __onvrR({...__onvrO,path:__onvrK+e.path})}catch(x){}if(__onvr)js"
+    R"js(B.Renew){let m=0;try{await __onvrR({...__onvrO,path:__onvrK+"/status",body)js"
+    R"js(:{GetServiceCapabilities:{"@_xmlns":"http://www.onvif.org/ver10/events/wsd)js"
+    R"js(l"}}});m=1}catch(x){}if(m)throw Error("onvif-recorder: moving subscription)js"
+    R"js( to proxy")}}const t=`${e.hostname}:${e.port}`;)js";
+
+// The route replacement onvif-recorder 1.6.32 applied: one fail-fast window
+// for all cameras, opened by every timeout.
+static const char kRouteRetired1[] =
     R"js(t.soapRequestRaw=async function __onvrSoapRaw(e,__onvrRouted){/*onvif-re)js"
     R"js(corder:pullpoint*/if(!__onvrRouted&&e&&"string"==typeof e.path){const __)js"
     R"js(onvrP="/onvif-recorder/pullpoint/",__onvrO={...e,hostname:"127.0.0.1",po)js"
@@ -484,6 +507,154 @@ static void test_route_patch_text() {
   check(rep.find(kInjectedMarker) != std::string::npos,
         "route: replacement carries the injected-code marker");
   check(has_known_patch(rep), "route: patched file is recognised as ours");
+  check(rep.find(kBackendPatchRoute.original) == std::string::npos,
+        "route: replacement does not contain its anchor");
+
+  // Earlier texts: each exactly as a release applied it, taken out back to
+  // the same anchor, and never the current text.
+  const char* const retired[] = {kRouteRetired1};
+  check(std::size(kRetiredRoutePatches) == std::size(retired),
+        "route: every earlier text is retired");
+  for (size_t i = 0; i < std::size(kRetiredRoutePatches); ++i) {
+    const Patch& p = kRetiredRoutePatches[i];
+    const std::string old = p.replacement;
+    check(old == retired[i], "route: retired text is the one once applied");
+    check(std::string(p.original) == kBackendPatchRoute.original,
+          "route: retired text goes back to the same anchor");
+    check(old != rep, "route: retired text is not the current one");
+    check(old.size() > tail.size() &&
+              old.compare(old.size() - tail.size(), tail.size(), tail) == 0,
+          "route: retired text keeps the body's first statement");
+    check(has_known_patch(old), "route: retired text is recognised as ours");
+  }
+}
+
+// The patched function still ends where Protect's did and uses neither
+// `this` nor `arguments`, and the prologue declares only names that start
+// with kRouteNamePrefix in the function's scope.
+static void test_route_patch_scan() {
+  const std::string original = kSoapRaw;
+  const std::string patched = with_patch(original, kBackendPatchRoute);
+  const JsBlockScan orig = scan_js_block(original, original.find('{'));
+  const JsBlockScan scan = scan_js_block(patched, patched.find('{'));
+  const size_t grown = std::strlen(kBackendPatchRoute.replacement) -
+                       std::strlen(kBackendPatchRoute.original);
+  check(orig.end != std::string::npos && scan.end == orig.end + grown,
+        "route scan: patched function ends where the original did");
+  check(!orig.uses_this_or_arguments && !scan.uses_this_or_arguments,
+        "route scan: injected code uses neither this nor arguments");
+
+  // Declarations directly in the prologue's block (the function's block is
+  // depth 1, the prologue's `if` block depth 2), before the original body.
+  const std::string rep = kBackendPatchRoute.replacement;
+  const size_t body = rep.find("const t=`${e.hostname}");
+  std::vector<std::string> names;
+  int depth = 0;
+  for (size_t i = rep.find('{'); i < body; ++i) {
+    if (rep[i] == '{') ++depth;
+    if (rep[i] == '}') --depth;
+    if (depth != 2 || (rep.compare(i, 6, "const ") != 0 &&
+                       rep.compare(i, 4, "let ") != 0)) {
+      continue;
+    }
+    size_t j = rep.find(' ', i) + 1;
+    while (j < body) {
+      size_t k = j;
+      while (k < body && is_ident_char(rep[k])) ++k;
+      names.push_back(rep.substr(j, k - j));
+      // Skip the initialiser, up to the next declarator or the end.
+      int nest = 0;
+      while (k < body && (nest > 0 || (rep[k] != ',' && rep[k] != ';'))) {
+        if (rep[k] == '(' || rep[k] == '[' || rep[k] == '{') ++nest;
+        if (rep[k] == ')' || rep[k] == ']' || rep[k] == '}') --nest;
+        ++k;
+      }
+      if (k >= body || rep[k] == ';') break;
+      j = k + 1;
+    }
+  }
+  const std::vector<std::string> expected = {
+      "__onvrP", "__onvrO", "__onvrB", "__onvrK", "__onvrW", "__onvrR"};
+  check(names == expected, "route scan: prologue declares only __onvr names");
+}
+
+// A service.js an earlier version patched gets the current route text, and
+// loses the earlier one when sharing is turned off.
+static void test_route_patch_upgrade() {
+  const std::string path = temp_dir() + "/test_route_upgrade_service.js";
+  const std::string bak = path + ".bak";
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+  const std::unordered_map<std::string, std::string> no_md5;
+  const Patch& old_route = kRetiredRoutePatches[0];
+
+  const std::string original = soap_fixture();
+  const std::string wsa_only = with_patch(original, kBackendPatchWsa);
+  const std::string old_both = with_patch(wsa_only, old_route);
+  const std::string new_both = with_patch(wsa_only, kBackendPatchRoute);
+  check(old_both != wsa_only && new_both != wsa_only && old_both != new_both,
+        "upgrade: fixtures differ");
+
+  // Sharing on: the earlier text is replaced and the backup kept.
+  write_test_file(path, old_both);
+  write_test_file(bak, original);
+  PatchReport rep;
+  check(patch_service_js(path, PatchOptions{true, true}, no_md5, &rep) == 1,
+        "upgrade: one replacement");
+  check(rep.event_proxy == PatchOutcome::kApplied &&
+            rep.onvif_addressing == PatchOutcome::kAlready,
+        "upgrade: outcomes");
+  check(read_test_file(path) == new_both, "upgrade: current text in place");
+  check(occurrences(read_test_file(path), kRouteNamePrefix) ==
+            occurrences(kBackendPatchRoute.replacement, kRouteNamePrefix),
+        "upgrade: nothing of the earlier text left");
+  check(read_test_file(bak) == original, "upgrade: backup kept");
+  check(patch_service_js(path, PatchOptions{true, true}, no_md5, &rep) == 0 &&
+            rep.event_proxy == PatchOutcome::kAlready,
+        "upgrade: second run is a no-op");
+  check(read_test_file(path) == new_both, "upgrade: second run leaves file");
+
+  // With a backup dpkg vouches for, the file is rebuilt from it.
+  write_test_file(path, old_both);
+  std::unordered_map<std::string, std::string> md5sums;
+  md5sums[path.substr(1)] = md5_of_file(bak);
+  check(patch_service_js(path, PatchOptions{true, true}, md5sums, &rep) == 2 &&
+            rep.event_proxy == PatchOutcome::kApplied,
+        "upgrade from .bak: applied");
+  check(read_test_file(path) == new_both, "upgrade from .bak: file");
+
+  // Sharing off: the earlier text is removed, and reported as removed.
+  write_test_file(path, old_both);
+  patch_service_js(path, PatchOptions{true, false}, no_md5, &rep);
+  check(rep.event_proxy == PatchOutcome::kRemoved &&
+            rep.onvif_addressing == PatchOutcome::kAlready,
+        "old route off: outcomes");
+  check(read_test_file(path) == wsa_only, "old route off: removed byte-exact");
+  patch_service_js(path, PatchOptions{true, false}, no_md5, &rep);
+  check(rep.event_proxy == PatchOutcome::kAbsent, "old route off: then absent");
+
+  write_test_file(path, with_patch(original, old_route));
+  patch_service_js(path, PatchOptions{false, false}, no_md5, &rep);
+  check(rep.event_proxy == PatchOutcome::kRemoved &&
+            rep.onvif_addressing == PatchOutcome::kAbsent,
+        "old route and wsa off: outcomes");
+  check(read_test_file(path) == original, "old route and wsa off: original");
+
+  // Two copies of the earlier text identify no single function: left alone.
+  const std::string old_raw = with_patch(kSoapRaw, old_route);
+  const std::string twice = old_raw + old_raw;
+  write_test_file(path, twice);
+  patch_service_js(path, PatchOptions{false, true}, no_md5, &rep);
+  check(rep.event_proxy == PatchOutcome::kNotApplicable,
+        "old route twice, on: not applicable");
+  check(read_test_file(path) == twice, "old route twice, on: unchanged");
+  patch_service_js(path, PatchOptions{false, false}, no_md5, &rep);
+  check(rep.event_proxy == PatchOutcome::kAmbiguous,
+        "old route twice, off: ambiguous");
+  check(read_test_file(path) == twice, "old route twice, off: unchanged");
+
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
 }
 
 // The route patch applies once, with or without the WS-Addressing patch,
@@ -1118,6 +1289,8 @@ int main() {
   test_rebuild_from_pristine_bak();
   test_wsa_patch();
   test_route_patch_text();
+  test_route_patch_scan();
+  test_route_patch_upgrade();
   test_route_patch_apply();
   test_route_patch_not_applicable();
   test_route_patch_ambiguous();

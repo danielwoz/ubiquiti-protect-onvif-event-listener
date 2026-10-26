@@ -173,13 +173,23 @@ static const char* route_patch_refusal(const std::string& content,
 //     Renew and Unsubscribe on a subscription the recorder created) go to
 //     the recorder, also limited to 4 s, or 1 s for Unsubscribe, whose
 //     result Protect ignores.
-//   - For 500 ms after a request to the recorder times out, further
-//     requests to it fail at once.  One Protect poll can chain several of
-//     them (a Renew, then the Create that replaces the subscription, then
-//     an Unsubscribe), so a recorder that has stopped answering holds a
-//     poll for about 4 s, not 4 s per request; the next poll, at least
-//     about 1 s later, waits the full 4 s again.  The window is measured
-//     on performance.now(), which wall-clock changes do not move.
+//   - A request whose limit has passed fails only after Protect's event
+//     loop has read its sockets once more, so an answer that has already
+//     arrived is used.  When the limit's timer runs more than 1 s late,
+//     Protect's event loop itself was blocked (a long garbage collection,
+//     say) and the request may not even have been sent yet, so the limit
+//     starts again from then.
+//   - For 500 ms after a request for a camera times out, further requests
+//     to the recorder for that camera fail at once; other cameras' requests
+//     are not affected.  One Protect poll can chain several of them (a
+//     Renew, then the Create that replaces the subscription, then an
+//     Unsubscribe), so a recorder that has stopped answering holds a
+//     camera's poll for about 4 s, not 4 s per request; the next poll, at
+//     least about 1 s later, waits the full 4 s again.  An Unsubscribe
+//     never opens the window, and neither does a stall in Protect itself,
+//     so a stall does not send the Create that follows a failed Renew to
+//     the camera.  The window is measured on performance.now(), which
+//     wall-clock changes do not move.
 //   - A Renew of a subscription held directly on the camera first asks the
 //     recorder's /status whether it serves that camera now; if so the Renew
 //     fails, so Protect creates its next subscription through the recorder.
@@ -191,10 +201,44 @@ static const char* route_patch_refusal(const std::string& content,
 // function semantics.  Identical anchor in 7.1.87, 7.2.105 and 7.3.70; 7.0
 // and earlier have no ONVIF event client.
 //
-// If this replacement text ever changes, the old text must stay in the
-// removed list so it is taken out before the new one goes in.
+// If this replacement text ever changes, the old text must go into
+// kRetiredRoutePatches so it is taken out before the new one goes in.
 static const Patch kBackendPatchRoute = {
 "t.soapRequestRaw=async e=>{const t=`${e.hostname}:${e.port}`;",
+"t.soapRequestRaw=async function __onvrSoapRaw(e,__onvrRouted){"
+"/*onvif-recorder:pullpoint*/if(!__onvrRouted&&e&&\"string\"==typeof e.path){"
+"const __onvrP=\"/onvif-recorder/pullpoint/\","
+"__onvrO={...e,hostname:\"127.0.0.1\",port:7892},__onvrB=e.body||{},"
+"__onvrK=__onvrP+encodeURIComponent(e.hostname)+\"/\"+"
+"encodeURIComponent(e.port),"
+"__onvrW=__onvrSoapRaw.w||(__onvrSoapRaw.w=new Map),"
+"__onvrR=(q,u)=>{const n=Error(\"onvif-recorder: no answer\"),"
+"l=u?1e3:4e3;"
+"if(performance.now()<(__onvrW.get(__onvrK)||0))return Promise.reject(n);"
+"let h,d=0;return Promise.race([__onvrSoapRaw(q,1).finally(()=>{d=1}),"
+"new Promise((_,j)=>{const a=s=>{h=setTimeout(()=>{"
+"const z=performance.now()-s>l+1e3;setImmediate(()=>{if(d)return;"
+"if(z)return a(performance.now());"
+"u||__onvrW.set(__onvrK,performance.now()+500);j(n)})},l)};"
+"a(performance.now())})]).finally(()=>clearTimeout(h))};"
+"if(e.path.startsWith(__onvrP))"
+"return __onvrR(__onvrO,__onvrB.Unsubscribe);"
+"if(__onvrB.CreatePullPointSubscription)try{"
+"return await __onvrR({...__onvrO,path:__onvrK+e.path})}catch(x){}"
+"if(__onvrB.Renew){let m=0;try{await __onvrR({...__onvrO,"
+"path:__onvrK+\"/status\",body:{GetServiceCapabilities:"
+"{\"@_xmlns\":\"http://www.onvif.org/ver10/events/wsdl\"}}});m=1}catch(x){}"
+"if(m)throw Error(\"onvif-recorder: moving subscription to proxy\")}}"
+"const t=`${e.hostname}:${e.port}`;",
+nullptr, nullptr, route_patch_refusal};
+
+// Earlier texts of kBackendPatchRoute.  Each is taken out wherever it is
+// found, so the current text replaces it while sharing is on and turning
+// sharing off still removes it.
+static const Patch kRetiredRoutePatches[] = {
+// onvif-recorder 1.6.32: one fail-fast window for all cameras, opened by
+// every timeout, including a missed Unsubscribe and a stall in Protect.
+{"t.soapRequestRaw=async e=>{const t=`${e.hostname}:${e.port}`;",
 "t.soapRequestRaw=async function __onvrSoapRaw(e,__onvrRouted){"
 "/*onvif-recorder:pullpoint*/if(!__onvrRouted&&e&&\"string\"==typeof e.path){"
 "const __onvrP=\"/onvif-recorder/pullpoint/\","
@@ -214,8 +258,7 @@ static const Patch kBackendPatchRoute = {
 "path:__onvrK+\"/status\",body:{GetServiceCapabilities:"
 "{\"@_xmlns\":\"http://www.onvif.org/ver10/events/wsdl\"}}});m=1}catch(x){}"
 "if(m)throw Error(\"onvif-recorder: moving subscription to proxy\")}}"
-"const t=`${e.hostname}:${e.port}`;",
-nullptr, nullptr, route_patch_refusal};
+"const t=`${e.hostname}:${e.port}`;"}};
 
 // Prefix of every name kBackendPatchRoute injects.
 static const char kRouteNamePrefix[] = "__onvr";
@@ -800,6 +843,7 @@ static bool status_is_half_installed(const std::string& status) {
 
 // Patch the service.js at @p path: the backend scope filter always, and the
 // optional patches of @p opts, each of which is taken out again when off.
+// Earlier texts of the route patch are always taken out.
 // Sets both outcomes in @p rep (kNotRun when the file cannot be read).
 // Returns the number of patches applied, or -1 if the file is not readable.
 static int patch_service_js(
@@ -816,6 +860,8 @@ static int patch_service_js(
   };
   const size_t wsa = add(kBackendPatchWsa, opts.onvif_addressing);
   const size_t route = add(kBackendPatchRoute, opts.event_proxy);
+  const size_t retired = removed.size();
+  for (const Patch& p : kRetiredRoutePatches) removed.push_back(p);
   std::vector<PatchOutcome> outcomes(backend.size(), PatchOutcome::kNotRun);
   std::vector<PatchOutcome> removed_outcomes(removed.size(),
                                              PatchOutcome::kNotRun);
@@ -825,6 +871,13 @@ static int patch_service_js(
   rep->onvif_addressing =
       (opts.onvif_addressing ? outcomes : removed_outcomes)[wsa];
   rep->event_proxy = (opts.event_proxy ? outcomes : removed_outcomes)[route];
+  // With sharing off, what happened to an earlier route text found in the
+  // file is the route patch's outcome.
+  for (size_t i = retired; !opts.event_proxy && i < removed.size(); ++i) {
+    if (rep->event_proxy == PatchOutcome::kAbsent) {
+      rep->event_proxy = removed_outcomes[i];
+    }
+  }
   return n;
 }
 
