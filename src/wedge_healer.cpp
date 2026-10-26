@@ -459,11 +459,13 @@ WedgeHealer::Reason WedgeHealer::maybe_check_recording_stuck(bool force) {
     if (stuck_restarted_.count(id) == 0) {
       fresh.push_back(id);
     } else if (stuck_warned_.insert(id).second) {
-      LOG(WARNING) << "[healer] Protect is still not recording camera " << id
-                   << " after the restart issued for it; not restarting "
-                      "Protect for it again until it records. Switch the "
-                      "camera's recording mode to Always and back, or "
-                      "restart unifi-protect, to start it.";
+      // An error, so it reaches the journal and the admin page's Recent
+      // errors card: only the user can start this camera's recording now.
+      LOG(ERROR) << "[healer] Protect is still not recording camera " << id
+                 << " after the restart issued for it; not restarting "
+                    "Protect for it again until it records. Switch the "
+                    "camera's recording mode to Always and back, or "
+                    "restart unifi-protect, to start it.";
     }
   }
   if (fresh.empty()) return Reason::kNone;
