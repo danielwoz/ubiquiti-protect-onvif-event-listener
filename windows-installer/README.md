@@ -67,11 +67,11 @@ else Protect's.
   any pin, so the device keeps following Protect: `detect-channel.sh` (run
   by `postinst` and the daily `onvif-recorder-channel.timer`) moves it
   along when Protect's channel changes.
-- Choosing a different channel, choosing any channel when Protect's could
-  not be read, or keeping the channel already pinned writes
-  `channel.pinned` exactly as the admin page's channel **Apply** does, so
-  upgrades and the channel timer leave it alone. The admin page can change
-  it later.
+- Choosing a different channel, choosing any channel when Protect's channel
+  or the existing pin could not be read, or keeping the channel already
+  pinned writes `channel.pinned` exactly as the admin page's channel
+  **Apply** does, so upgrades and the channel timer leave it alone. The
+  admin page can change it later.
 
 ## Where credentials live
 

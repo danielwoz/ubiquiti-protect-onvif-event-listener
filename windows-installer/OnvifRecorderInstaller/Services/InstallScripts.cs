@@ -144,10 +144,11 @@ public static class InstallScripts {
     }
 
     // An install pins the chosen channel when it differs from Protect's,
-    // when Protect's channel could not be read (null), or when the device is
-    // already pinned to it, so the choice survives postinst and the daily
-    // channel timer. Choosing Protect's channel otherwise leaves the device
-    // following Protect.
+    // when Protect's channel is unknown (null; the channel page also passes
+    // null when the device's pin could not be read, so an unseen pin is
+    // never removed), or when the device is already pinned to it, so the
+    // choice survives postinst and the daily channel timer. Choosing
+    // Protect's channel otherwise leaves the device following Protect.
     public static bool ShouldPinChannel(
             string channel, string? protectChannel, string? pinnedChannel) {
         return protectChannel == null

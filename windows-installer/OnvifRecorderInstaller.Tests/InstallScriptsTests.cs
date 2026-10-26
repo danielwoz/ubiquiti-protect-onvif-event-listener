@@ -104,7 +104,9 @@ public class InstallScriptsTests {
     // A different channel from Protect's: pin.
     [InlineData("early-access", "stable", null, true)]
     [InlineData("stable", "rc", null, true)]
-    // Protect's channel unknown: pin whatever was chosen.
+    // Protect's channel unknown (or the device's pin unreadable, which the
+    // channel page passes as an unknown Protect channel): pin whatever was
+    // chosen, so a pin that could not be read is never removed.
     [InlineData("stable", null, null, true)]
     [InlineData("rc", null, null, true)]
     // Keeping the channel already pinned on the device keeps the pin.

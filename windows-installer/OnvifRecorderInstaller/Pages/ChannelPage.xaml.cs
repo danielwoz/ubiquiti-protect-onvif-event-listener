@@ -24,7 +24,14 @@ public partial class ChannelPage : Page {
 
     private async Task DetectAsync() {
         var reachable = await DetectProtectChannelAsync();
-        if (reachable) _pinnedChannel = await ReadPinnedChannelAsync();
+        if (reachable && !await ReadPinnedChannelAsync()) {
+            // A pin that could not be read must not be removed by choosing
+            // Protect's channel, so Protect's channel is treated as unknown
+            // and the install pins whichever channel is chosen.
+            _protectChannel = null;
+            DetectedText.Text =
+                "Could not read the release channel settings from the device.";
+        }
         if (_pinnedChannel != null) {
             PinnedText.Text =
                 $"onvif-recorder is pinned to {DisplayName(_pinnedChannel)} on this " +
@@ -62,14 +69,19 @@ public partial class ChannelPage : Page {
         return true;
     }
 
-    private async Task<string?> ReadPinnedChannelAsync() {
+    // Sets _pinnedChannel (null when the device is not pinned). Returns false
+    // when the pin could not be read.
+    private async Task<bool> ReadPinnedChannelAsync() {
+        RunResult result;
         try {
-            var result = await _main.Ssh.RunCaptureAsync(
+            result = await _main.Ssh.RunCaptureAsync(
                 _main.Connection, InstallScripts.BuildReadPinnedChannelScript());
-            return result.Ok ? InstallScripts.ParseChannel(result.Stdout) : null;
         } catch (System.Exception) {
-            return null;
+            return false;
         }
+        if (!result.Ok) return false;
+        _pinnedChannel = InstallScripts.ParseChannel(result.Stdout);
+        return true;
     }
 
     private void UpdatePinHint() {
