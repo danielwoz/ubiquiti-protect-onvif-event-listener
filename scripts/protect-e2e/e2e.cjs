@@ -1041,10 +1041,11 @@ async function scenarioI(c) {
   c.num('recorder_warnings', recorderWarnings(rec));
 }
 
-// J: the recorder stops answering for one camera only.  A relay on the
-// PullPoint port forwards to the recorder (on port + 1), but while told to
-// it holds every request for camera a.  Protect's own client renews the
-// subscriptions of cameras a and b directly, without the poll.
+// J: the recorder stops answering for one camera, then for two.  A relay
+// on the PullPoint port forwards to the recorder (on port + 1), but while
+// told to it holds every request for the cameras named.  Protect's own
+// client renews the subscriptions of cameras a and b directly, without the
+// poll.
 async function scenarioJ(c) {
   const cams = await startCameras({ slots: 2, second: 2 });
   const inner = port + 1;
@@ -1052,8 +1053,11 @@ async function scenarioJ(c) {
   const rec = await startRecorder(cams, { stateDir: stateDir(), recPort: inner });
   for (const cam of cams.info.cameras) await waitUp(rec, cam.key);
   const prefixA = recorderPrefix(cams, 0);
+  const prefixB = recorderPrefix(cams, 1);
   let holdA = false;
-  const relay = await holdingRelay(port, inner, (line) => holdA && line.includes(` ${prefixA}`));
+  let holdB = false;
+  const relay = await holdingRelay(port, inner, (line) =>
+    (holdA && line.includes(` ${prefixA}`)) || (holdB && line.includes(` ${prefixB}`)));
   try {
     const rt = newProtect();
     const a = cameraRow(cams, 0, 'camJa', 'AABBCCDD000B');
@@ -1098,6 +1102,27 @@ async function scenarioJ(c) {
     c.ok('J2: camera a\'s next request within 500 ms fails at once',
       !j2a2.ok && j2a2.ms < 200, j2a2);
     c.ok('J2: 500 ms later camera a\'s requests go to the recorder again', j2a3.ok, j2a3);
+
+    // J3: camera a's Renew, then camera b's, each get no answer within
+    // 4 s.  After the second, every camera's requests fail at once for
+    // 500 ms, camera a's too although its own 500 ms have passed.
+    holdA = true;
+    holdB = true;
+    const j3a = await renewVia(rt, connA, subA);
+    const j3b = await renewVia(rt, connB, subB);
+    const j3a2 = await renewVia(rt, connA, subA);
+    holdA = false;
+    holdB = false;
+    await sleep(600);
+    const j3a3 = await renewVia(rt, connA, subA);
+    const j3b3 = await renewVia(rt, connB, subB);
+    c.num('J3', { a: j3a, b: j3b, a_again: j3a2, a_later: j3a3, b_later: j3b3 });
+    c.ok('J3: camera a\'s and then camera b\'s Renew each time out after about 4 s',
+      !j3a.ok && j3a.ms >= 3900 && j3a.ms < 5500 && !j3b.ok && j3b.ms >= 3900 && j3b.ms < 5500,
+      { a: j3a, b: j3b });
+    c.ok('J3: then camera a\'s next request fails at once', !j3a2.ok && j3a2.ms < 200, j3a2);
+    c.ok('J3: 500 ms later both cameras\' requests go to the recorder again', j3a3.ok && j3b3.ok,
+      { a: j3a3, b: j3b3 });
     c.ok('no warn logs from Protect', warns(rt).length === 0, warns(rt));
     c.num('recorder_warnings', recorderWarnings(rec));
   } finally {
@@ -1105,8 +1130,81 @@ async function scenarioJ(c) {
   }
 }
 
+// K: the recorder stops answering with eight shared cameras, more than the
+// six Protect polls at once.  K1: Protect has subscribed all eight through
+// the recorder when it starts hanging.  K2: Protect starts while the
+// recorder hangs and subscribes the eight one after another, as its
+// start-up and its reconcile do.
+async function scenarioK(c) {
+  const N = 8;
+  const cameraSets = async () => {
+    const sets = [];
+    for (let i = 0; i < N / 2; i++) sets.push(await startCameras({ slots: 2, second: 2 }));
+    return { info: { cameras: sets.flatMap((s) => s.info.cameras) } };
+  };
+  const rowsOf = (all, tag) => all.info.cameras.map((_, i) =>
+    cameraRow(all, i, `cam${tag}${i}`, `AABBCCDD${tag === 'K1' ? '01' : '02'}${String(i).padStart(2, '0')}`));
+
+  // K1
+  {
+    const all = await cameraSets();
+    const rec = await startRecorder(all, { stateDir: stateDir() });
+    for (const cam of all.info.cameras) await waitUp(rec, cam.key);
+    const rt = newProtect();
+    const rows = rowsOf(all, 'K1');
+    const ctx = makeContext(rt, rows);
+    for (const r of rows) await rt.m.reconcile.reconcileMotionState(ctx, r.pk);
+    await settle(ctx);
+    const setup = rows.map((r) => where(ctx, r.mac));
+    if (!setup.every((w) => w === 'PROXY')) throw new Error(`setup: ${setup}`);
+    const sched = new Scheduler(rt, ctx);
+    sched.start();
+    await sched.waitTicks(2);
+    const base = sched.ticks.length;
+    const R = rt.requests.length;
+    await rec.stop();
+    const hung = await hungServer(port);
+    await sleep(30000);
+    await sched.stop();
+    const ticks = sched.ticks.slice(base).map((x) => x.ms);
+    const sent = rt.requests.slice(R).filter((q) => q.host === RECORDER);
+    c.num('K1_baseline_tick_ms', sched.ticks.slice(0, base).map((x) => x.ms));
+    c.num('K1_hung_tick_ms', ticks);
+    c.num('K1_requests_to_recorder', sent.length);
+    c.num('K1_cameras_after', rows.map((r) => where(ctx, r.mac)));
+    c.ok('K1: with the recorder hung, every poll tick of eight shared cameras stays under ~6 s',
+      ticks.length >= 4 && Math.max(...ticks) < 6000, ticks);
+    await hung.close();
+    await killAll();
+  }
+
+  // K2
+  {
+    const hung = await hungServer(port);
+    const all = await cameraSets();
+    const rt = newProtect();
+    const rows = rowsOf(all, 'K2');
+    const ctx = makeContext(rt, rows);
+    const t0 = Date.now();
+    for (const r of rows) await rt.m.reconcile.reconcileMotionState(ctx, r.pk);
+    const ms = Date.now() - t0;
+    await settle(ctx);
+    const creates = rt.requests.filter((q) => q.op === 'CreatePullPointSubscription' &&
+      q.host === RECORDER);
+    const after = rows.map((r) => where(ctx, r.mac));
+    c.num('K2_subscribe_all_ms', ms);
+    c.num('K2_creates_sent_to_recorder_at_ms', creates.map((q) => q.t - t0));
+    c.ok('K2: subscribing eight cameras one after another takes about 8 s, not 4 s each',
+      ms < 10000, ms);
+    c.ok('K2: every camera ends up subscribed at the camera', after.every((w) => w === 'CAMERA'),
+      after);
+    await hung.close();
+  }
+}
+
 const SCENARIOS = { A: scenarioA, B: scenarioB, C: scenarioC, D: scenarioD, E: scenarioE,
-                    F: scenarioF, G: scenarioG, H: scenarioH, I: scenarioI, J: scenarioJ };
+                    F: scenarioF, G: scenarioG, H: scenarioH, I: scenarioI, J: scenarioJ,
+                    K: scenarioK };
 
 async function main() {
   if (await portInUse(port)) {

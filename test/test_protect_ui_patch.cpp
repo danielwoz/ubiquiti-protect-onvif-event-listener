@@ -407,19 +407,22 @@ static const char kRoute[] =
     R"js(P="/onvif-recorder/pullpoint/",__onvrO={...e,hostname:"127.0.0.1",port:789)js"
     R"js(2},__onvrB=e.body||{},__onvrK=__onvrP+encodeURIComponent(e.hostname)+"/"+e)js"
     R"js(ncodeURIComponent(e.port),__onvrW=__onvrSoapRaw.w||(__onvrSoapRaw.w=new Ma)js"
-    R"js(p),__onvrR=(q,u)=>{const n=Error("onvif-recorder: no answer"),c=performanc)js"
-    R"js(e.now(),l=u?1e3:4e3;if(c<(__onvrW.get(__onvrK)||0))return Promise.reject(n)js"
-    R"js();let h,d=0,g=0;return Promise.race([__onvrSoapRaw(q,1).finally(()=>{d=1}))js"
-    R"js(,new Promise((_,j)=>{const a=b=>{const k=Math.min(l-g,500);h=setTimeout(())js"
-    R"js(=>{const t=performance.now();g+=Math.min(t-b,k);if(g<l)return a(t);setImme)js"
-    R"js(diate(()=>{if(d)return;u||__onvrW.set(__onvrK,performance.now()+500);j(n)})js"
-    R"js()},k)};a(c)})]).finally(()=>clearTimeout(h))};if(e.path.startsWith(__onvrP)js"
-    R"js())return __onvrR(__onvrO,__onvrB.Unsubscribe);if(__onvrB.CreatePullPointSu)js"
-    R"js(bscription)try{return await __onvrR({...__onvrO,path:__onvrK+e.path})}catc)js"
-    R"js(h(x){}if(__onvrB.Renew){let m=0;try{await __onvrR({...__onvrO,path:__onvrK)js"
-    R"js(+"/status",body:{GetServiceCapabilities:{"@_xmlns":"http://www.onvif.org/v)js"
-    R"js(er10/events/wsdl"}}});m=1}catch(x){}if(m)throw Error("onvif-recorder: movi)js"
-    R"js(ng subscription to proxy")}}const t=`${e.hostname}:${e.port}`;)js";
+    R"js(p),__onvrS=__onvrSoapRaw.s||(__onvrSoapRaw.s=new Map),__onvrR=(q,u)=>{cons)js"
+    R"js(t n=Error("onvif-recorder: no answer"),c=performance.now(),l=u?1e3:4e3;if()js"
+    R"js(c<(__onvrW.get(__onvrK)||0)||c<(__onvrW.get("")||0))return Promise.reject()js"
+    R"js(n);let h,d=0,g=0;return Promise.race([__onvrSoapRaw(q,1).finally(()=>{d=1})js"
+    R"js(),new Promise((_,j)=>{const a=b=>{const k=Math.min(l-g,500);h=setTimeout(()js"
+    R"js()=>{const t=performance.now();g+=Math.min(t-b,k);g<3e3||__onvrS.set(__onvr)js"
+    R"js(K,t);if(g<l)return a(t);setImmediate(()=>{if(d)return;if(!u){const z=perfo)js"
+    R"js(rmance.now();[...__onvrS].some(([x,v])=>x!==__onvrK&&v>z-1e4)&&__onvrW.set)js"
+    R"js(("",z+500);__onvrW.set(__onvrK,z+500)}j(n)})},k)};a(c)})]).finally(()=>cle)js"
+    R"js(arTimeout(h))};if(e.path.startsWith(__onvrP))return __onvrR(__onvrO,__onvr)js"
+    R"js(B.Unsubscribe);if(__onvrB.CreatePullPointSubscription)try{return await __o)js"
+    R"js(nvrR({...__onvrO,path:__onvrK+e.path})}catch(x){}if(__onvrB.Renew){let m=0)js"
+    R"js(;try{await __onvrR({...__onvrO,path:__onvrK+"/status",body:{GetServiceCapa)js"
+    R"js(bilities:{"@_xmlns":"http://www.onvif.org/ver10/events/wsdl"}}});m=1}catch)js"
+    R"js((x){}if(m)throw Error("onvif-recorder: moving subscription to proxy")}}con)js"
+    R"js(st t=`${e.hostname}:${e.port}`;)js";
 
 // The route replacement onvif-recorder 1.6.32 applied: one fail-fast window
 // for all cameras, opened by every timeout.
@@ -574,7 +577,8 @@ static void test_route_patch_scan() {
     }
   }
   const std::vector<std::string> expected = {
-      "__onvrP", "__onvrO", "__onvrB", "__onvrK", "__onvrW", "__onvrR"};
+      "__onvrP", "__onvrO", "__onvrB", "__onvrK", "__onvrW", "__onvrS",
+      "__onvrR"};
   check(names == expected, "route scan: prologue declares only __onvr names");
 }
 

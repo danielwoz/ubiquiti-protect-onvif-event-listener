@@ -165,7 +165,9 @@ cameras' MAC addresses, comma-separated (case and `:` or `-` separators don't ma
   onvif-recorder is not running, declines, or does not answer within a few seconds, Protect
   subscribes to the camera itself, as it does without sharing. Time during which Protect
   itself is stalled (by a long garbage collection, for example) does not count towards
-  those seconds, and a camera that gets no answer does not affect the others.
+  those seconds. One camera that gets no answer does not affect the others; once two get
+  none, Protect stops waiting for onvif-recorder for half a second, so an onvif-recorder
+  that has stopped answering does not hold up Protect's polling of every camera in turn.
 - Only the event subscription goes through onvif-recorder. Protect's other requests to the
   camera (video, snapshots, PTZ, its check of the camera's event support) still go to the
   camera.
