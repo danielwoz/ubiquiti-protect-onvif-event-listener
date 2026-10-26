@@ -33,10 +33,11 @@ if [ ! -f "$CHANNEL_FILE" ]; then
     echo "stable" > "$CHANNEL_FILE"
 fi
 
-# If the user has explicitly chosen a channel via the admin UI, the UI
-# writes a sticky marker.  Respect it: skip auto-detection entirely.
-# (Marker is removed on `apt-get purge`, which is the only documented
-# way to opt back into auto-detection.)
+# If the user has explicitly chosen a channel via the admin UI or the
+# Windows installer, a sticky marker is written.  Respect it: skip
+# auto-detection entirely.  (The marker is removed on `apt-get purge`, or
+# by the Windows installer when Protect's own channel is chosen there in
+# place of a different pinned one; either opts back into auto-detection.)
 if [ -f "$PINNED_FILE" ]; then
     PINNED=$(tr -d '[:space:]' < "$PINNED_FILE")
     if [ -n "$PINNED" ]; then

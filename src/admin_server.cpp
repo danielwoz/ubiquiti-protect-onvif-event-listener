@@ -1226,8 +1226,9 @@ std::pair<int, std::string> handle_channel(const Ctx& ctx,
   // Drop a sticky marker recording the user's explicit choice.
   // detect-channel.sh checks for this and skips overwriting the
   // channel file on subsequent postinst runs / daily timer runs.
-  // Loss of the marker (e.g. apt purge wiping /etc/onvif-recorder)
-  // is the only path back to auto-detection.
+  // Removing the marker (apt purge wiping /etc/onvif-recorder, or the
+  // Windows installer when Protect's own channel is chosen there in place
+  // of a different pinned one) is the path back to auto-detection.
   std::string pinned_path = std::string(ctx.channel_file) + ".pinned";
   if (!write_file(pinned_path, channel + "\n")) {
     LOG(WARNING) << "[channel] failed to write " << pinned_path
