@@ -132,7 +132,8 @@ std::string local_patches_json(const PatchReport& report);
 /// valid, none of them is applied.  Changes to service.js load at
 /// Protect's next start.
 ///
-/// Each patch is applied only where its target code occurs exactly once.
+/// Each patch is applied only where its target code occurs exactly once,
+/// and only when its replacement does not form that code again.
 /// The event-sharing patch is also refused when Protect's SOAP transport
 /// function cannot be delimited, uses `this` or `arguments`, or service.js
 /// already uses the names the patch injects.  A file that differs from the

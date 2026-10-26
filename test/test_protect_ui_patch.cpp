@@ -1260,6 +1260,51 @@ static void test_local_patches_service_js() {
   std::remove(bak.c_str());
 }
 
+// An entry whose replacement forms its original again with the code around
+// it ("%~" -> "~~%%" in "%%~" leaves "%~" at the front) is not applied:
+// each pass over a file without a verified .bak would otherwise apply it
+// once more and grow the file without end.
+static void test_local_patch_forms_original_again() {
+  const std::string path = temp_dir() + "/test_local_again_service.js";
+  const std::string bak = path + ".bak";
+  const std::string lp = temp_dir() + "/test_local_again_patches.json";
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+  const std::string original = soap_fixture() + "var s=\"%%~\";";
+  write_test_file(path, original);
+  write_test_file(lp, "[" + local_entry("grows", "%~", "~~%%") + "," +
+                          local_entry("ok", "var s=", "let s=") + "]");
+  std::string expected = with_patch(original, kBackendPatchWsa);
+  expected.replace(expected.find("var s="), 6, "let s=");
+  const PatchOptions opts{true, false, lp};
+
+  for (int pass = 0; pass < 3; ++pass) {
+    PatchReport rep;
+    patch_service_js(path, opts, {}, &rep);
+    check(read_test_file(path) == expected,
+          "local again: entry not applied on a pass over the live file");
+    check(rep.local_patches.size() == 2 &&
+              rep.local_patches[0].outcome == PatchOutcome::kNotApplicable &&
+              rep.local_patches[1].outcome == (pass == 0
+                                                   ? PatchOutcome::kApplied
+                                                   : PatchOutcome::kAlready),
+          "local again: reported not applicable, the other entry applied");
+  }
+
+  std::unordered_map<std::string, std::string> md5sums;
+  md5sums[path.substr(1)] = md5_of_file(bak);
+  check(read_test_file(bak) == original, "local again: original backed up");
+  PatchReport rep;
+  patch_service_js(path, opts, md5sums, &rep);
+  check(read_test_file(path) == expected && rep.local_patches.size() == 2 &&
+            rep.local_patches[0].outcome == PatchOutcome::kNotApplicable,
+        "local again: not applied when rebuilt from .bak either");
+
+  std::remove(path.c_str());
+  std::remove(bak.c_str());
+  std::remove(lp.c_str());
+}
+
 // Our patches are applied and reported the same with local patches
 // present: ours go first, so an entry cannot take an anchor of ours or
 // make a safety scan of ours refuse, and turning ours off keeps the
@@ -1667,6 +1712,7 @@ int main() {
   test_load_local_patches();
   test_local_patches_json();
   test_local_patches_service_js();
+  test_local_patch_forms_original_again();
   test_local_patches_after_ours();
   test_scan_js_block();
   test_file_newer_than_process();

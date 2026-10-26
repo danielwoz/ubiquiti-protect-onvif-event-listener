@@ -231,7 +231,9 @@ Protect, so they come back by themselves after a Protect or UniFi OS update.
 - `original` is plain text, not a pattern, and must occur exactly once in `service.js`.
   Include enough of the surrounding code to make it unique. In JSON, write `"` as `\"` and
   `\` as `\\`.
-- `replacement` must not be empty and must not contain `original`.
+- `replacement` must not be empty, must not contain `original`, and must not form `original`
+  again with the code next to it. To insert code, choose an `original` that spans the place
+  where it goes, so the new code ends up inside it in `replacement`.
 - The file is read when onvif-recorder starts, so restart it after editing
   (`systemctl restart onvif-recorder`). Removing an entry undoes it.
 

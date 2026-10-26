@@ -463,6 +463,14 @@ static bool patch_present(const std::string& content, const Patch& p) {
          count_in(content, p.replacement, begin, end) > 0;
 }
 
+// Whether @p p's original occurs in its search range of @p content.
+static bool original_present(const std::string& content, const Patch& p) {
+  size_t begin = 0;
+  size_t end = 0;
+  return resolve_region(content, p, &begin, &end) &&
+         count_in(content, p.original, begin, end) > 0;
+}
+
 // ---------------------------------------------------------------
 // JavaScript block scanner.
 // ---------------------------------------------------------------
@@ -772,6 +780,17 @@ static int apply_patches(
     switch (states[i]) {
       case PatchState::kApply:
         result.replace(pos, std::strlen(p.original), p.replacement);
+        // A replacement that forms its original again with the code around
+        // it would be applied once more on every pass over a file without a
+        // verified .bak, each time writing the file again.
+        if (original_present(result, p)) {
+          result.replace(pos, std::strlen(p.replacement), p.original);
+          LOG(WARNING) << "[ui_patch] " << path << ": pattern \""
+                       << p.original << "\" not patched: its replacement "
+                          "forms the pattern again";
+          states[i] = PatchState::kNotApplicable;
+          break;
+        }
         ++applied;
         break;
       case PatchState::kAmbiguous:
@@ -1269,7 +1288,8 @@ static void log_local_patches(const PatchReport& rep) {
       case PatchOutcome::kNotApplicable:
         LOG(WARNING) << "[ui_patch] local patch \"" << e.name
                      << "\" not applied: its original text is not in "
-                        "service.js (a Protect update may have changed it)";
+                        "service.js (a Protect update may have changed it), "
+                        "or its replacement would form that text again";
         break;
       case PatchOutcome::kAmbiguous:
         LOG(WARNING) << "[ui_patch] local patch \"" << e.name
