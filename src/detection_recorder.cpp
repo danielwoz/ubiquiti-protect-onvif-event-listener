@@ -594,6 +594,86 @@ static bool jpeg_read_dimensions(const std::vector<unsigned char>& data,
 
 }  // anonymous namespace
 
+namespace detection_recorder_internal {
+
+std::string pg_text_array(const std::vector<std::string>& items) {
+  std::string out = "{";
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i > 0) out += ',';
+    out += '"';
+    for (char c : items[i]) {
+      if (c == '"' || c == '\\') out += '\\';
+      out += c;
+    }
+    out += '"';
+  }
+  out += '}';
+  return out;
+}
+
+bool insert_detection_labels(PGconn* conn,
+                             const std::string& event_id,
+                             const std::string& event_row_id,
+                             const std::string& object_row_id,
+                             const std::string& object_id,
+                             const std::vector<std::string>& label_names,
+                             const std::string& now_str) {
+  std::vector<std::string> label_ids;
+  label_ids.reserve(label_names.size());
+  for (std::size_t i = 0; i < label_names.size(); ++i)
+    label_ids.push_back(util::generate_uuid());
+  const std::string names = pg_text_array(label_names);
+  const std::string ids = pg_text_array(label_ids);
+  const char* params[] = {
+    event_id.c_str(), event_row_id.c_str(), object_row_id.c_str(),
+    object_id.c_str(), names.c_str(), ids.c_str(), now_str.c_str()
+  };
+  // One statement resolves the label names -- inserting the missing ones,
+  // the way Protect's createLabels does -- and writes the rows, so a label
+  // that Protect's cleanupLabels deleted since the last detection is
+  // created again instead of being referred to by a stale lid.  Names that
+  // already exist are filtered out before the INSERT so they do not use
+  // up lid sequence values.  ON CONFLICT DO NOTHING on detectionLabels
+  // leaves an existing event-level row alone (one per event).
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(conn, -1,
+    "WITH input(name, id) AS ("
+    "  SELECT * FROM unnest($5::text[], $6::text[])"
+    "), inserted AS ("
+    "  INSERT INTO labels (id, name, \"createdAt\", \"updatedAt\")"
+    "  SELECT i.id, i.name, $7::timestamptz, $7::timestamptz FROM input i"
+    "   WHERE NOT EXISTS (SELECT 1 FROM labels l WHERE l.name = i.name)"
+    "  ON CONFLICT (name) DO NOTHING"
+    "  RETURNING lid, name"
+    "), resolved AS ("
+    "  SELECT array_agg(lid::int ORDER BY lid) AS lids FROM ("
+    "    SELECT lid FROM inserted"
+    "    UNION"
+    "    SELECT l.lid FROM labels l JOIN input i ON i.name = l.name"
+    "     WHERE NOT EXISTS (SELECT 1 FROM inserted n WHERE n.name = l.name)"
+    "  ) found"
+    ")"
+    " INSERT INTO \"detectionLabels\""
+    "  (id, \"eventId\", \"objectId\", labels, \"createdAt\", \"updatedAt\")"
+    " SELECT r.id, $1, r.object_id, resolved.lids,"
+    "        $7::timestamptz, $7::timestamptz"
+    "   FROM resolved,"
+    "        (VALUES ($2::text, NULL::text), ($3::text, $4::text))"
+    "          AS r(id, object_id)"
+    "  WHERE r.id <> '' AND resolved.lids IS NOT NULL"
+    " ON CONFLICT DO NOTHING",
+    7, nullptr, params, nullptr, nullptr, 0);
+  const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+  if (!ok) {
+    const char* msg = res ? PQresultErrorMessage(res) : nullptr;
+    LOG(ERROR) << "[pg] detectionLabels insert failed: "
+               << ((msg && *msg) ? msg : PQerrorMessage(conn));
+  }
+  PQclear(res);
+  return ok;
+}
+
+}  // namespace detection_recorder_internal
+
 // ============================================================
 // PostgreSQL backend
 // ============================================================
@@ -607,10 +687,6 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   std::map<std::string, std::string> ip_to_id_;
   std::map<std::string, std::string> ip_to_mac_;
   bool use_msr_thumb_ids_{false};
-
-  // Cache of label name -> serial lid value from the `labels` table.
-  // Populated lazily by upsert_label(); avoids redundant DB queries.
-  std::map<std::string, int> label_cache_;
 
   // Spaces out reconnect attempts while the database is down and keeps
   // the journal to a few lines per outage.
@@ -1003,68 +1079,17 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
       6, params);
   }
 
-  // Upsert one label name; return its serial lid, or 0 on failure.
-  int upsert_label(const std::string& name, const std::string& now_str) {
-    auto it = label_cache_.find(name);
-    if (it != label_cache_.end()) return it->second;
-
-    maybe_reconnect();
-    const std::string label_id = util::generate_uuid();
-    const char* params[] = {
-      label_id.c_str(), name.c_str(), now_str.c_str()
-    };
-    PGresult* res = onvif::pg::ExecParamsWithTimeout(conn_, -1,
-      "INSERT INTO labels (id, name, \"createdAt\", \"updatedAt\")"
-      " VALUES ($1, $2, $3, $3)"
-      " ON CONFLICT (name) DO UPDATE SET \"updatedAt\" = EXCLUDED.\"updatedAt\""
-      " RETURNING lid",
-      3, nullptr, params, nullptr, nullptr, 0);
-    int lid = 0;
-    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-      lid = std::atoi(PQgetvalue(res, 0, 0));
-      label_cache_[name] = lid;
-    } else {
-      LOG(ERROR) << "[pg] upsert label failed: " << pg_errmsg(res);
-    }
-    PQclear(res);
-    return lid;
-  }
-
-  std::vector<int> upsert_labels(const std::vector<std::string>& names,
-                                  const std::string& now_str) override {
-    std::vector<int> lids;
-    for (const auto& name : names) {
-      int lid = upsert_label(name, now_str);
-      if (lid > 0) lids.push_back(lid);
-    }
-    return lids;
-  }
-
-  void insert_detection_label(const std::string&      event_id,
-                              const std::string&      object_id,
-                              const std::vector<int>& lids,
-                              const std::string&      now_str) override {
-    if (lids.empty()) return;
-
-    // Build PostgreSQL integer array literal: {1,2,3}
-    std::string arr = "{";
-    for (std::size_t i = 0; i < lids.size(); ++i) {
-      if (i > 0) arr += ',';
-      arr += std::to_string(lids[i]);
-    }
-    arr += '}';
-
-    const std::string dl_id = util::generate_uuid();
-    // Pass empty string for NULL object_id; NULLIF converts it to SQL NULL.
-    const char* params[] = {
-      dl_id.c_str(), event_id.c_str(), object_id.c_str(),
-      arr.c_str(), now_str.c_str(), now_str.c_str()
-    };
-    exec_params(
-      "INSERT INTO \"detectionLabels\""
-      " (id, \"eventId\", \"objectId\", labels, \"createdAt\", \"updatedAt\")"
-      " VALUES ($1, $2, NULLIF($3, ''), $4::integer[], $5, $6)",
-      6, params);
+  void insert_detection_labels(const std::string&              event_id,
+                               const std::string&              object_id,
+                               bool                            event_level,
+                               const std::vector<std::string>& label_names,
+                               const std::string&              now_str) override {
+    if (label_names.empty()) return;
+    if (!maybe_reconnect()) return;
+    detection_recorder_internal::insert_detection_labels(
+        conn_, event_id, event_level ? util::generate_uuid() : std::string(),
+        object_id.empty() ? std::string() : util::generate_uuid(), object_id,
+        label_names, now_str);
   }
 
   std::vector<IDbBackend::EventSummary> query_recent_events(int days) override {
@@ -2232,12 +2257,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           label_names.push_back("camera:" + cam_uuid);
           label_names.push_back("zone:" + cam_uuid + ":1");
         }
-        const std::vector<int> lids = db_->upsert_labels(label_names, now_str);
-        if (!lids.empty()) {
-          if (coalesced_event_id.empty())
-            db_->insert_detection_label(event_id, "", lids, now_str);  // event-level
-          db_->insert_detection_label(event_id, sdo_id, lids, now_str);  // SDO-level
-        }
+        db_->insert_detection_labels(event_id, sdo_id,
+                                     /*event_level=*/coalesced_event_id.empty(),
+                                     label_names, now_str);
       }
 
       // Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.

@@ -462,6 +462,7 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
   std::vector<ThumbRow>   thumbs;
   std::vector<SdaRow>     sdas;
   std::map<std::string, int> labels;      // name -> simulated lid
+  int                        next_lid{0};
   std::vector<DetLabelRow>   det_labels;
 
   absl::Status create_schema() override { return absl::OkStatus(); }
@@ -535,28 +536,22 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
     sdas.push_back({id, sdo_id, bbox_x1, bbox_y1, bbox_x2, bbox_y2});
   }
 
-  std::vector<int> upsert_labels(
-      const std::vector<std::string>& names,
-      const std::string& /*now_str*/) override {
+  // Mirrors the real statement: names missing from `labels` get a fresh
+  // lid, and the rows carry the lids current at the time of the call.
+  void insert_detection_labels(const std::string&              event_id,
+                               const std::string&              object_id,
+                               bool                            event_level,
+                               const std::vector<std::string>& label_names,
+                               const std::string& /*now_str*/) override {
     std::vector<int> lids;
-    for (const auto& name : names) {
+    for (const auto& name : label_names) {
       auto it = labels.find(name);
-      if (it == labels.end()) {
-        int lid = static_cast<int>(labels.size()) + 1;
-        labels[name] = lid;
-        lids.push_back(lid);
-      } else {
-        lids.push_back(it->second);
-      }
+      if (it == labels.end()) it = labels.emplace(name, ++next_lid).first;
+      lids.push_back(it->second);
     }
-    return lids;
-  }
-
-  void insert_detection_label(const std::string&      event_id,
-                              const std::string&      object_id,
-                              const std::vector<int>& lids,
-                              const std::string& /*now_str*/) override {
-    det_labels.push_back({event_id, object_id, lids});
+    if (lids.empty()) return;
+    if (event_level) det_labels.push_back({event_id, "", lids});
+    if (!object_id.empty()) det_labels.push_back({event_id, object_id, lids});
   }
 
   std::vector<onvif::DetectionRecorder::IDbBackend::EventSummary>
@@ -2430,6 +2425,212 @@ static void test_unhandled_topic_records_nothing() {
             std::to_string(bptr->events.size()));
 }
 
+// detectionLabels rows carry the labels as they exist when the detection
+// is written.  Protect's hourly cleanupLabels deletes labels that no
+// event-level row refers to (including camera:<id>, which lists a
+// third-party camera in Find Anything), so the recorder hands the label
+// names over on every detection instead of reusing lids it saw before.
+static void test_detection_labels_follow_label_cleanup() {
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("label_cleanup: CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(3600);
+
+  onvif::CameraConfig cfg;
+  cfg.ip = "192.168.1.212";
+  cfg.id = "6a0000000000000000000212";
+  recorder.set_snapshot(cfg);
+
+  auto make_ev = [](bool started, const char* t) {
+    onvif::OnvifEvent ev;
+    ev.camera_ip   = "192.168.1.212";
+    ev.topic       = "tns1:RuleEngine/FieldDetector/ObjectsInside";
+    ev.event_time  = t;
+    ev.property_op = "Changed";
+    ev.source["Rule"]   = "Human";
+    ev.data["IsInside"] = started ? "true" : "false";
+    return ev;
+  };
+  auto all_live = [bptr](const std::vector<int>& lids) {
+    for (int lid : lids) {
+      bool found = false;
+      for (const auto& kv : bptr->labels) found = found || kv.second == lid;
+      if (!found) return false;
+    }
+    return !lids.empty();
+  };
+
+  recorder.on_event(make_ev(true, "2026-03-31T10:00:00Z"));
+  CHECK(bptr->det_labels.size() == 2,
+        "new event: expected event-level + object-level rows, got " +
+            std::to_string(bptr->det_labels.size()));
+  if (bptr->det_labels.size() != 2) return;
+  CHECK(bptr->det_labels[0].object_id.empty(),
+        "new event: first row must be the event-level row");
+  CHECK(bptr->det_labels[0].lids.size() == 4,
+        "new event: expected 4 labels (eventType, smartDetectType, camera, "
+        "zone), got " + std::to_string(bptr->det_labels[0].lids.size()));
+  CHECK(bptr->labels.count("camera:6a0000000000000000000212") == 1,
+        "new event: camera label must exist");
+  CHECK(bptr->labels.count("zone:6a0000000000000000000212:1") == 1,
+        "new event: zone label must exist");
+  recorder.on_event(make_ev(false, "2026-03-31T10:00:01Z"));
+
+  // cleanupLabels runs while the recorder keeps going.
+  bptr->labels.clear();
+
+  // Within the coalesce window: object-level row only, and its lids are
+  // those of the labels re-created now, not the deleted ones.
+  recorder.on_event(make_ev(true, "2026-03-31T10:00:02Z"));
+  CHECK(bptr->events.size() == 1,
+        "coalesced detection must not create a second event, got " +
+            std::to_string(bptr->events.size()));
+  CHECK(bptr->det_labels.size() == 3,
+        "coalesced detection: expected one more (object-level) row, got " +
+            std::to_string(bptr->det_labels.size()));
+  if (bptr->det_labels.size() != 3) return;
+  CHECK(!bptr->det_labels[2].object_id.empty(),
+        "coalesced detection: added row must be object-level");
+  CHECK(all_live(bptr->det_labels[2].lids),
+        "coalesced detection: row must refer to labels that exist now");
+  CHECK(bptr->labels.count("camera:6a0000000000000000000212") == 1,
+        "camera label must be created again after the cleanup");
+}
+
+static void test_pg_text_array() {
+  using onvif::detection_recorder_internal::pg_text_array;
+  CHECK(pg_text_array({}) == "{}", "pg_text_array: empty");
+  CHECK(pg_text_array({"camera:abc", "zone:abc:1"}) ==
+            "{\"camera:abc\",\"zone:abc:1\"}",
+        "pg_text_array: plain names are quoted");
+  CHECK(pg_text_array({"a\"b", "c\\d", "e,f", ""}) ==
+            "{\"a\\\"b\",\"c\\\\d\",\"e,f\",\"\"}",
+        "pg_text_array: quotes and backslashes escaped, commas kept");
+}
+
+// Run @p sql on @p conn and return the first column of the first row
+// ("" for no rows); records a failure for an SQL error.
+static std::string pg_scalar(PGconn* conn, const std::string& sql) {
+  PGresult* r = PQexec(conn, sql.c_str());
+  std::string out;
+  const ExecStatusType st = PQresultStatus(r);
+  if (st == PGRES_TUPLES_OK && PQntuples(r) > 0 && PQnfields(r) > 0) {
+    out = PQgetvalue(r, 0, 0);
+  } else if (st != PGRES_TUPLES_OK && st != PGRES_COMMAND_OK) {
+    CHECK(false, "SQL failed: " + sql + ": " + PQresultErrorMessage(r));
+  }
+  PQclear(r);
+  return out;
+}
+
+// The label statement against a real PostgreSQL, through Protect's
+// cleanupLabels and back.  Uses ONVIF_TEST_DB_CONN (or libpq's PG*
+// defaults) and is skipped when no server is reachable.  Temporary tables
+// shaped like Protect's shadow any real ones, so nothing outside this
+// session is touched.
+static void test_detection_labels_sql_db() {
+  const char* env = std::getenv("ONVIF_TEST_DB_CONN");
+  PGconn* c = PQconnectdb(env ? env : "");
+  if (PQstatus(c) != CONNECTION_OK) {
+    std::cout << "  SKIP: no postgres reachable (set ONVIF_TEST_DB_CONN)\n";
+    PQfinish(c);
+    return;
+  }
+  pg_scalar(c, "SET client_min_messages = warning");
+  pg_scalar(c, "CREATE TEMP TABLE events (id varchar(255) PRIMARY KEY)");
+  pg_scalar(c,
+      "CREATE TEMP TABLE labels ("
+      " lid bigserial UNIQUE NOT NULL, name varchar(255) UNIQUE,"
+      " \"lastSeen\" bigint, id varchar(255) PRIMARY KEY,"
+      " \"createdAt\" timestamptz NOT NULL,"
+      " \"updatedAt\" timestamptz NOT NULL)");
+  pg_scalar(c,
+      "CREATE TEMP TABLE \"detectionLabels\" ("
+      " \"eventId\" varchar(255) NOT NULL REFERENCES events(id)"
+      "   ON UPDATE CASCADE ON DELETE CASCADE,"
+      " labels integer[], id varchar(255) PRIMARY KEY,"
+      " \"createdAt\" timestamptz NOT NULL,"
+      " \"updatedAt\" timestamptz NOT NULL, \"objectId\" varchar(255))");
+  pg_scalar(c,
+      "CREATE UNIQUE INDEX ON \"detectionLabels\" (\"eventId\")"
+      " WHERE \"objectId\" IS NULL");
+  pg_scalar(c,
+      "CREATE UNIQUE INDEX ON \"detectionLabels\" (\"eventId\", \"objectId\")"
+      " WHERE \"objectId\" IS NOT NULL");
+  pg_scalar(c, "INSERT INTO events VALUES ('E1'), ('E2')");
+
+  using onvif::detection_recorder_internal::insert_detection_labels;
+  const std::vector<std::string> names = {
+    "eventType:smartDetectZone", "smartDetectType:person",
+    "camera:CAM", "zone:CAM:1"};
+  const std::string now = "2026-10-26T10:00:00.000Z";
+  // Rows whose every lid names an existing label.
+  const char* kLiveRows =
+      "SELECT count(*) FROM \"detectionLabels\" dl"
+      " WHERE cardinality(dl.labels) = (SELECT count(*) FROM labels l"
+      "                                 WHERE l.lid = ANY(dl.labels))";
+
+  CHECK(insert_detection_labels(c, "E1", "dl-e1", "dl-o1", "O1", names, now),
+        "db: new event insert succeeds");
+  CHECK(pg_scalar(c, "SELECT count(*) FROM labels") == "4",
+        "db: the four labels are created");
+  CHECK(pg_scalar(c, "SELECT count(*) FROM \"detectionLabels\"") == "2",
+        "db: event-level and object-level rows written");
+  CHECK(pg_scalar(c, kLiveRows) == "2", "db: rows refer to existing labels");
+  CHECK(pg_scalar(c, "SELECT \"objectId\" IS NULL FROM \"detectionLabels\""
+                     " WHERE id = 'dl-e1'") == "t",
+        "db: event-level row has a NULL objectId");
+
+  const std::string max_lid = pg_scalar(c, "SELECT max(lid) FROM labels");
+  CHECK(insert_detection_labels(c, "E1", "", "dl-o2", "O2", names, now),
+        "db: coalesced (object-level only) insert succeeds");
+  CHECK(pg_scalar(c, "SELECT count(*) FROM \"detectionLabels\"") == "3",
+        "db: coalesced detection adds only the object-level row");
+  CHECK(pg_scalar(c, "SELECT count(*) FROM labels") == "4",
+        "db: existing labels are reused");
+  CHECK(pg_scalar(c, "SELECT last_value FROM labels_lid_seq") == max_lid,
+        "db: existing labels do not use up lid sequence values");
+
+  CHECK(insert_detection_labels(c, "E1", "dl-e1b", "dl-o3", "O3", names, now),
+        "db: a second event-level row for an event is skipped, not an error");
+  CHECK(pg_scalar(c, "SELECT count(*) FROM \"detectionLabels\""
+                     " WHERE \"objectId\" IS NULL") == "1",
+        "db: still one event-level row for E1");
+
+  // E1 expires, then Protect's cleanupLabels deletes every label no
+  // event-level row refers to.
+  pg_scalar(c, "DELETE FROM events WHERE id = 'E1'");
+  pg_scalar(c,
+      "DELETE FROM labels WHERE id IN (SELECT l.id FROM labels l"
+      " WHERE NOT EXISTS (SELECT 1 FROM \"detectionLabels\" dl"
+      "  WHERE dl.labels @> ARRAY[l.lid::int] AND dl.\"objectId\" IS NULL)"
+      " LIMIT 5000)");
+  CHECK(pg_scalar(c, "SELECT count(*) FROM labels") == "0",
+        "db: cleanupLabels removed the unreferenced labels");
+
+  CHECK(insert_detection_labels(c, "E2", "dl-e2", "dl-o4", "O4", names, now),
+        "db: insert after the cleanup succeeds");
+  CHECK(pg_scalar(c, "SELECT count(*) FROM labels"
+                     " WHERE name = 'camera:CAM'") == "1",
+        "db: camera label is created again");
+  CHECK(pg_scalar(c, kLiveRows) == "2",
+        "db: new rows refer to the re-created labels");
+
+  const std::vector<std::string> odd = {"smartDetectType:a\"b\\c,d"};
+  CHECK(insert_detection_labels(c, "E2", "", "dl-o5", "O5", odd, now),
+        "db: label name needing quoting is accepted");
+  CHECK(pg_scalar(c, "SELECT count(*) FROM labels"
+                     " WHERE name = 'smartDetectType:a\"b\\c,d'") == "1",
+        "db: label name survives the array literal unchanged");
+  PQfinish(c);
+}
+
 // IVS line crossing (issue #45) is momentary: one notification, never an
 // "ended" one.  It must produce a *closed* event with the configured
 // synthetic duration rather than a row with end IS NULL that
@@ -3618,6 +3819,10 @@ int main() {
   run_test("alt_port_camera",            [&] { test_alt_port_camera(dir()); });
   run_test("unhandled_topic_records_nothing",
            [] { test_unhandled_topic_records_nothing(); });
+  run_test("detection_labels_follow_label_cleanup",
+           [] { test_detection_labels_follow_label_cleanup(); });
+  run_test("pg_text_array", [] { test_pg_text_array(); });
+  run_test("detection_labels_sql_db", [] { test_detection_labels_sql_db(); });
   run_test("drop_unclassified_motion",
            [&] { test_drop_unclassified_motion(dir()); });
   run_test("drop_unclassified_spares_line_crossing",

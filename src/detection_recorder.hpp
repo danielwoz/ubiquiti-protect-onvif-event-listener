@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <libpq-fe.h>
+
 #include <deque>
 #include <map>
 #include <memory>
@@ -439,21 +441,21 @@ class DetectionRecorder {
                                             int                /*confidence*/,
                                             const std::string& /*now_str*/) {}
 
-    /// Upsert label names into the `labels` table and return their serial lid
-    /// values. Existing names are returned from cache to avoid redundant queries.
-    /// Returns an empty vector on failure or if not implemented.
-    virtual std::vector<int> upsert_labels(
-        const std::vector<std::string>& /*names*/,
-        const std::string& /*now_str*/) { return {}; }
-
-    /// Insert one row into `detectionLabels`.
-    /// Pass object_id empty to store NULL (event-level row).
-    /// The event-level row (objectId IS NULL) is required for the INNER JOIN
-    /// in Protect's find-anything / detection-search endpoint.
-    virtual void insert_detection_label(const std::string&      /*event_id*/,
-                                        const std::string&      /*object_id*/,
-                                        const std::vector<int>& /*lids*/,
-                                        const std::string&      /*now_str*/) {}
+    /// Insert the `detectionLabels` rows for one detection: the event-level
+    /// row (objectId NULL) when @p event_level is set, and the object-level
+    /// row for @p object_id.  Both carry the lids of @p label_names, looked
+    /// up -- and created when missing -- in the same statement rather than
+    /// cached: Protect's hourly cleanupLabels deletes every label that no
+    /// event-level row refers to, so a remembered lid can point at a
+    /// deleted label.  The event-level row is what Protect's find-anything
+    /// / detection-search endpoint joins on, and its camera:<id> label is
+    /// what lists a third-party camera in Find Anything's camera filter.
+    virtual void insert_detection_labels(
+        const std::string&              /*event_id*/,
+        const std::string&              /*object_id*/,
+        bool                            /*event_level*/,
+        const std::vector<std::string>& /*label_names*/,
+        const std::string&              /*now_str*/) {}
 
     /// One row returned by query_recent_events().
     struct EventSummary {
@@ -708,5 +710,27 @@ class DetectionRecorder {
 std::string snapshot_url_with_path(const std::string& advertised_url,
                                    const std::string& camera_key,
                                    const std::string& path);
+
+namespace detection_recorder_internal {
+
+/// PostgreSQL text[] literal for @p items, e.g. {"a","b\"c"}.  Exposed for
+/// testing.
+std::string pg_text_array(const std::vector<std::string>& items);
+
+/// Insert the `detectionLabels` rows for one detection on @p conn: the
+/// event-level row (objectId NULL) when @p event_row_id is non-empty, and
+/// the object-level row for @p object_id when @p object_row_id is.  Both
+/// carry the lids of @p label_names, which the same statement looks up in
+/// `labels` and creates when missing.  Returns false and logs on failure.
+/// Exposed for testing against a database.
+bool insert_detection_labels(PGconn* conn,
+                             const std::string& event_id,
+                             const std::string& event_row_id,
+                             const std::string& object_row_id,
+                             const std::string& object_id,
+                             const std::vector<std::string>& label_names,
+                             const std::string& now_str);
+
+}  // namespace detection_recorder_internal
 
 }  // namespace onvif
