@@ -1429,6 +1429,10 @@ class ThumbnailHookEmulator : public OnvifCameraEmulator {
                                  int delay_ms = 0)
     : OnvifCameraEmulator("127.0.0.1"), jpeg_(std::move(jpeg)),
       delay_ms_(delay_ms) {}
+  // Stop the server -- waiting for a delayed reply still in flight --
+  // before jpeg_ is destroyed; the base destructor would only stop it
+  // afterwards.
+  ~ThumbnailHookEmulator() override { stop(); }
 
   std::string url(const std::string& path) const {
     return "http://127.0.0.1:" + std::to_string(port()) + path;
