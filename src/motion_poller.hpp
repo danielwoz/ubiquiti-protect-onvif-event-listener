@@ -89,6 +89,16 @@ int select_best_candidate_index(
     const std::vector<std::string>& baseline_classes,
     const std::vector<Candidate>& event_candidates);
 
+/// Push mode: wait for a NOTIFY on @p conn or for @p timeout_ms, whichever
+/// comes first, checking @p running every second.  Returns at once when a
+/// notification is already queued, or when @p conn is down -- the poll
+/// loop's wait_for_connection() then paces the reconnect, rather than the
+/// wait sitting out the whole timeout on a closed socket.  Notifications
+/// are drained; the next poll query is driven by the high-water marks.
+/// Exposed for testing.
+void wait_for_notify_or_timeout(PGconn* conn, int timeout_ms,
+                                const std::atomic<bool>& running);
+
 /// Block until @p conn is usable, retrying through @p gate's back-off and
 /// sleeping between attempts in slices of at most a second.  Returns true
 /// once connected, false as soon as @p running is cleared.  The poll loop

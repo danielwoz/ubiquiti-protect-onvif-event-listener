@@ -107,63 +107,6 @@ bool try_install_motion_trigger_and_listen(PGconn* conn) {
   return true;
 }
 
-// Wait for either a NOTIFY on the connection socket or @p timeout_ms
-// elapsing, whichever comes first.  Returns quickly on stop() by polling
-// the running flag in 1-second slices.  Notifications are drained
-// (their id payloads are not needed -- the subsequent poll query is
-// hwm-driven and picks up whatever landed).
-void wait_for_notify_or_timeout(PGconn* conn,
-                                 int timeout_ms,
-                                 const std::atomic<bool>& running) {
-  // libpq's query machinery drains the socket internally, so any
-  // NOTIFY that arrives during the preceding poll SELECT is already
-  // queued in the connection's notification list -- select() would
-  // block for the full timeout waiting for more socket bytes.  Drain
-  // the queue first; if anything is there, return immediately so the
-  // next poll cycle picks it up.
-  {
-    PGnotify* n = nullptr;
-    bool got_any = false;
-    while ((n = PQnotifies(conn)) != nullptr) {
-      PQfreemem(n);
-      got_any = true;
-    }
-    if (got_any) return;
-  }
-  const int sock = PQsocket(conn);
-  const auto deadline = std::chrono::steady_clock::now()
-                      + std::chrono::milliseconds(timeout_ms);
-  while (running.load()) {
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= deadline) return;
-    const int remaining_ms = static_cast<int>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - now).count());
-    // Cap the individual select() at 1 s so stop() gets promptly noticed.
-    const int slice_ms = std::min(1000, remaining_ms);
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    if (sock >= 0) FD_SET(sock, &rfds);
-    timeval tv{slice_ms / 1000, (slice_ms % 1000) * 1000};
-    int rc = ::select(sock >= 0 ? sock + 1 : 0,
-                      sock >= 0 ? &rfds : nullptr,
-                      nullptr, nullptr, &tv);
-    if (rc < 0) {
-      if (errno == EINTR) continue;
-      return;  // caller re-tries the loop, which reconnects on demand
-    }
-    if (rc == 0) continue;  // timeout slice -- loop and check running
-    if (!PQconsumeInput(conn)) return;  // conn broken; caller reconnects
-    PGnotify* n = nullptr;
-    bool got_any = false;
-    while ((n = PQnotifies(conn)) != nullptr) {
-      PQfreemem(n);
-      got_any = true;
-    }
-    if (got_any) return;
-  }
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -345,6 +288,65 @@ bool ensure_listening(PGconn* conn, int* listen_pid) {
   // The connection went away (or was reset) under the LISTEN: try again
   // on the next session rather than giving up on push mode.
   return PQstatus(conn) != CONNECTION_OK || PQbackendPID(conn) != pid;
+}
+
+// Wait for either a NOTIFY on the connection socket or @p timeout_ms
+// elapsing, whichever comes first.  Returns quickly on stop() by polling
+// the running flag in 1-second slices.  Notifications are drained
+// (their id payloads are not needed -- the subsequent poll query is
+// hwm-driven and picks up whatever landed).
+void wait_for_notify_or_timeout(PGconn* conn,
+                                 int timeout_ms,
+                                 const std::atomic<bool>& running) {
+  // libpq's query machinery drains the socket internally, so any
+  // NOTIFY that arrives during the preceding poll SELECT is already
+  // queued in the connection's notification list -- select() would
+  // block for the full timeout waiting for more socket bytes.  Drain
+  // the queue first; if anything is there, return immediately so the
+  // next poll cycle picks it up.
+  {
+    PGnotify* n = nullptr;
+    bool got_any = false;
+    while ((n = PQnotifies(conn)) != nullptr) {
+      PQfreemem(n);
+      got_any = true;
+    }
+    if (got_any) return;
+  }
+  // A connection that is down has no socket to wait on: return at once
+  // so the poll loop waits out the reconnect back-off instead of the
+  // whole timeout.
+  const int sock = PQsocket(conn);
+  if (PQstatus(conn) != CONNECTION_OK || sock < 0) return;
+  const auto deadline = std::chrono::steady_clock::now()
+                      + std::chrono::milliseconds(timeout_ms);
+  while (running.load()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return;
+    const int remaining_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now).count());
+    // Cap the individual select() at 1 s so stop() gets promptly noticed.
+    const int slice_ms = std::min(1000, remaining_ms);
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(sock, &rfds);
+    timeval tv{slice_ms / 1000, (slice_ms % 1000) * 1000};
+    int rc = ::select(sock + 1, &rfds, nullptr, nullptr, &tv);
+    if (rc < 0) {
+      if (errno == EINTR) continue;
+      return;  // caller re-tries the loop, which reconnects on demand
+    }
+    if (rc == 0) continue;  // timeout slice -- loop and check running
+    if (!PQconsumeInput(conn)) return;  // conn broken; caller reconnects
+    PGnotify* n = nullptr;
+    bool got_any = false;
+    while ((n = PQnotifies(conn)) != nullptr) {
+      PQfreemem(n);
+      got_any = true;
+    }
+    if (got_any) return;
+  }
 }
 
 }  // namespace motion_poller_internal
@@ -1602,8 +1604,8 @@ void MotionPoller::poll_loop() {
     // slices so stop() is responsive.
     impl_->restore_listen();
     if (impl_->trigger_installed) {
-      wait_for_notify_or_timeout(impl_->conn, kSafetyNetTimeoutMs,
-                                  running_);
+      motion_poller_internal::wait_for_notify_or_timeout(
+          impl_->conn, kSafetyNetTimeoutMs, running_);
     } else {
       for (int s = 0; s < impl_->poll_interval_sec && running_.load(); ++s)
         std::this_thread::sleep_for(std::chrono::seconds(1));

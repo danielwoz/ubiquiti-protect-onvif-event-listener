@@ -469,6 +469,63 @@ static void test_ensure_listening_follows_session() {
   PQfinish(conn);
 }
 
+// ---------------------------------------------------------------------------
+// wait_for_notify_or_timeout: push mode's wait between poll cycles
+// ---------------------------------------------------------------------------
+
+static int64_t timed_notify_wait_ms(PGconn* conn, int timeout_ms) {
+  std::atomic<bool> running{true};
+  const auto t0 = std::chrono::steady_clock::now();
+  onvif::motion_poller_internal::wait_for_notify_or_timeout(conn, timeout_ms,
+                                                           running);
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+}
+
+// A connection that is already down (the outage was noticed by a query in
+// the middle of a cycle) has no socket to wait on.  The wait returns at
+// once so the loop's reconnect back-off applies, instead of the poller
+// sitting out the whole 60 s safety-net timeout after the database is
+// back.
+static void test_wait_for_notify_returns_when_down() {
+  PGconn* conn = PQconnectdb(
+      "host=/nonexistent-onvif-recorder-test port=1 connect_timeout=1");
+  const int64_t ms = timed_notify_wait_ms(conn, 5000);
+  check(ms < 500, ("notify wait: returns at once on a down connection, took " +
+                   std::to_string(ms) + " ms").c_str());
+  PQfinish(conn);
+}
+
+// Against a real PostgreSQL (skipped when none is reachable): an idle
+// listening session waits out the timeout, a queued notification ends the
+// wait at once, and so does a session the server has ended.
+static void test_wait_for_notify_db() {
+  const char* env = std::getenv("ONVIF_TEST_DB_CONN");
+  PGconn* conn = PQconnectdb(env ? env : "");
+  if (PQstatus(conn) != CONNECTION_OK) {
+    std::cerr << "SKIP: wait_for_notify_or_timeout against a database "
+                 "(set ONVIF_TEST_DB_CONN)\n";
+    PQfinish(conn);
+    return;
+  }
+  PQclear(PQexec(conn, "LISTEN onvif_recorder_motion"));
+  int64_t ms = timed_notify_wait_ms(conn, 300);
+  check(ms >= 250, ("notify wait db: idle session waits out the timeout, "
+                    "took " + std::to_string(ms) + " ms").c_str());
+
+  PQclear(PQexec(conn, "NOTIFY onvif_recorder_motion, 'ev'"));
+  ms = timed_notify_wait_ms(conn, 5000);
+  check(ms < 500, ("notify wait db: queued notification returns at once, "
+                   "took " + std::to_string(ms) + " ms").c_str());
+
+  PQclear(PQexec(conn, "SELECT pg_terminate_backend(pg_backend_pid())"));
+  check(PQstatus(conn) == CONNECTION_BAD, "notify wait db: session ended");
+  ms = timed_notify_wait_ms(conn, 5000);
+  check(ms < 500, ("notify wait db: ended session returns at once, took " +
+                   std::to_string(ms) + " ms").c_str());
+  PQfinish(conn);
+}
+
 int main() {
   test_smart_detect_types_known();
   test_smart_detect_types_person_default();
@@ -493,6 +550,8 @@ int main() {
   test_wait_for_connection_stops();
   test_ensure_listening_while_down();
   test_ensure_listening_follows_session();
+  test_wait_for_notify_returns_when_down();
+  test_wait_for_notify_db();
 
   std::cout << "test_motion_poller: "
             << g_pass << " passed, " << g_fail << " failed\n";
