@@ -83,6 +83,7 @@ constexpr seconds kPersistGranularity{600};
 constexpr int64_t kPersistGranularityMs = kPersistGranularity.count() * 1000;
 constexpr seconds kDeclineLogInterval{300};
 constexpr seconds kOverflowLogInterval{60};
+constexpr seconds kOverflowWarnInterval{600};
 constexpr seconds kEvictionWarnInterval{600};
 constexpr seconds kMoveWarnInterval{600};
 constexpr std::chrono::hours kSummaryInterval{1};
@@ -511,6 +512,7 @@ struct CameraState {
   std::optional<SteadyTime> resubscribe_planned_at;
   std::optional<SteadyTime> nudged_at;
   std::optional<SteadyTime> overflow_logged_at;
+  std::optional<SteadyTime> overflow_warned_at;
   std::optional<SteadyTime> move_warned_at;
   uint64_t moves_since_warning = 0;
 
@@ -819,9 +821,17 @@ struct PullPointHub::Impl {
     if (c != nullptr &&
         (!c->overflow_logged_at || now - *c->overflow_logged_at >= kOverflowLogInterval)) {
       c->overflow_logged_at = now;
-      LOG(WARNING) << "[event_proxy] " << c->ip << " Protect is not pulling fast enough;"
-                   << " dropped " << dropped << " queued event(s) (pp=" << id8(pp->id)
-                   << ", " << pp->dropped << " so far)";
+      // A warning per camera every kOverflowWarnInterval, INFO in between:
+      // a camera that keeps outrunning Protect's pulls, or a pull point
+      // Protect stopped pulling, would otherwise add a journal line a
+      // minute.  The pull age tells the two apart.
+      const bool warn =
+          !c->overflow_warned_at || now - *c->overflow_warned_at >= kOverflowWarnInterval;
+      if (warn) c->overflow_warned_at = now;
+      LOG(LEVEL(warn ? absl::LogSeverity::kWarning : absl::LogSeverity::kInfo))
+          << "[event_proxy] " << c->ip << " Protect is not pulling fast enough; dropped "
+          << dropped << " queued event(s) (pp=" << id8(pp->id) << ", pulled "
+          << whole_seconds(now - pp->last_pull) << "s ago, " << pp->dropped << " so far)";
     }
   }
 

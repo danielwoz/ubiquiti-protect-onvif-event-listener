@@ -620,10 +620,20 @@ void test_overflow() {
   const std::string snap = r->hub->snapshot_json();
   check(json_int(snap, "dropped") == 4, "overflow counted on the pull point");
   check(json_int(snap, "drops") == 4, "overflow counted on the camera");
-  check(g_logs->count("not pulling fast enough") == 1, "overflow warning once a minute");
+  const std::string overflow = "not pulling fast enough";
+  check(g_logs->count(overflow) == 1 && g_logs->warnings(overflow) == 1,
+        "overflow: a warning");
+  check(g_logs->count("(pp=" + c.id.substr(0, 8) + ", pulled 0s ago, 1 so far)") == 1,
+        "overflow: the line has the pull point, its pull age and its drops");
   r->clock.advance(seconds(61));
   for (int i = 0; i < 5; ++i) feed(r->hub.get(), kIp, {event("Z")});
-  check(g_logs->count("not pulling fast enough") == 2, "overflow warning again later");
+  check(g_logs->count(overflow) == 2 && g_logs->warnings(overflow) == 1,
+        "overflow: logged again a minute later, at INFO");
+  check(g_logs->count("pulled 61s ago") == 1, "overflow: pull age when not pulled");
+  r->clock.advance(seconds(540));
+  for (int i = 0; i < 5; ++i) feed(r->hub.get(), kIp, {event("Z")});
+  check(g_logs->count(overflow) == 3 && g_logs->warnings(overflow) == 2,
+        "overflow: a warning again 10 min after the last one");
 
   PullPointHub::Options ob;
   ob.max_queue_bytes = 300;
