@@ -317,6 +317,36 @@ std::string build_sdt_payload(uint64_t start_ms,
       + "}]";
 }
 
+bool wait_for_connection(PGconn* conn, onvif::pg::ReconnectGate* gate,
+                         const std::atomic<bool>& running) {
+  while (running.load()) {
+    if (gate->ensure(conn)) return true;
+    const int64_t wait_ms =
+        std::clamp<int64_t>(gate->ms_until_next_attempt(), 1, 1000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+  }
+  return false;
+}
+
+bool ensure_listening(PGconn* conn, int* listen_pid) {
+  if (PQstatus(conn) != CONNECTION_OK) return true;  // retried once back up
+  const int pid = PQbackendPID(conn);
+  if (pid == *listen_pid) return true;
+  PGresult* r = onvif::pg::ExecWithTimeout(conn, -1,
+                                           "LISTEN onvif_recorder_motion");
+  const bool ok = PQresultStatus(r) == PGRES_COMMAND_OK;
+  PQclear(r);
+  if (ok) {
+    if (*listen_pid != 0)
+      LOG(INFO) << "[motion_poller] LISTEN restored on the re-opened connection";
+    *listen_pid = pid;
+    return true;
+  }
+  // The connection went away (or was reset) under the LISTEN: try again
+  // on the next session rather than giving up on push mode.
+  return PQstatus(conn) != CONNECTION_OK || PQbackendPID(conn) != pid;
+}
+
 }  // namespace motion_poller_internal
 
 namespace {
@@ -460,20 +490,31 @@ struct MotionPoller::Impl {
     return std::max(1, std::min(cap, std::max(1, event_secs)));
   }
 
+  // Spaces out reconnect attempts while the database is down (a Protect
+  // Postgres restart takes about a minute) and keeps the journal to a few
+  // lines per outage.
+  onvif::pg::ReconnectGate reconnect{"motion_poller"};
+
   ~Impl() {
     if (conn) PQfinish(conn);
   }
 
-  // Attempt to restore a broken connection.
-  void maybe_reconnect() {
-    if (PQstatus(conn) != CONNECTION_BAD) return;
-    LOG(WARNING) << "[motion_poller] connection lost — reconnecting";
-    PQreset(conn);
-    if (PQstatus(conn) == CONNECTION_OK)
-      LOG(INFO) << "[motion_poller] reconnected";
-    else
-      LOG(ERROR) << "[motion_poller] reconnect failed: "
-                 << PQerrorMessage(conn);
+  // Server process of the session that issued the LISTEN.
+  int listen_pid{0};
+
+  // Restore a broken connection when an attempt is due.  Returns whether
+  // the connection is usable.
+  bool maybe_reconnect() { return reconnect.ensure(conn); }
+
+  // In push mode, re-issue the LISTEN on a re-opened connection; if that
+  // fails, fall back to the interval poll.
+  void restore_listen() {
+    if (!trigger_installed) return;
+    if (!motion_poller_internal::ensure_listening(conn, &listen_pid)) {
+      LOG(WARNING) << "[motion_poller] LISTEN after reconnect failed: "
+                   << PQerrorMessage(conn) << " -- falling back to interval poll";
+      trigger_installed = false;
+    }
   }
 };
 
@@ -767,6 +808,8 @@ void MotionPoller::poll_loop() {
     impl_->maybe_reconnect();
     impl_->trigger_installed =
         try_install_motion_trigger_and_listen(impl_->conn);
+    if (impl_->trigger_installed)
+      impl_->listen_pid = PQbackendPID(impl_->conn);
   } else {
     LOG(INFO) << "[motion_poller] push mode disabled -- interval poll";
   }
@@ -792,7 +835,14 @@ void MotionPoller::poll_loop() {
   uint64_t hb_skipped_overlap = 0;
 
   while (running_.load()) {
-    impl_->maybe_reconnect();
+    // While the database is down, wait out the reconnect back-off here
+    // rather than running every camera's queries against a dead
+    // connection.
+    if (!motion_poller_internal::wait_for_connection(
+            impl_->conn, &impl_->reconnect, running_)) {
+      break;
+    }
+    impl_->restore_listen();
 
     // Per-camera poll: each camera gets its own hwm-bounded query.
     // Earlier versions used a single global query parameterised by
@@ -803,7 +853,7 @@ void MotionPoller::poll_loop() {
     // that head-of-line blocking entirely.
     for (const std::string& cam_id : impl_->camera_ids) {
       if (!running_.load()) break;
-      impl_->maybe_reconnect();
+      if (!impl_->maybe_reconnect()) break;
 
       auto hwm_it = impl_->hwm.find(cam_id);
       const uint64_t cam_hwm = (hwm_it != impl_->hwm.end())
@@ -864,6 +914,9 @@ void MotionPoller::poll_loop() {
         LOG(INFO) << "[motion_poller] poll returned " << nrows
                   << " motion event(s) to consider for camera " << cam_id;
       for (int i = 0; i < nrows && running_.load(); ++i) {
+        // Connection lost mid-batch: leave the remaining rows for the
+        // next cycle (the high-water mark has not passed them).
+        if (!impl_->maybe_reconnect()) break;
         const bool has_overlap =
             std::string(PQgetvalue(res, i, 6)) == "t";
         if (has_overlap) {
@@ -1547,6 +1600,7 @@ void MotionPoller::poll_loop() {
     // dropped notifications can't cause missed events.  Interval mode
     // (or push-install failed): sleep for poll_interval_sec in 1 s
     // slices so stop() is responsive.
+    impl_->restore_listen();
     if (impl_->trigger_installed) {
       wait_for_notify_or_timeout(impl_->conn, kSafetyNetTimeoutMs,
                                   running_);

@@ -612,6 +612,10 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   // Populated lazily by upsert_label(); avoids redundant DB queries.
   std::map<std::string, int> label_cache_;
 
+  // Spaces out reconnect attempts while the database is down and keeps
+  // the journal to a few lines per outage.
+  onvif::pg::ReconnectGate reconnect_{"pg"};
+
   static absl::StatusOr<std::unique_ptr<PgBackend>> Create(
       const std::string& conninfo) {
     auto b = std::make_unique<PgBackend>(conninfo);
@@ -681,17 +685,11 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     return (it != ip_to_id_.end()) ? it->second : ip;
   }
 
-  // Attempt to restore a broken connection.  Called before every query.
-  // PQreset() re-uses the same conninfo string; safe to call on a live conn.
-  void maybe_reconnect() {
-    if (PQstatus(conn_) != CONNECTION_BAD) return;
-    LOG(WARNING) << "[pg] connection lost — attempting reconnect";
-    PQreset(conn_);
-    if (PQstatus(conn_) == CONNECTION_OK)
-      LOG(INFO) << "[pg] reconnected";
-    else
-      LOG(ERROR) << "[pg] reconnect failed: " << PQerrorMessage(conn_);
-  }
+  // Restore a broken connection when an attempt is due.  Called before
+  // every query; returns whether the connection is usable.  While it is
+  // not, the query is skipped -- it could only fail -- and the gate keeps
+  // reconnect attempts and log lines to a few per outage.
+  bool maybe_reconnect() { return reconnect_.ensure(conn_); }
 
   // Return the best available error string for a failed query.
   const char* pg_errmsg(PGresult* res) const {
@@ -704,7 +702,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   // Execute a no-parameter DELETE and return the row count; logs on failure.
   // Returns -1 on error so callers can detect failure.
   int exec_purge(const char* sql, const char* label) {
-    maybe_reconnect();
+    if (!maybe_reconnect()) return -1;
     PGresult* res = onvif::pg::ExecWithTimeout(conn_, -1, sql);
     int deleted = 0;
     if (PQresultStatus(res) == PGRES_COMMAND_OK) {
@@ -747,7 +745,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
                    const char* const* params,
                    const int*         lengths = nullptr,
                    const int*         formats = nullptr) {
-    maybe_reconnect();
+    if (!maybe_reconnect()) return;
     PGresult* res = onvif::pg::ExecParamsWithTimeout(conn_, -1, sql, nparams, nullptr,
                                  params, lengths, formats, 0);
     ExecStatusType st = PQresultStatus(res);
@@ -848,7 +846,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     // and the gate stops retrying while inserts are timing out.
     auto& gate = onvif::pg::AreaInsertGate();
     if (!gate.allowed()) return;
-    maybe_reconnect();
+    if (!maybe_reconnect()) return;
     PGresult* res = onvif::pg::ExecParamsWithTimeout(
         conn_, onvif::pg::kBestEffortTimeoutMs, sql.c_str(), 8, nullptr,
         params, nullptr, nullptr, 0);
@@ -1070,7 +1068,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   }
 
   std::vector<IDbBackend::EventSummary> query_recent_events(int days) override {
-    maybe_reconnect();
+    if (!maybe_reconnect()) return {};
     const uint64_t since_ms =
         util::now_ms() - static_cast<uint64_t>(days) * 86400000ULL;
     const std::string since_str = std::to_string(since_ms);
@@ -1249,7 +1247,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   }
 
   int purge_stale_open_events(uint64_t older_than_ms) override {
-    maybe_reconnect();
+    if (!maybe_reconnect()) return 0;
     if (!begin_txn()) return 0;
 
     const std::string cutoff = std::to_string(
@@ -1381,7 +1379,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     };
     const int formats[7] = { 0, 0, 0, 0, 0, 0, 1 };  // $7 is binary
 
-    maybe_reconnect();
+    if (!maybe_reconnect()) return;
     PGresult* res = onvif::pg::ExecParamsWithTimeout(conn_, -1,
       "INSERT INTO thumbnails"
       " (id, \"cameraId\", \"eventId\", timestamp, \"createdAt\","

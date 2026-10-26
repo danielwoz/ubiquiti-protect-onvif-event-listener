@@ -48,8 +48,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>  // NOLINT(build/c++11)
 #include <string>
+#include <vector>
 
+#include "absl/log/log_entry.h"
+#include "absl/log/log_sink.h"
+#include "absl/log/log_sink_registry.h"
 #include "pg_util.hpp"
 
 namespace {
@@ -156,6 +161,189 @@ static void test_best_effort_gate() {
 }
 
 // ---------------------------------------------------------------------------
+// ReconnectGate: back-off and log throttling for a lost connection
+// ---------------------------------------------------------------------------
+namespace {
+
+class CaptureSink : public absl::LogSink {
+ public:
+  void Send(const absl::LogEntry& entry) override {
+    std::lock_guard<std::mutex> lk(mu_);
+    lines_.emplace_back(entry.text_message());
+  }
+  int count(const std::string& needle) {
+    std::lock_guard<std::mutex> lk(mu_);
+    int n = 0;
+    for (const std::string& l : lines_)
+      if (l.find(needle) != std::string::npos) ++n;
+    return n;
+  }
+
+ private:
+  std::mutex mu_;
+  std::vector<std::string> lines_;
+};
+
+namespace rc_test {
+int64_t now_ms = 0;
+bool up = true;
+bool reset_ok = false;
+int resets = 0;
+int64_t clock() { return now_ms; }
+bool fake_up(PGconn*) { return up; }
+bool fake_reset(PGconn*, std::string* error) {
+  ++resets;
+  if (reset_ok) {
+    up = true;
+    return true;
+  }
+  *error = "FATAL: the database system is shutting down";
+  return false;
+}
+void install(onvif::pg::ReconnectGate* gate) {
+  gate->set_clock_for_testing(&clock);
+  gate->set_conn_ops_for_testing({&fake_up, &fake_reset});
+}
+}  // namespace rc_test
+
+}  // namespace
+
+static void test_reconnect_gate_backoff() {
+  CaptureSink sink;
+  absl::AddLogSink(&sink);
+  onvif::pg::ReconnectGate gate("rc_test", /*base_ms=*/1000, /*max_ms=*/8000,
+                                /*summary_ms=*/60'000);
+  rc_test::install(&gate);
+  rc_test::now_ms = 100'000;
+  rc_test::up = true;
+  rc_test::reset_ok = false;
+  rc_test::resets = 0;
+
+  check(gate.ensure(nullptr), "reconnect: usable while up");
+  check(rc_test::resets == 0, "reconnect: no reset while up");
+  check(gate.ms_until_next_attempt() == 0, "reconnect: nothing pending while up");
+
+  // The database goes away: the first attempt is immediate, later ones
+  // wait out a back-off that doubles up to max_ms.
+  rc_test::up = false;
+  check(!gate.ensure(nullptr), "reconnect: not usable while down");
+  check(rc_test::resets == 1, "reconnect: first attempt is immediate");
+  check(!gate.ensure(nullptr) && rc_test::resets == 1,
+        "reconnect: no attempt inside the back-off");
+  check(gate.ms_until_next_attempt() == 1000, "reconnect: back-off starts at base");
+  rc_test::now_ms += 999;
+  gate.ensure(nullptr);
+  check(rc_test::resets == 1, "reconnect: still waiting 1 ms before the back-off ends");
+  rc_test::now_ms += 1;
+  gate.ensure(nullptr);
+  check(rc_test::resets == 2, "reconnect: attempt once the back-off ends");
+  check(gate.ms_until_next_attempt() == 2000, "reconnect: back-off doubles");
+  rc_test::now_ms += 2000;
+  gate.ensure(nullptr);
+  rc_test::now_ms += 4000;
+  gate.ensure(nullptr);
+  check(gate.ms_until_next_attempt() == 8000, "reconnect: back-off reaches max");
+  rc_test::now_ms += 8000;
+  gate.ensure(nullptr);
+  check(gate.ms_until_next_attempt() == 8000, "reconnect: back-off capped at max");
+  check(rc_test::resets == 5, "reconnect: five attempts so far");
+
+  // A caller calling ensure() every 10 ms through a two-minute outage gets
+  // one attempt per back-off, a single loss/failure line, and a summary
+  // per minute.
+  for (int i = 0; i < 12'000; ++i) {
+    rc_test::now_ms += 10;
+    gate.ensure(nullptr);
+  }
+  check(rc_test::resets >= 18 && rc_test::resets <= 21,
+        ("reconnect: attempts bounded by the back-off, got " +
+         std::to_string(rc_test::resets)).c_str());
+  check(sink.count("[rc_test] connection lost") == 1,
+        "reconnect: the loss is logged once");
+  check(sink.count("[rc_test] reconnect failed: FATAL: the database system is "
+                   "shutting down") == 1,
+        "reconnect: the first failure is logged once, with the error");
+  const int summaries = sink.count("[rc_test] still disconnected after");
+  check(summaries == 2,
+        ("reconnect: one summary per minute, got " +
+         std::to_string(summaries)).c_str());
+
+  // Recovery: logged once with the outage length, and the back-off starts
+  // over for the next outage.
+  rc_test::reset_ok = true;
+  rc_test::now_ms += gate.ms_until_next_attempt();
+  check(gate.ensure(nullptr), "reconnect: usable after a successful reset");
+  check(sink.count("[rc_test] reconnected after") == 1,
+        "reconnect: recovery logged with the outage length");
+  check(gate.ms_until_next_attempt() == 0, "reconnect: nothing pending once up");
+
+  rc_test::up = false;
+  rc_test::reset_ok = false;
+  const int before = rc_test::resets;
+  check(!gate.ensure(nullptr), "reconnect: second outage detected");
+  check(rc_test::resets == before + 1,
+        "reconnect: second outage starts with an immediate attempt");
+  check(gate.ms_until_next_attempt() == 1000,
+        "reconnect: back-off reset to base after recovering");
+  check(sink.count("[rc_test] connection lost") == 2,
+        "reconnect: each outage logs its loss");
+
+  // The connection comes back without the gate's reset (pg_util re-opens
+  // it after a failed query): the outage ends there, and the next one is
+  // logged and backed off from scratch.
+  rc_test::now_ms += 5000;
+  gate.ensure(nullptr);  // second failed attempt of this outage
+  rc_test::up = true;
+  check(gate.ensure(nullptr), "reconnect: usable when re-opened elsewhere");
+  check(sink.count("[rc_test] reconnected after") == 2,
+        "reconnect: recovery elsewhere ends the outage");
+  check(gate.ms_until_next_attempt() == 0,
+        "reconnect: nothing pending after recovery elsewhere");
+  rc_test::up = false;
+  const int before_third = rc_test::resets;
+  check(!gate.ensure(nullptr), "reconnect: third outage detected");
+  check(rc_test::resets == before_third + 1,
+        "reconnect: third outage starts with an immediate attempt");
+  check(sink.count("[rc_test] connection lost") == 3,
+        "reconnect: third outage logs its loss");
+  check(sink.count("[rc_test] reconnect failed") == 3,
+        "reconnect: third outage logs its first failure");
+  absl::RemoveLogSink(&sink);
+}
+
+// Production defaults: 1 s doubling to 30 s.
+static void test_reconnect_gate_defaults() {
+  onvif::pg::ReconnectGate gate("rc_defaults");
+  rc_test::install(&gate);
+  rc_test::now_ms = 500'000;
+  rc_test::up = false;
+  rc_test::reset_ok = false;
+  gate.ensure(nullptr);
+  check(gate.ms_until_next_attempt() == 1000, "reconnect defaults: base 1 s");
+  for (int i = 0; i < 10; ++i) {
+    rc_test::now_ms += gate.ms_until_next_attempt();
+    gate.ensure(nullptr);
+  }
+  check(gate.ms_until_next_attempt() == 30'000, "reconnect defaults: max 30 s");
+}
+
+// The real libpq path against a server that is not there: attempts are
+// spaced by the back-off however often ensure() is called.
+static void test_reconnect_gate_unreachable_server() {
+  PGconn* c = PQconnectdb(
+      "host=/nonexistent-onvif-recorder-test port=1 connect_timeout=1");
+  check(PQstatus(c) == CONNECTION_BAD, "unreachable: connection is bad");
+  onvif::pg::ReconnectGate gate("rc_unreachable", /*base_ms=*/60'000,
+                                /*max_ms=*/60'000);
+  check(!gate.ensure(c), "unreachable: not usable");
+  for (int i = 0; i < 100; ++i) gate.ensure(c);
+  check(gate.attempts() == 1,
+        ("unreachable: one reset inside the back-off, got " +
+         std::to_string(gate.attempts())).c_str());
+  PQfinish(c);
+}
+
+// ---------------------------------------------------------------------------
 // DB-dependent tests
 // ---------------------------------------------------------------------------
 static void test_simple_select(PGconn* conn) {
@@ -257,11 +445,33 @@ static void test_sql_error_returns_error_result(PGconn* conn) {
   PQclear(r);
 }
 
+// The server ends the session (as a Postgres restart does); the gate
+// re-opens it on the next ensure().
+static void test_reconnect_gate_recovers(PGconn* conn) {
+  onvif::pg::ReconnectGate gate("rc_db");
+  check(gate.ensure(conn), "db reconnect: usable at start");
+  const int pid = PQbackendPID(conn);
+  // Plain PQexec: ExecWithTimeout would re-open the connection itself.
+  PQclear(PQexec(conn, "SELECT pg_terminate_backend(pg_backend_pid())"));
+  check(PQstatus(conn) == CONNECTION_BAD, "db reconnect: session ended");
+  check(gate.ensure(conn), "db reconnect: re-opened");
+  check(gate.attempts() == 1, "db reconnect: one attempt");
+  check(PQbackendPID(conn) != pid, "db reconnect: new server session");
+  PGresult* r = onvif::pg::ExecWithTimeout(conn, 5000, "SELECT 7");
+  check(r != nullptr && PQresultStatus(r) == PGRES_TUPLES_OK &&
+            std::strcmp(PQgetvalue(r, 0, 0), "7") == 0,
+        "db reconnect: query works on the re-opened connection");
+  PQclear(r);
+}
+
 int main() {
   // Always-runnable tests
   test_null_conn_returns_null();
   test_default_timeout_constant();
   test_best_effort_gate();
+  test_reconnect_gate_backoff();
+  test_reconnect_gate_defaults();
+  test_reconnect_gate_unreachable_server();
 
   // DB-dependent tests
   PGconn* conn = try_connect();
@@ -277,6 +487,7 @@ int main() {
     skip("test_timeout_fires");
     skip("test_connection_usable_after_timeout");
     skip("test_sql_error_returns_error_result");
+    skip("test_reconnect_gate_recovers");
   } else {
     test_simple_select(conn);
     test_parameterised_select(conn);
@@ -284,6 +495,7 @@ int main() {
     test_timeout_fires(conn);
     test_connection_usable_after_timeout(conn);
     test_sql_error_returns_error_result(conn);
+    test_reconnect_gate_recovers(conn);
     PQfinish(conn);
   }
 

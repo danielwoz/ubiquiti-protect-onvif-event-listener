@@ -257,5 +257,142 @@ BestEffortGate& AreaInsertGate() {
   return gate;
 }
 
+namespace {
+
+bool ConnUp(PGconn* conn) {
+  return conn != nullptr && PQstatus(conn) != CONNECTION_BAD;
+}
+
+// libpq error text spans several lines ("...failed: No such file or
+// directory\n\tIs the server running locally...").  Fold it onto one line.
+std::string OneLine(const char* msg) {
+  std::string out;
+  bool space = false;
+  for (const char* p = msg ? msg : ""; *p != '\0'; ++p) {
+    if (*p == '\n' || *p == '\r' || *p == '\t' || *p == ' ') {
+      space = !out.empty();
+      continue;
+    }
+    if (space) out += ' ';
+    space = false;
+    out += *p;
+  }
+  return out;
+}
+
+bool ConnReset(PGconn* conn, std::string* error) {
+  if (conn == nullptr) {
+    *error = "no connection object";
+    return false;
+  }
+  PQreset(conn);
+  if (PQstatus(conn) == CONNECTION_OK) return true;
+  *error = OneLine(PQerrorMessage(conn));
+  return false;
+}
+
+}  // namespace
+
+ReconnectGate::ReconnectGate(std::string tag, int64_t base_ms, int64_t max_ms,
+                             int64_t summary_ms)
+    : tag_(std::move(tag)),
+      base_ms_(base_ms),
+      max_ms_(max_ms),
+      summary_ms_(summary_ms) {
+  ops_.up = &ConnUp;
+  ops_.reset = &ConnReset;
+}
+
+int64_t ReconnectGate::now() const {
+  if (clock_ != nullptr) return clock_();
+  return std::chrono::duration_cast<milliseconds>(
+             steady_clock::now().time_since_epoch()).count();
+}
+
+bool ReconnectGate::ensure(PGconn* conn) {
+  std::lock_guard<std::mutex> lk(mu_);
+  const bool up = ops_.up(conn);
+  if (up && !down_) return true;
+  const int64_t t = now();
+  if (up) {
+    // Re-opened elsewhere, e.g. by CancelAndDrain after a failed query.
+    recovered(t, outage_failures_);
+    return true;
+  }
+  if (!down_) {
+    down_ = true;
+    down_since_ms_ = t;
+    last_summary_ms_ = t;
+    next_attempt_ms_ = t;
+    backoff_ms_ = 0;
+    outage_failures_ = 0;
+    failures_since_summary_ = 0;
+    LOG(WARNING) << "[" << tag_ << "] connection lost — reconnecting";
+  }
+  if (t < next_attempt_ms_) return false;
+
+  ++attempts_;
+  std::string error;
+  if (ops_.reset(conn, &error)) {
+    recovered(t, outage_failures_ + 1);
+    return true;
+  }
+
+  ++outage_failures_;
+  ++failures_since_summary_;
+  last_error_ = error;
+  backoff_ms_ = backoff_ms_ == 0 ? base_ms_ : std::min(backoff_ms_ * 2, max_ms_);
+  next_attempt_ms_ = t + backoff_ms_;
+  if (outage_failures_ == 1) {
+    LOG(ERROR) << "[" << tag_ << "] reconnect failed: " << error
+               << " -- retrying with back-off (" << base_ms_ / 1000.0
+               << " s doubling to " << max_ms_ / 1000.0
+               << " s), summary every " << summary_ms_ / 1000.0 << " s";
+    failures_since_summary_ = 0;
+  } else if (t - last_summary_ms_ >= summary_ms_) {
+    LOG(WARNING) << "[" << tag_ << "] still disconnected after "
+                 << (t - down_since_ms_) / 1000 << " s: "
+                 << failures_since_summary_
+                 << " more reconnect attempts failed, last error: "
+                 << last_error_;
+    last_summary_ms_ = t;
+    failures_since_summary_ = 0;
+  }
+  return false;
+}
+
+void ReconnectGate::recovered(int64_t t, uint64_t attempts) {
+  if (outage_failures_ == 0) {
+    LOG(INFO) << "[" << tag_ << "] reconnected";
+  } else {
+    LOG(WARNING) << "[" << tag_ << "] reconnected after "
+                 << (t - down_since_ms_) / 1000 << " s (" << attempts
+                 << " attempts)";
+  }
+  down_ = false;
+  backoff_ms_ = 0;
+}
+
+int64_t ReconnectGate::ms_until_next_attempt() {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (!down_) return 0;
+  return std::max<int64_t>(0, next_attempt_ms_ - now());
+}
+
+uint64_t ReconnectGate::attempts() {
+  std::lock_guard<std::mutex> lk(mu_);
+  return attempts_;
+}
+
+void ReconnectGate::set_clock_for_testing(int64_t (*now_ms)()) {
+  std::lock_guard<std::mutex> lk(mu_);
+  clock_ = now_ms;
+}
+
+void ReconnectGate::set_conn_ops_for_testing(ConnOps ops) {
+  std::lock_guard<std::mutex> lk(mu_);
+  ops_ = ops;
+}
+
 }  // namespace pg
 }  // namespace onvif

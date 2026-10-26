@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "pg_util.hpp"
 
 namespace object_detect { class ObjectDetector; }
 
@@ -87,6 +88,24 @@ struct Candidate {
 int select_best_candidate_index(
     const std::vector<std::string>& baseline_classes,
     const std::vector<Candidate>& event_candidates);
+
+/// Block until @p conn is usable, retrying through @p gate's back-off and
+/// sleeping between attempts in slices of at most a second.  Returns true
+/// once connected, false as soon as @p running is cleared.  The poll loop
+/// calls this before every cycle so a database outage is waited out
+/// instead of spinning through failing queries.  Exposed for testing.
+bool wait_for_connection(PGconn* conn, onvif::pg::ReconnectGate* gate,
+                         const std::atomic<bool>& running);
+
+/// Push mode: issue LISTEN for the motion channel when @p conn is a
+/// different server session from the one that last listened (*@p
+/// listen_pid, updated on success).  A reset connection -- from the
+/// reconnect gate, or from pg_util after a failed query -- starts a
+/// session without the LISTEN, which would leave only the 60 s safety-net
+/// poll.  Returns false only when the LISTEN itself is refused; a
+/// connection that is down or drops meanwhile is retried on the next call.
+/// Exposed for testing.
+bool ensure_listening(PGconn* conn, int* listen_pid);
 
 }  // namespace motion_poller_internal
 

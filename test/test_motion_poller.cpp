@@ -16,12 +16,20 @@
  * test_motion_poller.cpp
  *
  * Pure-logic tests for helpers exposed via onvif::motion_poller_internal
- * (smart_detect_types_json, build_sdr_payload).  No PostgreSQL required.
+ * (smart_detect_types_json, build_sdr_payload, wait_for_connection, ...).
+ * No PostgreSQL required; the LISTEN-restore test also runs against one
+ * when ONVIF_TEST_DB_CONN is set and is skipped otherwise.
  */
 
+#include <libpq-fe.h>
+
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>  // NOLINT(build/c++11)
 #include <vector>
 
 #include "motion_poller.hpp"
@@ -327,6 +335,140 @@ static void test_select_same_class_two_frames() {
         "select: stronger detection in later frame wins");
 }
 
+// ---------------------------------------------------------------------------
+// wait_for_connection: the poll loop's wait while the database is down
+// ---------------------------------------------------------------------------
+
+namespace wait_test {
+int resets = 0;
+int succeed_on = 0;
+bool up = false;
+bool fake_up(PGconn*) { return up; }
+bool fake_reset(PGconn*, std::string* error) {
+  if (++resets >= succeed_on) {
+    up = true;
+    return true;
+  }
+  *error = "FATAL: the database system is starting up";
+  return false;
+}
+}  // namespace wait_test
+
+// A Postgres restart: the third attempt gets through.  The wait returns
+// once connected, having slept out the back-off between attempts rather
+// than retrying in a tight loop.
+static void test_wait_for_connection_until_up() {
+  onvif::pg::ReconnectGate gate("wait_test", /*base_ms=*/20, /*max_ms=*/40);
+  gate.set_conn_ops_for_testing({&wait_test::fake_up, &wait_test::fake_reset});
+  wait_test::resets = 0;
+  wait_test::succeed_on = 3;
+  wait_test::up = false;
+  std::atomic<bool> running{true};
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool ok = onvif::motion_poller_internal::wait_for_connection(
+      nullptr, &gate, running);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+  check(ok, "wait: returns true once the connection is back");
+  check(wait_test::resets == 3, "wait: one attempt per back-off");
+  check(ms >= 55, "wait: sleeps out the back-off between attempts");
+}
+
+// The database stays down: a real libpq connection to a server that is
+// not there.  The wait keeps to the back-off and returns false promptly
+// when the poller is stopped.
+static void test_wait_for_connection_stops() {
+  PGconn* conn = PQconnectdb(
+      "host=/nonexistent-onvif-recorder-test port=1 connect_timeout=1");
+  onvif::pg::ReconnectGate gate("wait_test_down", /*base_ms=*/100,
+                                /*max_ms=*/200);
+  std::atomic<bool> running{true};
+  std::atomic<bool> result{true};
+  std::thread waiter([&] {
+    result = onvif::motion_poller_internal::wait_for_connection(
+        conn, &gate, running);
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  const auto t0 = std::chrono::steady_clock::now();
+  running = false;
+  waiter.join();
+  const auto stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+  check(!result.load(), "wait: returns false when stopped while down");
+  check(stop_ms < 500, "wait: notices stop() within its sleep slice");
+  // Attempts at 0, 100, 300, 500, 700, 900 ms: about six in one second.
+  check(gate.attempts() >= 4 && gate.attempts() <= 8,
+        ("wait: attempts bounded by the back-off, got " +
+         std::to_string(gate.attempts())).c_str());
+  PQfinish(conn);
+}
+
+// ---------------------------------------------------------------------------
+// ensure_listening: push mode's LISTEN follows the connection's session
+// ---------------------------------------------------------------------------
+
+// A connection that is down is left for the next call, not reported as a
+// refused LISTEN (which would drop push mode for the rest of the run).
+static void test_ensure_listening_while_down() {
+  PGconn* conn = PQconnectdb(
+      "host=/nonexistent-onvif-recorder-test port=1 connect_timeout=1");
+  int pid = 1234;
+  check(onvif::motion_poller_internal::ensure_listening(conn, &pid),
+        "listen: down connection is retried later");
+  check(pid == 1234, "listen: down connection leaves the session id alone");
+  PQfinish(conn);
+}
+
+static bool listening(PGconn* conn) {
+  PGresult* r = PQexec(conn,
+      "SELECT count(*) FROM pg_listening_channels() c"
+      " WHERE c = 'onvif_recorder_motion'");
+  const bool on = PQresultStatus(r) == PGRES_TUPLES_OK &&
+                  std::string(PQgetvalue(r, 0, 0)) == "1";
+  PQclear(r);
+  return on;
+}
+
+// Against a real PostgreSQL (ONVIF_TEST_DB_CONN or libpq's PG* defaults;
+// skipped when none is reachable): the LISTEN comes back after the
+// session is re-opened, whether the reconnect gate or pg_util's
+// cancel-and-drain re-opened it.
+static void test_ensure_listening_follows_session() {
+  const char* env = std::getenv("ONVIF_TEST_DB_CONN");
+  PGconn* conn = PQconnectdb(env ? env : "");
+  if (PQstatus(conn) != CONNECTION_OK) {
+    std::cerr << "SKIP: ensure_listening against a database "
+                 "(set ONVIF_TEST_DB_CONN)\n";
+    PQfinish(conn);
+    return;
+  }
+  using onvif::motion_poller_internal::ensure_listening;
+  int pid = 0;
+  check(ensure_listening(conn, &pid) && pid == PQbackendPID(conn),
+        "listen db: first LISTEN records the session");
+  check(listening(conn), "listen db: channel listened");
+
+  // Server ends the session; the reconnect gate re-opens it.
+  onvif::pg::ReconnectGate gate("listen_test");
+  PQclear(PQexec(conn, "SELECT pg_terminate_backend(pg_backend_pid())"));
+  check(ensure_listening(conn, &pid), "listen db: down session deferred");
+  check(gate.ensure(conn), "listen db: gate re-opened the session");
+  check(!listening(conn), "listen db: new session starts without LISTEN");
+  check(ensure_listening(conn, &pid) && pid == PQbackendPID(conn),
+        "listen db: LISTEN issued on the new session");
+  check(listening(conn), "listen db: channel listened again (gate)");
+
+  // Session ends under a query: pg_util resets the connection itself.
+  PQclear(PQexec(conn, "SELECT pg_terminate_backend(pg_backend_pid())"));
+  PQclear(onvif::pg::ExecWithTimeout(conn, 5000, "SELECT 1"));
+  if (PQstatus(conn) != CONNECTION_OK) gate.ensure(conn);
+  check(PQstatus(conn) == CONNECTION_OK, "listen db: session re-opened");
+  check(ensure_listening(conn, &pid) && pid == PQbackendPID(conn),
+        "listen db: LISTEN issued after pg_util's reset");
+  check(listening(conn), "listen db: channel listened again (pg_util)");
+  PQfinish(conn);
+}
+
 int main() {
   test_smart_detect_types_known();
   test_smart_detect_types_person_default();
@@ -346,6 +488,11 @@ int main() {
   test_select_person_through_parked_car();
   test_select_all_classes_in_baseline();
   test_select_same_class_two_frames();
+
+  test_wait_for_connection_until_up();
+  test_wait_for_connection_stops();
+  test_ensure_listening_while_down();
+  test_ensure_listening_follows_session();
 
   std::cout << "test_motion_poller: "
             << g_pass << " passed, " << g_fail << " failed\n";

@@ -393,7 +393,12 @@ cc_test(
     name = "test_pg_util",
     srcs = ["test_pg_util.cpp"],
     linkstatic = True,
-    deps = ["//:pg_util"] + select({
+    deps = [
+        "//:pg_util",
+        "@com_google_absl//absl/log:log_entry",
+        "@com_google_absl//absl/log:log_sink",
+        "@com_google_absl//absl/log:log_sink_registry",
+    ] + select({
         "@platforms//cpu:aarch64": ["@arm64_sysroot//:libpq"],
         "//conditions:default":    ["//third_party:libpq"],
     }),

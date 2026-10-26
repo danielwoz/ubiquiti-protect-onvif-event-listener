@@ -109,5 +109,65 @@ class BestEffortGate {
 // first-party motion poller write the same table).
 BestEffortGate& AreaInsertGate();
 
+// Re-opens a lost connection with a bounded back-off and few log lines.
+// While the connection is down, PQreset runs at most once per back-off:
+// the first attempt is immediate, the next base_ms after a failure,
+// doubling up to max_ms.  The loss and the first failed attempt are
+// logged, later failures only as a summary every summary_ms, and the
+// recovery once with the length of the outage.  A successful reset clears
+// the back-off.  Thread-safe for its own state; callers still serialise
+// use of the PGconn.
+class ReconnectGate {
+ public:
+  explicit ReconnectGate(std::string tag,
+                         int64_t base_ms = 1'000,
+                         int64_t max_ms = 30'000,
+                         int64_t summary_ms = 60'000);
+
+  // True when @p conn is usable.  When it is down and an attempt is due,
+  // resets it first.  False while it stays down, including between
+  // attempts, so callers skip their query instead of failing it.
+  bool ensure(PGconn* conn);
+
+  // Milliseconds until the next reset attempt is due; 0 when the
+  // connection is up or an attempt is due now.
+  int64_t ms_until_next_attempt();
+
+  // Reset attempts made so far.
+  uint64_t attempts();
+
+  // Test seams: a monotonic millisecond clock, and the two connection
+  // operations ensure() uses (is the connection up; reset it, returning
+  // whether it is up afterwards and setting *error when it is not).
+  struct ConnOps {
+    bool (*up)(PGconn* conn);
+    bool (*reset)(PGconn* conn, std::string* error);
+  };
+  void set_clock_for_testing(int64_t (*now_ms)());
+  void set_conn_ops_for_testing(ConnOps ops);
+
+ private:
+  int64_t now() const;
+  // Log the end of an outage that took @p attempts resets; mu_ held.
+  void recovered(int64_t t, uint64_t attempts);
+
+  const std::string tag_;
+  const int64_t base_ms_;
+  const int64_t max_ms_;
+  const int64_t summary_ms_;
+  std::mutex mu_;
+  bool down_ = false;
+  int64_t down_since_ms_ = 0;
+  int64_t next_attempt_ms_ = 0;
+  int64_t backoff_ms_ = 0;
+  int64_t last_summary_ms_ = 0;
+  uint64_t attempts_ = 0;
+  uint64_t outage_failures_ = 0;
+  uint64_t failures_since_summary_ = 0;
+  std::string last_error_;
+  int64_t (*clock_)() = nullptr;
+  ConnOps ops_{};
+};
+
 }  // namespace pg
 }  // namespace onvif
