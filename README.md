@@ -258,7 +258,10 @@ Protect, so they come back by themselves after a Protect or UniFi OS update.
   Protect update.
 - Entries are applied after onvif-recorder's own patches. An entry whose `original` overlaps
   code that one of those patches changes does not apply while that patch is on.
-- `patch_alarm_picker=false` turns off all patching, these entries included.
+- With `patch_alarm_picker=false` onvif-recorder doesn't touch Protect's files, so entries are
+  neither applied nor taken out: ones already in `service.js` stay there. To take an entry
+  out, for example one that stops Protect from starting, delete it from the file and
+  restart onvif-recorder.
 - Removing an entry undoes it only while `service.js.bak` is still Protect's original, which
   onvif-recorder checks against dpkg's checksums. If you edited `service.js.bak` by hand
   before, undo those edits so the two match again:
