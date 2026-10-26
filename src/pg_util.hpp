@@ -113,8 +113,9 @@ BestEffortGate& AreaInsertGate();
 // While the connection is down, PQreset runs at most once per back-off:
 // the first attempt is immediate, the next base_ms after a failure,
 // doubling up to max_ms.  The loss and the first failed attempt are
-// logged, later failures only as a summary every summary_ms, and the
-// recovery once with the length of the outage.  A successful reset clears
+// logged, later failures only as a summary every summary_ms (both
+// failure lines at ERROR, so a lasting outage stays in the default
+// journal), and the recovery once with the length of the outage.  A successful reset clears
 // the back-off.  Thread-safe for its own state; callers still serialise
 // use of the PGconn.
 class ReconnectGate {

@@ -170,18 +170,28 @@ class CaptureSink : public absl::LogSink {
   void Send(const absl::LogEntry& entry) override {
     std::lock_guard<std::mutex> lk(mu_);
     lines_.emplace_back(entry.text_message());
+    errors_.push_back(entry.log_severity() >= absl::LogSeverity::kError);
   }
-  int count(const std::string& needle) {
-    std::lock_guard<std::mutex> lk(mu_);
-    int n = 0;
-    for (const std::string& l : lines_)
-      if (l.find(needle) != std::string::npos) ++n;
-    return n;
+  int count(const std::string& needle) { return count_where(needle, false); }
+  // Lines at ERROR or above: what the journal shows without --verbose.
+  int count_errors(const std::string& needle) {
+    return count_where(needle, true);
   }
 
  private:
+  int count_where(const std::string& needle, bool errors_only) {
+    std::lock_guard<std::mutex> lk(mu_);
+    int n = 0;
+    for (std::size_t i = 0; i < lines_.size(); ++i)
+      if ((!errors_only || errors_[i]) &&
+          lines_[i].find(needle) != std::string::npos)
+        ++n;
+    return n;
+  }
+
   std::mutex mu_;
   std::vector<std::string> lines_;
+  std::vector<bool> errors_;
 };
 
 namespace rc_test {
@@ -267,6 +277,10 @@ static void test_reconnect_gate_backoff() {
   check(summaries == 2,
         ("reconnect: one summary per minute, got " +
          std::to_string(summaries)).c_str());
+  check(sink.count_errors("[rc_test] reconnect failed") == 1 &&
+            sink.count_errors("[rc_test] still disconnected after") == 2,
+        "reconnect: the first failure and the summaries are logged at ERROR, "
+        "so a lasting outage stays in the journal without --verbose");
 
   // Recovery: logged once with the outage length, and the back-off starts
   // over for the next outage.

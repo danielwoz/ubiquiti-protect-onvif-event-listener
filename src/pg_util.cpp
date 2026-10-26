@@ -350,11 +350,14 @@ bool ReconnectGate::ensure(PGconn* conn) {
                << " s), summary every " << summary_ms_ / 1000.0 << " s";
     failures_since_summary_ = 0;
   } else if (t - last_summary_ms_ >= summary_ms_) {
-    LOG(WARNING) << "[" << tag_ << "] still disconnected after "
-                 << (t - down_since_ms_) / 1000 << " s: "
-                 << failures_since_summary_
-                 << " more reconnect attempts failed, last error: "
-                 << last_error_;
+    // ERROR, like the first failure: without --verbose the journal (and
+    // the admin page's recent errors) shows only ERROR lines, and an
+    // outage that persists must not drop out of them after one line.
+    LOG(ERROR) << "[" << tag_ << "] still disconnected after "
+               << (t - down_since_ms_) / 1000 << " s: "
+               << failures_since_summary_
+               << " more reconnect attempts failed, last error: "
+               << last_error_;
     last_summary_ms_ = t;
     failures_since_summary_ = 0;
   }
