@@ -145,9 +145,10 @@ struct CameraConfig {
     int heartbeat_interval_sec{60};
     /// Protect's event subscription for this camera is served from this
     /// camera's subscription.  Enables the listener's taps, delivers events
-    /// to the callback from a separate thread, resubscribes on a failed
-    /// Renew, and keeps the subscription across restarts when a resume path
-    /// is set.
+    /// to the callback from a separate thread, asks the camera for its
+    /// current state (SetSynchronizationPoint) after each new subscription,
+    /// resubscribes on a failed Renew, and keeps the subscription across
+    /// restarts when a resume path is set.
     bool event_proxy{false};
 };
 

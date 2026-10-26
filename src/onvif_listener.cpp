@@ -1093,6 +1093,10 @@ class CameraWorker {
       } else {
         LOG(INFO) << '[' << cfg_.ip << "] subscription -> " << sub.url;
         emit(UpstreamEvent::kSubscribed, 200, sub.url);
+        // A shared camera's current state, as Initialized messages, is
+        // what Protect's new subscribers are given first.  Some cameras
+        // send it on a new subscription only when asked.
+        if (cfg_.event_proxy) set_synchronization_point(sub.url, sub.ref_params);
       }
       subscribed_at_ms_.store(util::now_ms());
       last_renew_ms_.store(util::now_ms());
@@ -1202,16 +1206,14 @@ class CameraWorker {
                 " consecutive failures -- pausing before retry"
                 " (last error: " + std::string(ps.message()) + ")");
           } else {
-            LOG_FIRST_N(ERROR, 1) << '[' << cfg_.ip << "] error: "
-                                  << ps.message()
-                                  << ", reconnecting in "
-                                  << cfg_.retry_interval_sec << "s"
-                                  << (max_failures > 0
-                                        ? " (" +
-                                          std::to_string(consecutive_failures) +
-                                          "/" + std::to_string(max_failures) +
-                                          ")"
-                                        : "");
+            log_limited(&pull_warn_, kPullWarnInterval,
+                        std::string("pull error: ") + std::string(ps.message()) +
+                            " -- resubscribing in " +
+                            std::to_string(cfg_.retry_interval_sec) + "s" +
+                            (max_failures > 0
+                               ? " (" + std::to_string(consecutive_failures) +
+                                 "/" + std::to_string(max_failures) + ")"
+                               : ""));
             sleep_interruptible(cfg_.retry_interval_sec);
           }
           end = End::kPullFailed;
@@ -1269,10 +1271,17 @@ class CameraWorker {
   std::atomic<uint64_t> subscribed_at_ms_{0};
   WorkerHooks           hooks_;
   std::unique_ptr<AsyncDelivery> async_;  // event_proxy cameras only
-  // Renew warnings are logged at most once per kRenewWarnInterval.
-  std::chrono::steady_clock::time_point last_renew_warn_{};
-  bool                  renew_warned_{false};
-  uint64_t              renew_warn_suppressed_{0};
+
+  // A warning logged at most once per interval; see log_limited().
+  struct LimitedWarning {
+    std::chrono::steady_clock::time_point last{};
+    bool     warned{false};
+    uint64_t since{0};  // occurrences logged at INFO since the warning
+  };
+  static constexpr std::chrono::minutes kRenewWarnInterval{10};
+  static constexpr std::chrono::hours   kPullWarnInterval{1};
+  LimitedWarning        renew_warn_;
+  LimitedWarning        pull_warn_;
 
   void publish_current_health() {
     if (hooks_.publish_health) hooks_.publish_health(health());
@@ -1308,22 +1317,31 @@ class CameraWorker {
                             cfg_.retry_backoff_max_sec);
   }
 
-  void warn_renew_failed(const absl::Status& st) {
-    constexpr auto kRenewWarnInterval = std::chrono::minutes(10);
+  // Log "[ip] <msg>" at WARNING when @p w has not warned within @p every,
+  // else at INFO, so every occurrence is in the log but the warnings stay
+  // few.
+  void log_limited(LimitedWarning* w, std::chrono::steady_clock::duration every,
+                   const std::string& msg) {
     const auto now = std::chrono::steady_clock::now();
-    if (renew_warned_ && now - last_renew_warn_ < kRenewWarnInterval) {
-      ++renew_warn_suppressed_;
+    if (w->warned && now - w->last < every) {
+      ++w->since;
+      LOG(INFO) << '[' << cfg_.ip << "] " << msg;
       return;
     }
-    LOG(WARNING) << '[' << cfg_.ip << "] renew error: " << st.message()
-                 << (renew_warn_suppressed_
-                       ? " (" + std::to_string(renew_warn_suppressed_) +
+    LOG(WARNING) << '[' << cfg_.ip << "] " << msg
+                 << (w->since
+                       ? " (" + std::to_string(w->since) +
                          " more since the last warning)"
-                       : "")
-                 << (cfg_.event_proxy ? " -- resubscribing" : "");
-    renew_warned_          = true;
-    last_renew_warn_       = now;
-    renew_warn_suppressed_ = 0;
+                       : "");
+    w->warned = true;
+    w->last   = now;
+    w->since  = 0;
+  }
+
+  void warn_renew_failed(const absl::Status& st) {
+    log_limited(&renew_warn_, kRenewWarnInterval,
+                "renew error: " + std::string(st.message()) +
+                    (cfg_.event_proxy ? " -- resubscribing" : ""));
   }
 
   bool take_resubscribe() {
@@ -1751,7 +1769,7 @@ class CameraWorker {
     if (resp.status_code != 200)
       return absl::InternalError(
         "PullMessages HTTP " + std::to_string(resp.status_code) +
-        ": " + resp.body.substr(0, 300));
+        ": " + failure_detail(resp.body));
 
     if (cfg_.event_proxy && hooks_.raw_tap) hooks_.raw_tap(cfg_, resp.body);
 

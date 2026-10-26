@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -35,6 +36,10 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/log_severity.h"
+#include "absl/log/log_entry.h"
+#include "absl/log/log_sink.h"
+#include "absl/log/log_sink_registry.h"
 #include "absl/status/status.h"
 #include "onvif_listener.hpp"
 #include "camera_emulators.hpp"
@@ -1233,8 +1238,9 @@ static void test_resume_across_restart(const std::string& jsonl,
   CHECK(emu.unsubscribes_total() == 0,
         "listener A must not unsubscribe a kept subscription");
   CHECK(emu.live_subscriptions() == 1, "the kept subscription must be live");
-  CHECK(emu.sync_points_total() == 0,
-        "a new subscription must not send SetSynchronizationPoint");
+  CHECK(emu.sync_points_total() == 1,
+        "a new shared subscription must send one SetSynchronizationPoint, got " +
+            std::to_string(emu.sync_points_total()));
 
   {
     onvif::CameraConfig cfg_b = cfg;
@@ -1255,9 +1261,9 @@ static void test_resume_across_restart(const std::string& jsonl,
         std::chrono::seconds(10));
     b.stop();
     CHECK(renewed, "listener B must keep renewing the resumed subscription");
-    CHECK(emu.sync_points_total() == 1,
+    CHECK(emu.sync_points_total() == 2,
           "a resumed subscription must get exactly one SetSynchronizationPoint, "
-          "got " + std::to_string(emu.sync_points_total()));
+          "got " + std::to_string(emu.sync_points_total() - 1));
     std::lock_guard<std::mutex> lk(log.mu);
     CHECK(log.count(onvif::UpstreamEvent::kSubscribed) == 0,
           "listener B must not report kSubscribed");
@@ -1343,8 +1349,9 @@ static void test_resume_fallbacks(const std::string& jsonl,
           "unknown entry must not be resumed");
     CHECK(emu.creates_total() == 3 && emu.creates_refused() == 0,
           "unknown entry must lead to one fresh Create");
-    CHECK(emu.sync_points_total() == 0,
-          "SetSynchronizationPoint only after a resume");
+    CHECK(emu.sync_points_total() == 3,
+          "one SetSynchronizationPoint per new shared subscription, got " +
+              std::to_string(emu.sync_points_total()));
   }
 
   // A camera that is no longer shared releases the saved subscription and
@@ -1352,6 +1359,7 @@ static void test_resume_fallbacks(const std::string& jsonl,
   {
     CHECK(file_exists(path), "kept subscription expected before the last case");
     const int unsubs_before = emu.unsubscribes_total();
+    const int syncs_before = emu.sync_points_total();
     onvif::CameraConfig plain = cfg;
     plain.event_proxy = false;
     ProxyLog log;
@@ -1366,6 +1374,8 @@ static void test_resume_fallbacks(const std::string& jsonl,
               emu.live_subscriptions() == 0,
           "camera that is not shared must release both subscriptions");
     CHECK(!file_exists(path), "nothing kept, so no file");
+    CHECK(emu.sync_points_total() == syncs_before,
+          "a camera that is not shared sends no SetSynchronizationPoint");
   }
 
   // Without a MAC on either side the entry is matched by ip.
@@ -1377,6 +1387,7 @@ static void test_resume_fallbacks(const std::string& jsonl,
       CHECK(subscribe_and_stop(no_mac, &log), "no MAC: did not subscribe");
     }
     const int creates_before = emu.creates_total();
+    const int syncs_before = emu.sync_points_total();
     ProxyLog log;
     ListenerRunner run({no_mac}, &log, path);
     const bool ok = log.wait([](ProxyLog& l) {
@@ -1385,7 +1396,7 @@ static void test_resume_fallbacks(const std::string& jsonl,
     run.stop();
     CHECK(ok && emu.creates_total() == creates_before,
           "no MAC: the entry must be resumed by ip without a Create");
-    CHECK(emu.sync_points_total() == 1,
+    CHECK(emu.sync_points_total() == syncs_before + 1,
           "no MAC: the resumed subscription gets one SetSynchronizationPoint");
   }
   CHECK(onvif::OnvifListener::release_saved_subscriptions(path, {cfg}).ok() &&
@@ -1448,6 +1459,124 @@ static void test_resume_unclaimed_released(const std::string& jsonl,
     CHECK(emu.unsubscribes_total() == 2 && emu.live_subscriptions() == 0,
           "a kept subscription that cannot be saved must be released");
   }
+}
+
+// A SOAP 1.2 fault with subcode @p subcode.
+static std::string soap_fault(const std::string& subcode) {
+  return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+         "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+         " xmlns:ter=\"http://www.onvif.org/ver10/error\"><SOAP-ENV:Body>"
+         "<SOAP-ENV:Fault><SOAP-ENV:Code><SOAP-ENV:Value>SOAP-ENV:Receiver"
+         "</SOAP-ENV:Value><SOAP-ENV:Subcode><SOAP-ENV:Value>" + subcode +
+         "</SOAP-ENV:Value></SOAP-ENV:Subcode></SOAP-ENV:Code><SOAP-ENV:Reason>"
+         "<SOAP-ENV:Text xml:lang=\"en\">refused</SOAP-ENV:Text></SOAP-ENV:Reason>"
+         "</SOAP-ENV:Fault></SOAP-ENV:Body></SOAP-ENV:Envelope>";
+}
+
+// A one-slot camera that answers every request for @p action with an
+// HTTP 500 SOAP fault and counts them.
+class FaultingCamera : public SlotLimitedCameraEmulator {
+ public:
+  FaultingCamera(const std::string& jsonl_path, std::string action)
+    : SlotLimitedCameraEmulator(jsonl_path, 1), action_(std::move(action)) {}
+  int faults() const { return faults_.load(); }
+
+ protected:
+  std::pair<int, std::string> handle(const std::string& path,
+                                     const std::string& soap_action,
+                                     const std::string& body) override {
+    if (soap_action.find(action_) != std::string::npos) {
+      ++faults_;
+      return {500, soap_fault("ter:ActionNotSupported")};
+    }
+    return SlotLimitedCameraEmulator::handle(path, soap_action, body);
+  }
+
+ private:
+  const std::string action_;
+  std::atomic<int>  faults_{0};
+};
+
+// Records every log line with its severity.
+class LogCapture : public absl::LogSink {
+ public:
+  void Send(const absl::LogEntry& entry) override {
+    std::lock_guard<std::mutex> lk(mu_);
+    lines_.emplace_back(entry.log_severity(), std::string(entry.text_message()));
+  }
+  // Lines holding @p needle, at @p severity only when given.
+  int count(const std::string& needle,
+            std::optional<absl::LogSeverity> severity = std::nullopt) {
+    std::lock_guard<std::mutex> lk(mu_);
+    int n = 0;
+    for (const auto& l : lines_) {
+      if ((!severity || l.first == *severity) &&
+          l.second.find(needle) != std::string::npos)
+        ++n;
+    }
+    return n;
+  }
+
+ private:
+  std::mutex mu_;
+  std::vector<std::pair<absl::LogSeverity, std::string>> lines_;
+};
+
+// A shared camera that refuses SetSynchronizationPoint keeps its new
+// subscription: the refusal is only logged.
+static void test_sync_point_fault_harmless(const std::string& jsonl) {
+  FaultingCamera emu(jsonl, "SetSynchronizationPoint");
+  emu.start();
+
+  ProxyLog log;
+  ListenerRunner run({shared_cfg(emu.local_address())}, &log);
+  const bool ok = log.wait([](ProxyLog& l) {
+    return l.count(onvif::UpstreamEvent::kPullOk) >= 5 && l.taps >= 5;
+  }, std::chrono::seconds(15));
+  run.stop();
+
+  CHECK(ok, "pulls must go on after a refused SetSynchronizationPoint");
+  CHECK(emu.faults() == 1,
+        "one SetSynchronizationPoint after the new subscription, got " +
+            std::to_string(emu.faults()));
+  CHECK(emu.creates_total() == 1 && emu.creates_refused() == 0,
+        "a refused SetSynchronizationPoint must not lead to a new subscription");
+  std::lock_guard<std::mutex> lk(log.mu);
+  CHECK(log.count(onvif::UpstreamEvent::kSubscribed) == 1 &&
+            log.count(onvif::UpstreamEvent::kPullFailed) == 0 &&
+            log.count(onvif::UpstreamEvent::kUnsubscribed) == 1,
+        "the subscription lasts until stop()");
+}
+
+// Every failed pull is logged with the resubscribe that follows it: the
+// first as a warning, the rest within the hour at INFO.
+static void test_pull_errors_logged(const std::string& jsonl) {
+  FaultingCamera emu(jsonl, "PullMessages");
+  emu.start();
+  LogCapture logs;
+  absl::AddLogSink(&logs);
+
+  onvif::CameraConfig cfg = shared_cfg(emu.local_address());
+  cfg.event_proxy = false;
+  ProxyLog log;
+  ListenerRunner run({cfg}, &log);
+  const bool ok = wait_for_cond([&] { return emu.faults() >= 3; },
+                                std::chrono::seconds(15));
+  run.stop();
+  absl::RemoveLogSink(&logs);
+
+  const std::string line =
+      "[" + cfg.ip + "] pull error: PullMessages HTTP 500: "
+      "SOAP-ENV:Receiver ter:ActionNotSupported: refused -- resubscribing in 1s";
+  const int faults = emu.faults();
+  CHECK(ok, "timed out waiting for three failed pulls");
+  CHECK(logs.count(line) == faults,
+        "every failed pull is logged, " + std::to_string(logs.count(line)) +
+            " of " + std::to_string(faults));
+  CHECK(logs.count(line, absl::LogSeverity::kWarning) == 1,
+        "only the first failed pull within the hour is a warning");
+  CHECK(emu.creates_total() >= faults,
+        "each failed pull is followed by a new subscription");
 }
 
 // A per-test scratch directory under TEST_TMPDIR (or /tmp).
@@ -1586,6 +1715,10 @@ int main(int argc, char* argv[]) {
            [&] { test_resume_fallbacks(dahua_jsonl, tmp_dir); });
   run_test("resume_unclaimed_released",
            [&] { test_resume_unclaimed_released(dahua_jsonl, tmp_dir); });
+  run_test("sync_point_fault_harmless",
+           [&] { test_sync_point_fault_harmless(dahua_jsonl); });
+  run_test("pull_errors_logged",
+           [&] { test_pull_errors_logged(dahua_jsonl); });
   run_test("hikvision_basic",
            [&] { test_hikvision_basic(hikvision_jsonl); });
   run_test("hot_add",
