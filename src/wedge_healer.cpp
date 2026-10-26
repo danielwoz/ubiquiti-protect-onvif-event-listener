@@ -623,8 +623,12 @@ ProtectRecordingState recording_state_of(const json::Value& cam) {
 
   const json::Value* started = cam.member("hasRecordingStarted");
   if (started == nullptr || !started->is_false()) return st;
+  // Protect starts recording only provisioned cameras, also at start-up,
+  // so a restart does not help one it has not provisioned yet, such as a
+  // camera just unpaired from an AI Port.
   if (!member_true(cam, "isThirdPartyCamera") ||
-      !member_true(cam, "isAdopted") || !st.connected) {
+      !member_true(cam, "isAdopted") ||
+      !member_true(cam, "isProvisioned") || !st.connected) {
     return st;
   }
   const json::Value* mode = cam.find({"recordingSettings", "mode"});

@@ -339,10 +339,10 @@ struct ProtectRecordingState {
   // isPairedWithAiPort is true, and Protect does not re-check when one of
   // those becomes true later, so the camera stays unrecorded until Protect
   // restarts (#70).  Set when the camera is third-party, adopted,
-  // CONNECTED, has channels, is not paused or held back by geofencing,
-  // its recordingSettings.mode is not "never", Protect would record it now
-  // (mode always or schedule, or one of the three flags true), and
-  // hasRecordingStarted is false.
+  // provisioned, CONNECTED, has channels, is not paused or held back by
+  // geofencing, its recordingSettings.mode is not "never", Protect would
+  // record it now (mode always or schedule, or one of the three flags
+  // true), and hasRecordingStarted is false.
   bool stuck = false;
 };
 ProtectRecordingState read_protect_recording_state(const std::string& api_body);

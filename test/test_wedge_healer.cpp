@@ -49,7 +49,8 @@ static const char kStuckCamera[] =
     "{\"id\":\"cam1\",\"name\":\"Gate \\\"hasRecordingStarted\\\":true "
     "\\\"mode\\\":\\\"never\\\"\","
     "\"doorbellSession\":{\"hasRecordingStarted\":true,\"state\":\"x\"},"
-    "\"isThirdPartyCamera\":true,\"isAdopted\":true,\"state\":\"CONNECTED\","
+    "\"isThirdPartyCamera\":true,\"isAdopted\":true,\"isProvisioned\":true,"
+    "\"state\":\"CONNECTED\","
     "\"hasRecordingStarted\":false,\"isRecording\":false,"
     "\"isRecordingsPaused\":false,\"isPairedWithAiPort\":false,"
     "\"channels\":[{\"id\":0,\"enabled\":true},{\"id\":1,\"enabled\":true}],"
@@ -784,6 +785,13 @@ int main() {
                 .stuck);
     assert(!read_protect_recording_state(
                 with(stuck, "\"isAdopted\":true", "\"isAdopted\":false"))
+                .stuck);
+    assert(!read_protect_recording_state(
+                with(stuck, "\"isProvisioned\":true",
+                     "\"isProvisioned\":false"))
+                .stuck);
+    assert(!read_protect_recording_state(
+                with(stuck, "\"isProvisioned\":true,", ""))
                 .stuck);
     st = read_protect_recording_state(
         with(stuck, "\"state\":\"CONNECTED\"", "\"state\":\"DISCONNECTED\""));
