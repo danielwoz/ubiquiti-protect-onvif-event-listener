@@ -224,6 +224,7 @@ cc_test(
         "//:alarm_notifier",
         "//:detection_recorder",
         "//:msr_client",
+        "//:pg_util",
         "//:protect_version",
         "//:ubv_thumbnail",
         ":camera_emulators",

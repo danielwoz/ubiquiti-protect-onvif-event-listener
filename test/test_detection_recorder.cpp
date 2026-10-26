@@ -75,6 +75,7 @@
 #include "alarm_notifier.hpp"
 #include "detection_recorder.hpp"
 #include "onvif_listener.hpp"
+#include "pg_util.hpp"
 #include "protect_version.hpp"
 #include "ubv_thumbnail.hpp"
 #include "camera_emulators.hpp"
@@ -2712,6 +2713,54 @@ static void test_detection_labels_sql_db() {
   PQfinish(c);
 }
 
+// The recorder's reconnect back-off, driven the way on_event drives it: a
+// detection every 100 ms through an outage that ends after 1 s .. 70 s.
+// No write gets through while the database is down, so every moment the
+// back-off waits after it is back is a detection lost.  That wait stays
+// within five seconds, and the attempts during the outage stay few.
+namespace recorder_reconnect {
+int64_t now_ms = 0;
+bool db_up = false;
+bool conn_up = false;
+int64_t clock() { return now_ms; }
+bool up(PGconn*) { return conn_up; }
+bool reset(PGconn*, std::string* error) {
+  conn_up = db_up;
+  if (!conn_up) *error = "FATAL: the database system is starting up";
+  return conn_up;
+}
+}  // namespace recorder_reconnect
+
+static void test_recorder_reconnect_after_outage() {
+  namespace rr = recorder_reconnect;
+  using onvif::detection_recorder_internal::kReconnectBaseMs;
+  using onvif::detection_recorder_internal::kReconnectMaxMs;
+  int64_t worst_wait_ms = 0;
+  uint64_t worst_attempts = 0;
+  for (int64_t outage_ms = 1'000; outage_ms <= 70'000; outage_ms += 1'000) {
+    onvif::pg::ReconnectGate gate("recorder_reconnect", kReconnectBaseMs,
+                                  kReconnectMaxMs);
+    gate.set_clock_for_testing(&rr::clock);
+    gate.set_conn_ops_for_testing({&rr::up, &rr::reset});
+    rr::now_ms = 1'000'000;
+    rr::db_up = false;
+    rr::conn_up = false;
+    const int64_t back_at = rr::now_ms + outage_ms;
+    while (!gate.ensure(nullptr)) {
+      rr::now_ms += 100;
+      if (rr::now_ms >= back_at) rr::db_up = true;
+    }
+    worst_wait_ms = std::max(worst_wait_ms, rr::now_ms - back_at);
+    if (outage_ms == 60'000) worst_attempts = gate.attempts();
+  }
+  CHECK(worst_wait_ms <= 5'000,
+        "recorder reconnect: detections dropped for up to " +
+            std::to_string(worst_wait_ms) + " ms after the database is back");
+  CHECK(worst_attempts <= 20,
+        "recorder reconnect: " + std::to_string(worst_attempts) +
+            " reset attempts during a one-minute outage");
+}
+
 // IVS line crossing (issue #45) is momentary: one notification, never an
 // "ended" one.  It must produce a *closed* event with the configured
 // synthetic duration rather than a row with end IS NULL that
@@ -3906,6 +3955,8 @@ int main() {
            [] { test_detection_labels_follow_label_cleanup(); });
   run_test("pg_text_array", [] { test_pg_text_array(); });
   run_test("detection_labels_sql_db", [] { test_detection_labels_sql_db(); });
+  run_test("recorder_reconnect_after_outage",
+           [] { test_recorder_reconnect_after_outage(); });
   run_test("drop_unclassified_motion",
            [&] { test_drop_unclassified_motion(dir()); });
   run_test("drop_unclassified_spares_line_crossing",

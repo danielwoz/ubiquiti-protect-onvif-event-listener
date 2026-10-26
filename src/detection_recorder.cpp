@@ -697,7 +697,9 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
 
   // Spaces out reconnect attempts while the database is down and keeps
   // the journal to a few lines per outage.
-  onvif::pg::ReconnectGate reconnect_{"pg"};
+  onvif::pg::ReconnectGate reconnect_{
+      "pg", detection_recorder_internal::kReconnectBaseMs,
+      detection_recorder_internal::kReconnectMaxMs};
 
   static absl::StatusOr<std::unique_ptr<PgBackend>> Create(
       const std::string& conninfo) {

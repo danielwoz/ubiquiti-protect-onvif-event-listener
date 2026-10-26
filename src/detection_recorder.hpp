@@ -16,6 +16,7 @@
 
 #include <libpq-fe.h>
 
+#include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
@@ -712,6 +713,14 @@ std::string snapshot_url_with_path(const std::string& advertised_url,
                                    const std::string& path);
 
 namespace detection_recorder_internal {
+
+/// Reconnect back-off of the recorder's database connection: 1 s doubling
+/// to 5 s.  Attempts are made only when a detection or another write
+/// needs the connection, and every write is skipped while it is down, so
+/// a shorter cap than the motion poller's 30 s keeps the detections lost
+/// after the database is back to a few seconds' worth.
+constexpr int64_t kReconnectBaseMs = 1'000;
+constexpr int64_t kReconnectMaxMs = 5'000;
 
 /// PostgreSQL text[] literal for @p items, e.g. {"a","b\"c"}.  Exposed for
 /// testing.
