@@ -112,6 +112,12 @@ unlock door, light, PTZ preset) configured in **Protect → Alarms**.
    via the local Protect API (port 7080), records history in `automationsHistory`
    so hits appear in the Protect UI, and respects the "ignore repeated" cooldown
    setting on each automation.
+4. With Global Alarm Manager on, notifications go to the alarm's recipients on
+   the channels (push, email) and schedules set in the alarm, as they do for
+   Protect's own detections. "When away" schedules are left to Protect, which
+   checks them when it sends. An alarm with no notification action, or whose
+   recipients all have notifications off or are outside their schedule, sends
+   nothing but still records the hit in its history.
 
 **Setup:**
 

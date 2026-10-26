@@ -16,7 +16,9 @@
 
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -49,6 +51,19 @@ namespace onvif {
  *
  * The in-memory registration is lost when Protect restarts.  notify() detects
  * HTTP 500 ("Alarm not found") and re-registers before retrying once.
+ *
+ * Recipients
+ * ----------
+ * The /actions/notify route delivers to exactly the receivers the request
+ * names, so notify() builds them from the alarm's SEND_NOTIFICATION action:
+ * each recipient with push or email on, on those channels, when the alarm's
+ * and the recipient's schedules match the console's local time (Protect's
+ * checkScheduleConditions rules).  Schedule conditions on whether people are
+ * away become the route's geofence_restriction.  No call is made when the
+ * alarm has no SEND_NOTIFICATION action or no recipient is left; the
+ * history row and the cooldown are recorded either way.  The legacy
+ * /api/automations/<id>/run path runs Protect's own alarm, which applies
+ * the recipients itself.
  *
  * Usage
  * -----
@@ -103,6 +118,64 @@ class AlarmNotifier {
               uint64_t ts_ms);
 
  private:
+  // One condition of an alarm or recipient schedule, as Protect's
+  // checkScheduleConditions evaluates it: the unit's test, inverted unless
+  // the type is "is", then AND-ed with `and_then` and the result OR-ed
+  // with `or_else`.
+  struct Schedule {
+    enum class Unit { kTimeRange, kMonthDay, kWeekDay, kLocation, kOther };
+    Unit unit = Unit::kOther;  // kOther ("never", unknown) never matches
+    bool negate = false;
+    // kWeekDay: 0 (Sunday) .. 6.  kMonthDay: 1 .. 31.  kTimeRange: start
+    // hour, start minute, end hour, end minute; the end is exclusive.
+    std::vector<int> values;
+    // kLocation: true for "away" (this recipient is away), false for
+    // "allAway" (every user is away, which Protect reports as the console
+    // being away).
+    bool user_away = false;
+    std::shared_ptr<const Schedule> and_then;
+    std::shared_ptr<const Schedule> or_else;
+  };
+
+  // Local wall-clock fields a schedule is tested against.
+  struct ScheduleClock {
+    int minute_of_day = 0;  // 0 .. 1439
+    int month_day = 1;      // 1 .. 31
+    int week_day = 0;       // 0 = Sunday
+  };
+
+  // One recipient of an alarm's SEND_NOTIFICATION action.
+  struct Receiver {
+    std::string user;        // Protect user id
+    std::string ucore_user;  // UniFi OS user id: the notify user_id
+    bool push = false;
+    bool email = false;
+    std::vector<Schedule> schedules;  // empty = always
+  };
+
+  // The notify route's geofence_restriction: deliver only while this
+  // user (kCurrentAdmin) or every user (kAllAdmins) is away.
+  enum class Geofence { kNone, kCurrentAdmin, kAllAdmins };
+
+  // One entry of the notify payload's receivers array.
+  struct NotifyReceiver {
+    std::string user_id;
+    bool push = false;
+    bool email = false;
+    Geofence geofence = Geofence::kNone;
+  };
+
+  // Recipients one notify call goes to, or why there are none.
+  struct NotifyPlan {
+    std::vector<NotifyReceiver> receivers;
+    const char* skip_reason = "";
+    // A recipient's schedule tests whether people are away in a way the
+    // notify route cannot express; that test was taken as matching.
+    bool location_approximated = false;
+    // A recipient with a channel on has no UniFi OS user id.
+    bool unresolved_user = false;
+  };
+
   struct AutomationEntry {
     std::string id;
     std::string name;
@@ -111,10 +184,14 @@ class AlarmNotifier {
     bool enabled = false;
     bool cooldown_enabled = false;
     uint64_t cooldown_ms = 0;
+    bool has_notify_action = false;   // has a SEND_NOTIFICATION action
+    std::vector<Receiver> receivers;  // of every SEND_NOTIFICATION action
+    std::vector<Schedule> schedules;  // the alarm's own; empty = always
   };
 
-  // Grant the white-box test access to the private static parser and the
-  // AutomationEntry layout. Defined in test/test_alarm_notifier.cpp.
+  // Grant the white-box test access to the private static parsers, the
+  // recipient planning and the AutomationEntry layout. Defined in
+  // test/test_alarm_notifier.cpp.
   friend struct AlarmNotifierTest;
 
   std::string protect_url_;
@@ -129,6 +206,7 @@ class AlarmNotifier {
   std::map<std::string, uint64_t> last_fired_;   // automation_id → ms, protected by mu_
   std::map<std::string, std::string> mac_to_camera_id_;  // MAC → camera DB UUID, protected by mu_
   std::chrono::steady_clock::time_point last_refresh_{};
+  std::set<std::string> warned_;  // first_warning() keys, protected by mu_
 
   // Does this HTTP status from /actions/notify mean the UOS automation
   // manager has lost our registration?  Its store is in-memory only, so a
@@ -149,6 +227,33 @@ class AlarmNotifier {
 
   static std::vector<AutomationEntry> parse_automations(
       const std::string& json);
+  // Protect schedules array ([{"schedule":{...}}, ...]) at json[pos].
+  static std::vector<Schedule> parse_schedules(const std::string& json,
+                                               size_t pos);
+  // One schedule object at json[pos]; `depth` bounds and/or nesting.
+  static Schedule parse_schedule(const std::string& json, size_t pos,
+                                 int depth);
+  // Protect user id → UniFi OS user id, from GET /api/users.
+  static std::map<std::string, std::string> parse_user_ids(
+      const std::string& json);
+
+  // Protect's checkScheduleConditions: true when `schedules` is empty or
+  // any of them matches.  @p user_away is whether the recipient is away,
+  // @p all_away whether every user is.
+  static bool schedules_match(const std::vector<Schedule>& schedules,
+                              const ScheduleClock& clock,
+                              bool user_away, bool all_away);
+  static bool schedule_matches(const Schedule& schedule,
+                               const ScheduleClock& clock,
+                               bool user_away, bool all_away);
+  static ScheduleClock local_clock(std::time_t t);
+  // The receivers of the notify call for @p automation at @p clock.
+  static NotifyPlan plan_notification(const AutomationEntry& automation,
+                                      const ScheduleClock& clock);
+
+  // True the first time it is called with @p key.
+  bool first_warning(const std::string& key);
+
   static size_t write_cb(char* ptr, size_t size, size_t nmemb, void* userdata);
 
   // Build the JSON payload for POST /internal/automationManager/external/actions/notify.
@@ -159,13 +264,14 @@ class AlarmNotifier {
   //                 the live event row and attach the thumbnail to the push
   // event_id     -- UUID of the just-inserted events row (real thumbnail anchor)
   // ts_ms        -- event start ms-since-epoch
-  // user_id      -- UCore user UUID for the receivers array (schema requirement)
-  static std::string build_notify_payload(const std::string& alarm_id,
-                                          const std::string& event_key,
-                                          const std::string& camera_db_id,
-                                          const std::string& event_id,
-                                          uint64_t           ts_ms,
-                                          const std::string& user_id);
+  // receivers    -- who to notify, on which channels (plan_notification)
+  static std::string build_notify_payload(
+      const std::string& alarm_id,
+      const std::string& event_key,
+      const std::string& camera_db_id,
+      const std::string& event_id,
+      uint64_t           ts_ms,
+      const std::vector<NotifyReceiver>& receivers);
 
   std::string http_get(const std::string& url);
   // POST helper; returns the HTTP status code (0 on network error).

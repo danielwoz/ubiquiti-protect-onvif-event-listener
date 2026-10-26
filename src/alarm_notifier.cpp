@@ -22,8 +22,11 @@
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -107,10 +110,10 @@ static size_t find_key(const std::string& j,
   return std::string::npos;
 }
 
-// Extract the substring of a JSON array or object starting at pos (which must
-// point to '[' or '{').  Returns the matched substring including delimiters.
-static std::string extract_balanced(const std::string& j, size_t pos) {
-  if (pos >= j.size()) return {};
+// Position just past the JSON array or object starting at pos (which must
+// point to '[' or '{'); npos if it is not closed.
+static size_t balanced_end(const std::string& j, size_t pos) {
+  if (pos >= j.size()) return std::string::npos;
   char open = j[pos];
   char close = (open == '[') ? ']' : '}';
   int depth = 0;
@@ -138,10 +141,110 @@ static std::string extract_balanced(const std::string& j, size_t pos) {
       ++depth;
     } else if (c == close) {
       --depth;
-      if (depth == 0) return j.substr(pos, i - pos + 1);
+      if (depth == 0) return i + 1;
     }
   }
-  return {};
+  return std::string::npos;
+}
+
+// Extract the substring of a JSON array or object starting at pos (which must
+// point to '[' or '{').  Returns the matched substring including delimiters.
+static std::string extract_balanced(const std::string& j, size_t pos) {
+  const size_t end = balanced_end(j, pos);
+  if (end == std::string::npos) return {};
+  return j.substr(pos, end - pos);
+}
+
+// Position just past the JSON value starting at pos; npos if malformed.
+static size_t skip_value(const std::string& j, size_t pos) {
+  if (pos >= j.size()) return std::string::npos;
+  if (j[pos] == '{' || j[pos] == '[') return balanced_end(j, pos);
+  if (j[pos] == '"') {
+    for (size_t i = pos + 1; i < j.size(); ++i) {
+      if (j[i] == '\\') {
+        ++i;
+      } else if (j[i] == '"') {
+        return i + 1;
+      }
+    }
+    return std::string::npos;
+  }
+  size_t i = pos;  // number, true, false or null
+  while (i < j.size() && j[i] != ',' && j[i] != '}' && j[i] != ']' &&
+         j[i] != ' ' && j[i] != '\n' && j[i] != '\r' && j[i] != '\t')
+    ++i;
+  return i == pos ? std::string::npos : i;
+}
+
+// Call fn(key, value_pos) for each member of the object at j[pos] itself,
+// not of the objects nested in it.
+template <typename Fn>
+static void for_each_member(const std::string& j, size_t pos, Fn fn) {
+  if (pos >= j.size() || j[pos] != '{') return;
+  pos = skip_ws(j, pos + 1);
+  while (pos < j.size() && j[pos] == '"') {
+    const size_t key_pos = pos;
+    const std::string key = extract_string(j, pos);
+    if (pos == key_pos) return;
+    pos = skip_ws(j, pos);
+    if (pos >= j.size() || j[pos] != ':') return;
+    pos = skip_ws(j, pos + 1);
+    const size_t end = skip_value(j, pos);
+    if (end == std::string::npos) return;
+    fn(key, pos);
+    pos = skip_ws(j, end);
+    if (pos >= j.size() || j[pos] != ',') return;
+    pos = skip_ws(j, pos + 1);
+  }
+}
+
+// Position of the value of `key` among the members of the object at
+// j[pos] itself; npos if it has none.
+static size_t member(const std::string& j, size_t pos,
+                     const std::string& key) {
+  size_t found = std::string::npos;
+  for_each_member(j, pos, [&](const std::string& k, size_t value_pos) {
+    if (found == std::string::npos && k == key) found = value_pos;
+  });
+  return found;
+}
+
+// Call fn(value_pos) for each element of the array at j[pos].
+template <typename Fn>
+static void for_each_element(const std::string& j, size_t pos, Fn fn) {
+  if (pos >= j.size() || j[pos] != '[') return;
+  pos = skip_ws(j, pos + 1);
+  while (pos < j.size() && j[pos] != ']') {
+    const size_t end = skip_value(j, pos);
+    if (end == std::string::npos) return;
+    fn(pos);
+    pos = skip_ws(j, end);
+    if (pos >= j.size() || j[pos] != ',') return;
+    pos = skip_ws(j, pos + 1);
+  }
+}
+
+// String value at j[pos]; empty if it is not a string.
+static std::string string_at(const std::string& j, size_t pos) {
+  if (pos == std::string::npos) return {};
+  return extract_string(j, pos);
+}
+
+// Append, in order, the numbers in the array at j[pos] and in the arrays
+// directly inside it: [1, 2] and [[8, 0], [17, 30]] both flatten.
+static void collect_ints(const std::string& j, size_t pos,
+                         std::vector<int>* out) {
+  const auto add = [&](size_t p) {
+    if (j[p] == '-' || (j[p] >= '0' && j[p] <= '9'))
+      out->push_back(static_cast<int>(std::strtol(j.c_str() + p, nullptr, 10)));
+  };
+  for_each_element(j, pos, [&](size_t p) {
+    if (j[p] == '[') {
+      for_each_element(j, p, add);
+    } else {
+      add(p);
+    }
+  });
 }
 
 // Parse "conditions" array: extract each condition.source string.
@@ -240,52 +343,71 @@ std::vector<AlarmNotifier::AutomationEntry> AlarmNotifier::parse_automations(
         const std::string obj = json.substr(start, i - start + 1);
         AutomationEntry entry;
 
-        // Extract "id" string
-        size_t p = find_key(obj, 0, "id");
-        if (p != std::string::npos)
-          entry.id = extract_string(obj, p);
-
-        // Extract "name" string
-        p = find_key(obj, 0, "name");
-        if (p != std::string::npos)
-          entry.name = extract_string(obj, p);
+        // Keys are looked up among the alarm's own members only: its
+        // actions nest objects with keys of the same names.
+        entry.id = string_at(obj, member(obj, 0, "id"));
+        entry.name = string_at(obj, member(obj, 0, "name"));
 
         // Check "enable" boolean
-        p = find_key(obj, 0, "enable");
-        if (p != std::string::npos && p < obj.size())
-          entry.enabled = (obj[p] == 't');
+        size_t p = member(obj, 0, "enable");
+        entry.enabled = p != std::string::npos && obj[p] == 't';
 
         // Skip deleted automations
-        p = find_key(obj, 0, "deleted");
-        bool deleted = false;
-        if (p != std::string::npos && p < obj.size())
-          deleted = (obj[p] == 't');
+        p = member(obj, 0, "deleted");
+        const bool deleted = p != std::string::npos && obj[p] == 't';
 
         // Parse "conditions" array
-        p = find_key(obj, 0, "conditions");
-        if (p != std::string::npos && p < obj.size() && obj[p] == '[') {
+        p = member(obj, 0, "conditions");
+        if (p != std::string::npos && obj[p] == '[') {
           std::string arr = extract_balanced(obj, p);
           entry.trigger_types = parse_conditions(arr);
         }
 
         // Parse "sources" array (camera device filters)
-        p = find_key(obj, 0, "sources");
-        if (p != std::string::npos && p < obj.size() && obj[p] == '[') {
+        p = member(obj, 0, "sources");
+        if (p != std::string::npos && obj[p] == '[') {
           std::string arr = extract_balanced(obj, p);
           entry.source_devices = parse_sources(arr);
         }
 
         // Parse "cooldown" object
-        p = find_key(obj, 0, "cooldown");
-        if (p != std::string::npos && p < obj.size() && obj[p] == '{') {
-          std::string cd = extract_balanced(obj, p);
-          size_t ep = find_key(cd, 0, "enable");
-          if (ep != std::string::npos && ep < cd.size())
-            entry.cooldown_enabled = (cd[ep] == 't');
-          size_t tp = find_key(cd, 0, "timeout");
+        p = member(obj, 0, "cooldown");
+        if (p != std::string::npos && obj[p] == '{') {
+          const size_t ep = member(obj, p, "enable");
+          entry.cooldown_enabled = ep != std::string::npos && obj[ep] == 't';
+          const size_t tp = member(obj, p, "timeout");
           if (tp != std::string::npos)
-            entry.cooldown_ms = extract_uint(cd, tp);
+            entry.cooldown_ms = extract_uint(obj, tp);
         }
+
+        // The alarm's own schedules, and the recipients of its
+        // SEND_NOTIFICATION action:
+        //   "actions":[{"type":"SEND_NOTIFICATION","metadata":{"receivers":[
+        //     {"user":"<protect id>","ucoreUser":"<uuid>",
+        //      "channels":["push","email"],"schedules":[...]}]}}]
+        p = member(obj, 0, "schedules");
+        if (p != std::string::npos) entry.schedules = parse_schedules(obj, p);
+        for_each_element(obj, member(obj, 0, "actions"), [&](size_t action) {
+          if (string_at(obj, member(obj, action, "type")) !=
+              "SEND_NOTIFICATION") {
+            return;
+          }
+          entry.has_notify_action = true;
+          const size_t meta = member(obj, action, "metadata");
+          for_each_element(obj, member(obj, meta, "receivers"), [&](size_t rp) {
+            Receiver r;
+            r.user = string_at(obj, member(obj, rp, "user"));
+            r.ucore_user = string_at(obj, member(obj, rp, "ucoreUser"));
+            for_each_element(obj, member(obj, rp, "channels"), [&](size_t cp) {
+              const std::string channel = string_at(obj, cp);
+              if (channel == "push") r.push = true;
+              if (channel == "email") r.email = true;
+            });
+            const size_t sp = member(obj, rp, "schedules");
+            if (sp != std::string::npos) r.schedules = parse_schedules(obj, sp);
+            entry.receivers.push_back(std::move(r));
+          });
+        });
 
         if (!entry.id.empty() && !deleted && !entry.trigger_types.empty()) {
           result.push_back(std::move(entry));
@@ -295,6 +417,189 @@ std::vector<AlarmNotifier::AutomationEntry> AlarmNotifier::parse_automations(
     }
   }
   return result;
+}
+
+std::vector<AlarmNotifier::Schedule> AlarmNotifier::parse_schedules(
+    const std::string& json, size_t pos) {
+  std::vector<Schedule> schedules;
+  for_each_element(json, pos, [&](size_t p) {
+    if (json[p] != '{') return;
+    // Protect stores each entry as {"schedule": {...}}.
+    const size_t inner = member(json, p, "schedule");
+    schedules.push_back(
+        parse_schedule(json, inner != std::string::npos ? inner : p, 0));
+  });
+  return schedules;
+}
+
+AlarmNotifier::Schedule AlarmNotifier::parse_schedule(const std::string& json,
+                                                      size_t pos, int depth) {
+  constexpr int kMaxDepth = 16;
+  Schedule s;
+  if (pos >= json.size() || json[pos] != '{') return s;
+  // {"type":"is"|"not","unit":"day_of_week","values":[1,2],
+  //  "and":{...},"or":{...}}
+  s.negate = string_at(json, member(json, pos, "type")) != "is";
+  const std::string unit = string_at(json, member(json, pos, "unit"));
+  const size_t values = member(json, pos, "values");
+  if (unit == "time_range") {
+    s.unit = Schedule::Unit::kTimeRange;  // [[8, 0], [17, 30]]
+    collect_ints(json, values, &s.values);
+  } else if (unit == "day_of_month") {
+    s.unit = Schedule::Unit::kMonthDay;
+    collect_ints(json, values, &s.values);
+  } else if (unit == "day_of_week") {
+    s.unit = Schedule::Unit::kWeekDay;
+    collect_ints(json, values, &s.values);
+  } else if (unit == "location") {
+    s.unit = Schedule::Unit::kLocation;  // ["away"] or ["allAway"]
+    size_t first = std::string::npos;
+    for_each_element(json, values, [&](size_t p) {
+      if (first == std::string::npos) first = p;
+    });
+    s.user_away = string_at(json, first) == "away";
+  }
+  if (depth < kMaxDepth) {
+    const size_t and_pos = member(json, pos, "and");
+    if (and_pos != std::string::npos && json[and_pos] == '{') {
+      s.and_then = std::make_shared<const Schedule>(
+          parse_schedule(json, and_pos, depth + 1));
+    }
+    const size_t or_pos = member(json, pos, "or");
+    if (or_pos != std::string::npos && json[or_pos] == '{') {
+      s.or_else = std::make_shared<const Schedule>(
+          parse_schedule(json, or_pos, depth + 1));
+    }
+  }
+  return s;
+}
+
+std::map<std::string, std::string> AlarmNotifier::parse_user_ids(
+    const std::string& json) {
+  std::map<std::string, std::string> ids;
+  for_each_element(json, skip_ws(json, 0), [&](size_t p) {
+    const std::string id = string_at(json, member(json, p, "id"));
+    const std::string ucore = string_at(json, member(json, p, "ucoreUserId"));
+    if (!id.empty() && !ucore.empty()) ids[id] = ucore;
+  });
+  return ids;
+}
+
+// ============================================================
+// Recipients and schedules
+// ============================================================
+
+bool AlarmNotifier::schedule_matches(const Schedule& s,
+                                     const ScheduleClock& clock,
+                                     bool user_away, bool all_away) {
+  const auto has = [&](int v) {
+    return std::find(s.values.begin(), s.values.end(), v) != s.values.end();
+  };
+  bool match = false;
+  switch (s.unit) {
+    case Schedule::Unit::kMonthDay:
+      match = has(clock.month_day);
+      break;
+    case Schedule::Unit::kWeekDay:
+      match = has(clock.week_day);
+      break;
+    case Schedule::Unit::kTimeRange:
+      if (s.values.size() >= 4) {
+        const int from = s.values[0] * 60 + s.values[1];
+        const int to = s.values[2] * 60 + s.values[3];
+        match = clock.minute_of_day >= from && clock.minute_of_day < to;
+      }
+      break;
+    case Schedule::Unit::kLocation:
+      match = s.user_away ? user_away : all_away;
+      break;
+    case Schedule::Unit::kOther:
+      break;
+  }
+  if (s.negate) match = !match;
+  if (match && s.and_then)
+    match = schedule_matches(*s.and_then, clock, user_away, all_away);
+  if (!match && s.or_else)
+    match = schedule_matches(*s.or_else, clock, user_away, all_away);
+  return match;
+}
+
+bool AlarmNotifier::schedules_match(const std::vector<Schedule>& schedules,
+                                    const ScheduleClock& clock,
+                                    bool user_away, bool all_away) {
+  if (schedules.empty()) return true;
+  for (const Schedule& s : schedules) {
+    if (schedule_matches(s, clock, user_away, all_away)) return true;
+  }
+  return false;
+}
+
+AlarmNotifier::ScheduleClock AlarmNotifier::local_clock(std::time_t t) {
+  std::tm tm{};
+  localtime_r(&t, &tm);
+  ScheduleClock clock;
+  clock.minute_of_day = tm.tm_hour * 60 + tm.tm_min;
+  clock.month_day = tm.tm_mday;
+  clock.week_day = tm.tm_wday;
+  return clock;
+}
+
+AlarmNotifier::NotifyPlan AlarmNotifier::plan_notification(
+    const AutomationEntry& automation, const ScheduleClock& clock) {
+  NotifyPlan plan;
+  if (!automation.has_notify_action) {
+    plan.skip_reason = "the alarm has no notification action";
+    return plan;
+  }
+  // Whether people are away is known to Protect at delivery time, so each
+  // recipient is tested in every (this user away, every user away) state
+  // that can occur: every user being away implies this one is.  Protect
+  // tests the alarm's own schedules with the user taken as at home.
+  static constexpr bool kAway[3][2] = {
+      {false, false}, {true, false}, {true, true}};
+  bool any_channel = false;
+  bool any_user = false;
+  for (const Receiver& r : automation.receivers) {
+    if (!r.push && !r.email) continue;
+    any_channel = true;
+    if (r.ucore_user.empty()) {
+      plan.unresolved_user = true;
+      continue;
+    }
+    any_user = true;
+    bool m[3];
+    for (int i = 0; i < 3; ++i) {
+      m[i] = schedules_match(automation.schedules, clock, false, kAway[i][1]) &&
+             schedules_match(r.schedules, clock, kAway[i][0], kAway[i][1]);
+    }
+    if (!m[0] && !m[1] && !m[2]) continue;
+    NotifyReceiver receiver;
+    receiver.user_id = r.ucore_user;
+    receiver.push = r.push;
+    receiver.email = r.email;
+    if (!m[0] && m[1] && m[2]) {
+      receiver.geofence = Geofence::kCurrentAdmin;
+    } else if (!m[0] && !m[1] && m[2]) {
+      receiver.geofence = Geofence::kAllAdmins;
+    } else if (!(m[0] && m[1] && m[2])) {
+      // Only while at home, or only while this user but not everyone is
+      // away: geofence_restriction cannot say either.
+      plan.location_approximated = true;
+    }
+    plan.receivers.push_back(std::move(receiver));
+  }
+  if (plan.receivers.empty()) {
+    plan.skip_reason =
+        !any_channel ? "no recipient has push or email on"
+        : !any_user  ? "no recipient has a UniFi OS user id"
+                     : "the alarm's and recipients' schedules do not match now";
+  }
+  return plan;
+}
+
+bool AlarmNotifier::first_warning(const std::string& key) {
+  absl::MutexLock lk(&mu_);
+  return warned_.insert(key).second;
 }
 
 // ============================================================
@@ -520,7 +825,7 @@ std::string AlarmNotifier::build_notify_payload(
     const std::string& camera_db_id,
     const std::string& event_id,
     uint64_t           ts_ms,
-    const std::string& user_id) {
+    const std::vector<NotifyReceiver>& receivers) {
   using onvif::util::json_str;
   char ts_buf[24];
   std::snprintf(ts_buf, sizeof(ts_buf), "%" PRIu64, ts_ms);
@@ -548,8 +853,13 @@ std::string AlarmNotifier::build_notify_payload(
   //   }],
   //   "data":      { "is_critical": false },
   //   "receivers": [{ "user_id": "<ucore-uuid>", "push": true,
-  //                   "email": false, "voip": false }]
+  //                   "email": false, "voip": false,
+  //                   "geofence_restriction": "current_admin" }, ...]
   // }
+  //
+  // Protect sends to each receiver whose UniFi OS user it knows, on the
+  // channels set true; geofence_restriction "current_admin" holds it back
+  // unless that user is away, "all_admins" unless every user is.
   //
   // The sourceEvent.cameraId field is the key difference from the legacy
   // /api/automations/<id>/run path (which hardcodes "expectedNoEventId").
@@ -582,8 +892,22 @@ std::string AlarmNotifier::build_notify_payload(
   p +=   ",\"timestamp\":";        p += ts_buf;
   p += "}]}}]";
   p += ",\"data\":{\"is_critical\":false}";
-  p += ",\"receivers\":[{\"user_id\":"; p += json_str(user_id);
-  p += ",\"push\":true,\"email\":false,\"voip\":false}]}";
+  p += ",\"receivers\":[";
+  for (size_t i = 0; i < receivers.size(); ++i) {
+    const NotifyReceiver& r = receivers[i];
+    if (i > 0) p += ',';
+    p += "{\"user_id\":";          p += json_str(r.user_id);
+    p += ",\"push\":";             p += r.push ? "true" : "false";
+    p += ",\"email\":";            p += r.email ? "true" : "false";
+    p += ",\"voip\":false";
+    if (r.geofence == Geofence::kCurrentAdmin) {
+      p += ",\"geofence_restriction\":\"current_admin\"";
+    } else if (r.geofence == Geofence::kAllAdmins) {
+      p += ",\"geofence_restriction\":\"all_admins\"";
+    }
+    p += '}';
+  }
+  p += "]}";
   return p;
 }
 
@@ -731,6 +1055,26 @@ void AlarmNotifier::refresh_alarms() {
   if (response.empty()) return;
 
   auto parsed = parse_automations(response);
+
+  // A recipient saved without its UniFi OS user id is found by its Protect
+  // user id, the way Protect resolves recipients itself.
+  bool missing_ucore = false;
+  for (const auto& a : parsed) {
+    for (const auto& r : a.receivers) {
+      if (r.ucore_user.empty() && !r.user.empty()) missing_ucore = true;
+    }
+  }
+  if (missing_ucore) {
+    const auto ucore_ids = parse_user_ids(http_get(url + "/api/users"));
+    for (auto& a : parsed) {
+      for (auto& r : a.receivers) {
+        if (!r.ucore_user.empty()) continue;
+        const auto it = ucore_ids.find(r.user);
+        if (it != ucore_ids.end()) r.ucore_user = it->second;
+      }
+    }
+  }
+
   if (parsed.empty()) {
     LOG(WARNING) << "[alarm] loaded 0 automations from Protect API -- "
                  << "no automations will fire on detections.  Open Protect "
@@ -745,7 +1089,10 @@ void AlarmNotifier::refresh_alarms() {
               << " types=" << a.trigger_types.size()
               << " sources=" << a.source_devices.size()
               << " cooldown=" << a.cooldown_enabled
-              << "/" << a.cooldown_ms << "ms";
+              << "/" << a.cooldown_ms << "ms"
+              << " notify=" << a.has_notify_action
+              << " recipients=" << a.receivers.size()
+              << " schedules=" << a.schedules.size();
   }
 
   // ---- Step 3: register each enabled automation with the UOS store ----------
@@ -755,14 +1102,18 @@ void AlarmNotifier::refresh_alarms() {
   // notify() will also re-register on-demand when it receives HTTP 500.
   // One summary line rather than one error per automation: a rejected
   // registration usually affects all of them for the same reason.
+  int attempted = 0;
   int failed = 0;
+  int route_missing = 0;
   long last_code = 0;  // NOLINT(runtime/int)
   for (const auto& entry : parsed) {
     if (!entry.enabled) continue;
+    ++attempted;
     const long code = register_automation(entry);  // NOLINT(runtime/int)
     if (code < 200 || code >= 300) {
       ++failed;
       last_code = code;
+      if (uos_unavailable(code)) ++route_missing;
     }
   }
   if (failed > 0) {
@@ -772,6 +1123,11 @@ void AlarmNotifier::refresh_alarms() {
   }
 
   absl::MutexLock lk(&mu_);
+  // Every registration answering 404 means the automation manager routes
+  // are absent, so the legacy path is used from the first detection on.
+  // notify() makes no UOS call for an alarm with nobody to notify, so it
+  // would not otherwise find out before the legacy path is needed.
+  if (attempted > 0 && route_missing == attempted) uos_unavailable_ = true;
   automations_  = std::move(parsed);
   last_refresh_ = std::chrono::steady_clock::now();
 }
@@ -849,9 +1205,7 @@ void AlarmNotifier::notify(const std::string& obj_type,
 
       const std::string notify_url =
           url + "/internal/automationManager/external/actions/notify";
-      const std::string payload = build_notify_payload(
-          automation.id, obj_type, device_id, event_id, ts_ms,
-          user_id_provider_->current());
+      std::string payload;
 
       bool use_uos;
       {
@@ -861,7 +1215,32 @@ void AlarmNotifier::notify(const std::string& obj_type,
 
       long code = 0;  // NOLINT(runtime/int)
       if (use_uos) {
-        code = http_post(notify_url, payload);
+        // The route notifies exactly the receivers named, so they come
+        // from the alarm's own recipients, channels and schedules.
+        const NotifyPlan plan =
+            plan_notification(automation, local_clock(std::time(nullptr)));
+        if (plan.location_approximated &&
+            first_warning("location:" + automation.id)) {
+          LOG(WARNING) << "[alarm] automation " << automation.id << " (\""
+                       << automation.name << "\"): a recipient's schedule "
+                       << "depends on who is home in a way Protect's notify "
+                       << "route cannot check; notifying that recipient "
+                       << "whether or not they are away";
+        }
+        if (plan.unresolved_user && first_warning("user:" + automation.id)) {
+          LOG(WARNING) << "[alarm] automation " << automation.id << " (\""
+                       << automation.name << "\"): a recipient could not "
+                       << "be matched to a UniFi OS user; not notifying "
+                       << "that recipient";
+        }
+        if (plan.receivers.empty()) {
+          LOG(INFO) << "[alarm] automation " << automation.id
+                    << ": no notification sent -- " << plan.skip_reason;
+        } else {
+          payload = build_notify_payload(automation.id, obj_type, device_id,
+                                         event_id, ts_ms, plan.receivers);
+          code = http_post(notify_url, payload);
+        }
         if (uos_unavailable(code)) {
           // Protect's Global Alarm Manager is off, so this endpoint does
           // not exist.  Say so once -- with the fix -- then use the legacy

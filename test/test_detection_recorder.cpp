@@ -1670,17 +1670,25 @@ static void test_onvif_bbox_crop(const std::string& ubv_dir) {
   CHECK(w > 0 && h > 0, "onvif_bbox_crop: zero crop dimensions");
 }
 
+// The actions member of an alarm that notifies the "test-user-id" UniFi OS
+// user by push.  AlarmNotifier sends nothing for an alarm without one.
+static const char kPushAction[] =
+    R"("actions":[{"type":"SEND_NOTIFICATION","metadata":{"receivers":[)"
+    R"({"user":"test-protect-user","ucoreUser":"test-user-id",)"
+    R"("channels":["push"],"schedules":[]}]},"order":-1}])";
+
 // ============================================================
 // AlarmNotifier: single person automation fires exactly once on person detection
 // ============================================================
 static void test_alarm_notify_person() {
-  static const char kAutomations[] =
-    "[{\"id\":\"aaa111\",\"enable\":true,\"deleted\":false,"
+  const std::string automations =
+    std::string("[{\"id\":\"aaa111\",\"enable\":true,\"deleted\":false,"
     "\"sources\":[],"
-    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"person\"}}]}]";
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"person\"}}],") +
+    kPushAction + "}]";
 
   UosEmulator uos;
-  uos.set_alarms_json(kAutomations);
+  uos.set_alarms_json(automations);
   uos.start();
 
   onvif::ProtectUserIdProvider uid("test-user-id", "");
@@ -1704,16 +1712,18 @@ static void test_alarm_notify_person() {
 // vehicle automation ignores person events
 // ============================================================
 static void test_alarm_type_filtering() {
-  static const char kAutomations[] =
-    "[{\"id\":\"person_auto\",\"enable\":true,\"deleted\":false,"
+  const std::string automations =
+    std::string("[{\"id\":\"person_auto\",\"enable\":true,\"deleted\":false,"
     "\"sources\":[],"
-    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"person\"}}]},"
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"person\"}}],") +
+    kPushAction + "},"
     "{\"id\":\"vehicle_auto\",\"enable\":true,\"deleted\":false,"
     "\"sources\":[],"
-    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"vehicle\"}}]}]";
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"vehicle\"}}]," +
+    kPushAction + "}]";
 
   UosEmulator uos;
-  uos.set_alarms_json(kAutomations);
+  uos.set_alarms_json(automations);
   uos.start();
 
   onvif::ProtectUserIdProvider uid("test-user-id", "");
@@ -1790,16 +1800,18 @@ static void test_alarm_uos_unreachable() {
 // that every POST includes the camera MAC in the scope.
 // ============================================================
 static void test_alarm_integration_e2e(const std::string& ubv_dir) {
-  static const char kAutomations[] =
-    "[{\"id\":\"person_auto\",\"enable\":true,\"deleted\":false,"
+  const std::string automations =
+    std::string("[{\"id\":\"person_auto\",\"enable\":true,\"deleted\":false,"
     "\"sources\":[],"
-    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"person\"}}]},"
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"person\"}}],") +
+    kPushAction + "},"
     "{\"id\":\"vehicle_auto\",\"enable\":true,\"deleted\":false,"
     "\"sources\":[],"
-    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"vehicle\"}}]}]";
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"vehicle\"}}]," +
+    kPushAction + "}]";
 
   UosEmulator uos;
-  uos.set_alarms_json(kAutomations);
+  uos.set_alarms_json(automations);
   uos.start();
 
   onvif::ProtectUserIdProvider uid("test-user-id", "");
@@ -1970,16 +1982,18 @@ static void test_camera_object_type_override(const std::string& ubv_dir) {
 // AlarmNotifier: animal detection fires automation with animal trigger
 // ============================================================
 static void test_alarm_notify_animal() {
-  static const char kAutomations[] =
-    "[{\"id\":\"animal_auto\",\"enable\":true,\"deleted\":false,"
+  const std::string automations =
+    std::string("[{\"id\":\"animal_auto\",\"enable\":true,\"deleted\":false,"
     "\"sources\":[],"
-    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"animal\"}}]}"
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"animal\"}}],") +
+    kPushAction + "}"
     ",{\"id\":\"package_auto\",\"enable\":true,\"deleted\":false,"
     "\"sources\":[],"
-    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"package\"}}]}]";
+    "\"conditions\":[{\"condition\":{\"type\":\"is\",\"source\":\"package\"}}]," +
+    kPushAction + "}]";
 
   UosEmulator uos;
-  uos.set_alarms_json(kAutomations);
+  uos.set_alarms_json(automations);
   uos.start();
 
   onvif::ProtectUserIdProvider uid("test-user-id", "");
@@ -3144,8 +3158,9 @@ static void test_uos_notify_payload_and_retry() {
   // Part 1: payload schema + registration.
   {
     UosEmulator uos;
-    uos.set_alarms_json(R"([{"id":"aaa111","name":"Front person",
-      "enable":true,"conditions":[{"source":"person"}]}])");
+    uos.set_alarms_json(std::string(R"([{"id":"aaa111","name":"Front person",
+      "enable":true,"conditions":[{"source":"person"}],)") +
+                        kPushAction + "}]");
     uos.start();
 
     onvif::AlarmNotifier notifier(uos.base_url(), &uid);
@@ -3189,8 +3204,9 @@ static void test_uos_notify_payload_and_retry() {
   // Part 2: HTTP 500 ("Alarm not found") re-registers and retries.
   {
     UosEmulator uos;
-    uos.set_alarms_json(R"([{"id":"bbb222","name":"Gate person",
-      "enable":true,"conditions":[{"source":"person"}]}])");
+    uos.set_alarms_json(std::string(R"([{"id":"bbb222","name":"Gate person",
+      "enable":true,"conditions":[{"source":"person"}],)") +
+                        kPushAction + "}]");
     uos.start();
     uos.set_notify_status(500);
 
@@ -3212,8 +3228,9 @@ static void test_uos_notify_payload_and_retry() {
   // notification must still be delivered through the UOS manager.
   {
     UosEmulator uos;
-    uos.set_alarms_json(R"([{"id":"ccc333","name":"Drive person",
-      "enable":true,"conditions":[{"source":"person"}]}])");
+    uos.set_alarms_json(std::string(R"([{"id":"ccc333","name":"Drive person",
+      "enable":true,"conditions":[{"source":"person"}],)") +
+                        kPushAction + "}]");
     uos.set_global_alarm_manager(true);
     uos.start();
 

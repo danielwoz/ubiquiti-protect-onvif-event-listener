@@ -353,8 +353,17 @@ cc_test(
 cc_test(
     name = "test_alarm_notifier",
     srcs = ["test_alarm_notifier.cpp"],
+    env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},
+    data = ["//test:tsan_suppressions"],
     deps = [
         "//:alarm_notifier",
+        "//:protect_user_id_provider",
+        ":camera_emulators",
+        ":onvif_camera_emulator",
+        "@com_google_absl//absl/log:log_entry",
+        "@com_google_absl//absl/log:log_sink",
+        "@com_google_absl//absl/log:log_sink_registry",
+        "@com_google_absl//absl/synchronization:synchronization",
     ],
 )
 
