@@ -39,17 +39,29 @@
  *   - Connection is reusable for a fresh query after a timeout fires
  *     (regression for the CancelAndDrain + PQreset fallback path that
  *     surfaced as "another command is already in progress" in dev3)
+ *   - ReconnectGate re-opens a connection the server closed while it was
+ *     idle before the next query is sent, and leaves a healthy one (and
+ *     its queued notifications) alone; run against a minimal in-process
+ *     server, so these always run
  */
 
+#include <arpa/inet.h>
 #include <libpq-fe.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>  // NOLINT(build/c++11)
 #include <string>
+#include <thread>  // NOLINT(build/c++11)
 #include <vector>
 
 #include "absl/log/log_entry.h"
@@ -358,6 +370,235 @@ static void test_reconnect_gate_unreachable_server() {
 }
 
 // ---------------------------------------------------------------------------
+// ReconnectGate against a server that ends an idle session
+// ---------------------------------------------------------------------------
+namespace fake_pg {
+
+// What the server does with the first session once it is ready.  Later
+// sessions (the reconnect) are always kept open.
+enum class First { kKeepOpen, kClose, kFatalThenClose, kNotify };
+
+void put_u32(std::string* out, uint32_t v) {
+  const uint32_t be = htonl(v);
+  out->append(reinterpret_cast<const char*>(&be), sizeof(be));
+}
+
+// One backend message: type byte, length (including itself), body.
+std::string message(char type, const std::string& body) {
+  std::string m(1, type);
+  put_u32(&m, static_cast<uint32_t>(body.size() + 4));
+  return m + body;
+}
+
+bool read_exact(int fd, char* buf, size_t n) {
+  while (n > 0) {
+    const ssize_t r = ::recv(fd, buf, n, 0);
+    if (r <= 0) return false;
+    buf += r;
+    n -= static_cast<size_t>(r);
+  }
+  return true;
+}
+
+void send_all(int fd, const std::string& data) {
+  size_t off = 0;
+  while (off < data.size()) {
+    const ssize_t w = ::send(fd, data.data() + off, data.size() - off,
+                             MSG_NOSIGNAL);
+    if (w <= 0) return;
+    off += static_cast<size_t>(w);
+  }
+}
+
+// Minimal Postgres server on 127.0.0.1: reads the startup message,
+// answers AuthenticationOk, a few ParameterStatus messages,
+// BackendKeyData and ReadyForQuery, then treats the first session as
+// `first` says.
+class Server {
+ public:
+  explicit Server(First first) : first_(first) {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    ::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    ::listen(listen_fd_, 4);
+    socklen_t len = sizeof(addr);
+    ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+    port_ = ntohs(addr.sin_port);
+    thread_ = std::thread([this] { run(); });
+  }
+  ~Server() {
+    stop_ = true;
+    thread_.join();
+    for (int fd : open_) ::close(fd);
+    ::close(listen_fd_);
+  }
+
+  std::string conninfo() const {
+    return "host=127.0.0.1 port=" + std::to_string(port_) +
+           " user=test dbname=test sslmode=disable gssencmode=disable"
+           " connect_timeout=2";
+  }
+  int sessions() const { return sessions_.load(); }
+  // Wait until the first session's `first` action has been carried out.
+  bool wait_first_done() const {
+    for (int i = 0; i < 200 && !first_done_.load(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return first_done_.load();
+  }
+
+ private:
+  void run() {
+    while (!stop_) {
+      pollfd pfd = {listen_fd_, POLLIN, 0};
+      if (::poll(&pfd, 1, 50) <= 0) continue;
+      const int fd = ::accept(listen_fd_, nullptr, nullptr);
+      if (fd < 0) continue;
+      if (!handshake(fd)) {
+        ::close(fd);
+        continue;
+      }
+      const bool first = sessions_.fetch_add(1) == 0;
+      if (first && first_ == First::kFatalThenClose) {
+        std::string err;
+        err += 'S'; err += "FATAL"; err += '\0';
+        err += 'V'; err += "FATAL"; err += '\0';
+        err += 'C'; err += "57P01"; err += '\0';
+        err += 'M';
+        err += "terminating connection due to administrator command";
+        err += '\0';
+        err += '\0';
+        send_all(fd, message('E', err));
+      }
+      if (first && (first_ == First::kClose ||
+                    first_ == First::kFatalThenClose)) {
+        ::close(fd);
+      } else {
+        if (first && first_ == First::kNotify) {
+          std::string body;
+          put_u32(&body, 4242);
+          body += "cameras_changed";
+          body += '\0';
+          body += "payload";
+          body += '\0';
+          send_all(fd, message('A', body));
+        }
+        open_.push_back(fd);
+      }
+      if (first) first_done_ = true;
+    }
+  }
+
+  // Startup message, then the replies a trust-authenticated server sends.
+  static bool handshake(int fd) {
+    char len_buf[4];
+    if (!read_exact(fd, len_buf, 4)) return false;
+    uint32_t len = 0;
+    std::memcpy(&len, len_buf, 4);
+    len = ntohl(len);
+    if (len < 8 || len > 10000) return false;
+    std::string rest(len - 4, '\0');
+    if (!read_exact(fd, &rest[0], rest.size())) return false;
+    std::string out;
+    std::string auth;
+    put_u32(&auth, 0);
+    out += message('R', auth);
+    for (const char* kv : {"server_version\0" "16.0", "client_encoding\0" "UTF8",
+                           "standard_conforming_strings\0" "on"}) {
+      const std::string key(kv);
+      const std::string value(kv + key.size() + 1);
+      out += message('S', key + '\0' + value + '\0');
+    }
+    std::string key_data;
+    put_u32(&key_data, 4242);
+    put_u32(&key_data, 99);
+    out += message('K', key_data);
+    out += message('Z', "I");
+    send_all(fd, out);
+    return true;
+  }
+
+  const First first_;
+  int listen_fd_ = -1;
+  int port_ = 0;
+  std::thread thread_;
+  std::atomic<bool> stop_{false};
+  std::atomic<int> sessions_{0};
+  std::atomic<bool> first_done_{false};
+  std::vector<int> open_;  // run() thread only, then the destructor
+};
+
+// Wait until the client socket has something to read (data or EOF),
+// without reading it.
+void wait_readable(PGconn* c) {
+  pollfd pfd = {PQsocket(c), POLLIN, 0};
+  ::poll(&pfd, 1, 1000);
+}
+
+}  // namespace fake_pg
+
+// The server ends an idle session, as a Postgres restart does.  libpq
+// still reports CONNECTION_OK; the gate must notice and reconnect before
+// the caller's next query, instead of letting that query fail.
+static void test_reconnect_gate_idle_close(fake_pg::First mode,
+                                           const char* name) {
+  CaptureSink sink;
+  absl::AddLogSink(&sink);
+  fake_pg::Server server(mode);
+  PGconn* c = PQconnectdb(server.conninfo().c_str());
+  const std::string label = std::string("idle close (") + name + "): ";
+  check(PQstatus(c) == CONNECTION_OK, (label + "connected").c_str());
+  check(server.wait_first_done(), (label + "server ended the session").c_str());
+  fake_pg::wait_readable(c);
+  check(PQstatus(c) == CONNECTION_OK,
+        (label + "libpq has not noticed yet").c_str());
+  onvif::pg::ReconnectGate gate("rc_idle");
+  check(gate.ensure(c), (label + "usable after ensure()").c_str());
+  check(gate.attempts() == 1, (label + "one reconnect").c_str());
+  check(server.sessions() == 2, (label + "a new session was opened").c_str());
+  check(PQstatus(c) == CONNECTION_OK, (label + "connection is up").c_str());
+  check(sink.count("connection lost") == 1,
+        (label + "the loss is logged once").c_str());
+  check(gate.ensure(c) && gate.attempts() == 1,
+        (label + "no further reconnect").c_str());
+  absl::RemoveLogSink(&sink);
+  PQfinish(c);
+}
+
+// A healthy idle connection is left alone, and a notification that is
+// waiting on it is still delivered by PQnotifies() afterwards.
+static void test_reconnect_gate_idle_healthy() {
+  {
+    fake_pg::Server server(fake_pg::First::kKeepOpen);
+    PGconn* c = PQconnectdb(server.conninfo().c_str());
+    check(PQstatus(c) == CONNECTION_OK, "idle healthy: connected");
+    check(server.wait_first_done(), "idle healthy: server ready");
+    onvif::pg::ReconnectGate gate("rc_healthy");
+    for (int i = 0; i < 5; ++i) gate.ensure(c);
+    check(gate.ensure(c), "idle healthy: usable");
+    check(gate.attempts() == 0, "idle healthy: no reconnect");
+    check(server.sessions() == 1, "idle healthy: one session");
+    PQfinish(c);
+  }
+  {
+    fake_pg::Server server(fake_pg::First::kNotify);
+    PGconn* c = PQconnectdb(server.conninfo().c_str());
+    check(server.wait_first_done(), "idle notify: notification sent");
+    fake_pg::wait_readable(c);
+    onvif::pg::ReconnectGate gate("rc_notify");
+    check(gate.ensure(c), "idle notify: usable");
+    check(gate.attempts() == 0, "idle notify: no reconnect");
+    PGnotify* n = PQnotifies(c);
+    check(n != nullptr && std::strcmp(n->relname, "cameras_changed") == 0,
+          "idle notify: notification still queued");
+    if (n) PQfreemem(n);
+    PQfinish(c);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // DB-dependent tests
 // ---------------------------------------------------------------------------
 static void test_simple_select(PGconn* conn) {
@@ -486,6 +727,10 @@ int main() {
   test_reconnect_gate_backoff();
   test_reconnect_gate_defaults();
   test_reconnect_gate_unreachable_server();
+  test_reconnect_gate_idle_healthy();
+  test_reconnect_gate_idle_close(fake_pg::First::kClose, "EOF");
+  test_reconnect_gate_idle_close(fake_pg::First::kFatalThenClose,
+                                 "FATAL, then EOF");
 
   // DB-dependent tests
   PGconn* conn = try_connect();

@@ -259,8 +259,26 @@ BestEffortGate& AreaInsertGate() {
 
 namespace {
 
+// A connection the server closed while it sat idle (a Postgres restart)
+// still reports CONNECTION_OK until something reads from it, so the next
+// query would be sent into a dead socket and lost.  An idle connection
+// has nothing to read except asynchronous messages (NOTIFY, a FATAL
+// termination notice) and EOF, so when its socket is readable the input
+// is consumed here: libpq marks the connection bad on EOF, and ensure()
+// reconnects before the query instead of after it fails.  Notifications
+// read here stay queued for PQnotifies().
 bool ConnUp(PGconn* conn) {
-  return conn != nullptr && PQstatus(conn) != CONNECTION_BAD;
+  if (conn == nullptr || PQstatus(conn) == CONNECTION_BAD) return false;
+  if (PQtransactionStatus(conn) != PQTRANS_IDLE) return true;
+  const int sock = PQsocket(conn);
+  if (sock < 0) return false;
+  // A termination notice and the EOF behind it can take two reads.
+  for (int i = 0; i < 4; ++i) {
+    struct pollfd pfd = {sock, POLLIN, 0};
+    if (poll(&pfd, 1, 0) <= 0) break;
+    if (PQconsumeInput(conn) == 0) return false;
+  }
+  return PQstatus(conn) != CONNECTION_BAD;
 }
 
 // libpq error text spans several lines ("...failed: No such file or
