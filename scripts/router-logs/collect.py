@@ -52,8 +52,10 @@ HEAD_LEN = 64
 # is at least this long.
 MAX_PARTIAL_LINE = 1 << 20
 JOURNAL_FIRST_RUN_SINCE = "-24h"
+# Oldest first.  logguard compresses daemon.log.1 itself when /var/log passes 80% full.
 DAEMON_LOGS = ["/var/log/daemon.log.4.zst", "/var/log/daemon.log.3.zst",
-               "/var/log/daemon.log.2.zst", "/var/log/daemon.log.1", "/var/log/daemon.log"]
+               "/var/log/daemon.log.2.zst", "/var/log/daemon.log.1.zst",
+               "/var/log/daemon.log.1", "/var/log/daemon.log"]
 # /api/config entries kept in snapshots: settings only, never URLs that may carry
 # credentials (camera_snapshot_urls, thumbnail_hook_url).
 CONFIG_KEEP = {
@@ -68,26 +70,55 @@ CONFIG_FIELDS = ("name", "override", "flag_default")
 # ---------------------------------------------------------------------------------------
 # Redaction applied to every collected text line.
 
+# What follows a key up to its value in key=value or "key": "value": the key's closing
+# quote, ':' or '=', and the value's opening quote.  A quote may be escaped (\") when the
+# pair sits inside a JSON string.
+_KV_SEP = r"\\?[\"']?\s*[:=]\s*\\?\"?"
+# The value: up to a quote, backslash, space or list separator.
+_KV_VALUE = r"[^\"\\\s,;&}]+"
 _REDACT = [
     (re.compile(r"(?i)(://[^/\s:@]+:)[^@/\s]+@"), r"\1[redacted]@"),
     (re.compile(r"(?i)(wsse:Password[^>]*>)[^<]*"), r"\1[redacted]"),
     (re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+"), r"\1[redacted]"),
-    (re.compile(r"(?i)((?:password|passwd|secret|api[_-]?key|authorization|cookie)"
-                r"[\"']?\s*[:=]\s*\"?)([^\"\s,;&}]+)"), r"\1[redacted]"),
+    # Authorization keeps its scheme (Basic, Digest, ...) and loses the credential after it.
+    (re.compile(r"(?i)(authorization" + _KV_SEP +
+                r"(?:(?:basic|bearer|digest|negotiate|ntlm)\s+)?)" + _KV_VALUE),
+     r"\1[redacted]"),
+    # A cookie header loses its whole value, every name=value pair in it.
+    (re.compile(r"(?i)(cookie" + _KV_SEP + r")[^\"\\\r\n]+"), r"\1[redacted]"),
+    # Passwords, secrets and keys, and UniFi user ids: an X-UserId header carrying one is a
+    # Protect API credential on the router.  A JSON null and a path (sudo's PWD=/root) are
+    # left as they are.
+    (re.compile(r"(?i)((?:password|passwd|(?<![a-z])pwd|(?<![a-z])pass|secret|api[_-]?key"
+                r"|x-userid|(?<![a-z])user_?id)" + _KV_SEP + r")(?!null\b|/)" + _KV_VALUE),
+     r"\1[redacted]"),
     # Access tokens, but not ONVIF object tokens such as inputToken or ProfileToken.
     (re.compile(r"(?i)((?<![a-z])(?:access|refresh|auth|session|id|csrf|api)?[_-]?token"
-                r"[\"']?\s*[:=]\s*\"?)([^\"\s,;&}]+)"), r"\1[redacted]"),
+                + _KV_SEP + r")" + _KV_VALUE), r"\1[redacted]"),
 ]
+_REDACT_HINTS = ("pass", "pwd", "token", "secret", "key", "auth", "bearer", "cookie",
+                 "userid", "user_id", "@")
 
 
 def redact(line):
     """Returns LINE with credential-looking values replaced by [redacted]."""
-    if not any(k in line.lower() for k in ("pass", "token", "secret", "key", "auth",
-                                           "bearer", "cookie", "@")):
+    low = line.lower()
+    if not any(k in low for k in _REDACT_HINTS):
         return line
     for pat, rep in _REDACT:
         line = pat.sub(rep, line)
     return line
+
+
+def redact_tree(obj):
+    """Returns parsed JSON OBJ with redact() applied to every string in it."""
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, list):
+        return [redact_tree(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: redact_tree(v) for k, v in obj.items()}
+    return obj
 
 
 # ---------------------------------------------------------------------------------------
@@ -448,7 +479,7 @@ def collect_snapshot(ssh, stage, now, remote_snapshot, stats):
                 body, {"Pid", "State", "VmRSS", "VmHWM", "Threads"})
         elif kind == "proc":
             snap["proc"][what] = body.strip()
-    text = json.dumps(snap, indent=1, sort_keys=True) + "\n"
+    text = json.dumps(redact_tree(snap), indent=1, sort_keys=True) + "\n"
     day = now.strftime("%Y-%m-%d")
     path = os.path.join(stage, "new", day, "api", now.strftime("%H%M%S") + ".json")
     os.makedirs(os.path.dirname(path), exist_ok=True)

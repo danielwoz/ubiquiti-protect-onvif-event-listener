@@ -27,13 +27,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log() { printf '%s %s\n' "$(date -Is)" "$*"; }
 
 # Re-runs the calling script under timeout(1) once, so a hung ssh or a stalled CephFS
-# cannot leave a run holding the lock forever.
+# cannot leave a run holding the lock forever.  SIGKILL follows 60 s after SIGTERM, for a
+# shell blocked on the mount that would otherwise never run its TERM trap.
 run_under_timeout() {
   local secs=$1 script=$2
   shift 2
   if [[ -z "${ROUTER_LOGS_UNDER_TIMEOUT:-}" ]]; then
     export ROUTER_LOGS_UNDER_TIMEOUT=1
-    exec timeout "$secs" "$script" "$@"
+    exec timeout -k 60 "$secs" "$script" "$@"
   fi
 }
 

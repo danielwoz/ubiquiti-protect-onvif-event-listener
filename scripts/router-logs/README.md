@@ -75,14 +75,20 @@ smart-detect type for the day.
 - `/etc/onvif-recorder/config.json`
 - any password or key
 
-Every collected line also goes through a redaction filter. It replaces anything that
-looks like a password, token, API key, `Authorization` / `Bearer` value, `wsse:Password`
-or `user:pass@` in a URL with `[redacted]`.
+Every collected line, and every string in the API snapshots, also goes through a
+redaction filter. It replaces these with `[redacted]`:
+- passwords (`password`, `passwd`, `pwd`, `pass`), secrets, API keys and access tokens;
+- the credential after an `Authorization` scheme (`Basic`, `Bearer`, `Digest`, …), and
+  whole `Cookie` values;
+- UniFi user ids (`user_id`, `userId`, `X-UserId`), since an `X-UserId` header is a
+  Protect API credential on the router;
+- `wsse:Password` and `user:pass@` in a URL.
 
 ## Layout
 
-Store: `/mnt/cephfs/ssd/onvif-router-logs/` (CephFS SSD pool). Files are mode 0600 and
-directories 0700.
+Store: `/mnt/cephfs/ssd/onvif-router-logs/` (CephFS SSD pool). The collector's files are
+mode 0600 and its directories 0700. The store's top directory stays 0755 so the alarm test
+sink (uid 10001) can reach `alarm-sink/`.
 
 ```
 state/
@@ -208,7 +214,8 @@ cursor (about 18 h). After a longer pause it records a gap and backfills from
 **Locking and timeouts.**
 - Each run takes `flock -n` on the local lock. If the previous run is still going, the
   new one exits at once.
-- Runs are wrapped in `timeout 600`; the summary uses 900.
+- Runs are wrapped in `timeout 600`; the summary uses 900. SIGKILL follows 60 s after the
+  SIGTERM, in case the shell itself is blocked on a stalled mount.
 - The summary waits up to 5 min for the lock, so it never reads a file mid-append.
 
 **A failed run** (router unreachable, ssh error, CephFS unavailable, unexpected output):
@@ -225,6 +232,10 @@ journalctl -t onvif-router-collect
 
 **Order of writes.** Data is written before state. A run killed between the two stores a
 few lines twice on the next run, but never loses any.
+
+Each frame is compressed locally before it is appended. An append that fails or is
+interrupted by SIGTERM is cut back to the file's previous size. A partial frame would make
+`zstdcat` stop there and hide every frame appended after it.
 
 **Gaps** are noted in `YYYY-MM-DD/gaps.txt` and in the summary's *Collector health*
 section. A gap is recorded when:

@@ -93,8 +93,29 @@ class RedactTest(unittest.TestCase):
                             ("Authorization: Bearer abc.def", "abc.def"),
                             ("apiKey=XYZ123", "XYZ123"),
                             ('{"accessToken": "tok1"}', "tok1"),
-                            ("token=tok2&x=1", "tok2")):
+                            ("token=tok2&x=1", "tok2"),
+                            ("Authorization: Basic YWRtaW46cHc=", "YWRtaW46cHc="),
+                            ("Cookie: a=1; unifises=ck2", "ck2"),
+                            ("/snapshot.cgi?usr=admin&pwd=pw4", "pw4"),
+                            ('{\\"password\\":\\"pw5\\"}', "pw5"),
+                            ("X-UserId: uid6", "uid6"),
+                            ('        "user_id": "uid7",', "uid7")):
             self.assertNotIn(secret, collect.redact(raw), raw)
+
+    def test_keeps_scheme_nulls_and_paths(self):
+        self.assertEqual(collect.redact("Authorization: Basic YWRtaW46cHc="),
+                         "Authorization: Basic [redacted]")
+        for line in ('  "userId": null,', "sudo: x : PWD=/root ; USER=root",
+                     "retrying GET http://x after user_id refresh"):
+            self.assertEqual(collect.redact(line), line)
+
+    def test_redacts_strings_inside_snapshot_json(self):
+        snap = {"api": {"recent_errors": "HTTP 401 from http://admin:pw8@192.168.1.5/snap",
+                        "n": [1, {"u": "rtsp://a:pw9@h/x"}]}}
+        text = str(collect.redact_tree(snap))
+        self.assertNotIn("pw8", text)
+        self.assertNotIn("pw9", text)
+        self.assertIn("192.168.1.5", text)
 
     def test_keeps_onvif_object_tokens(self):
         line = '    "inputToken": "DI_0",'

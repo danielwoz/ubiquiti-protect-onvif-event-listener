@@ -22,7 +22,22 @@ fi
 
 started=$(date +%s)
 tmp=$(mktemp -d "$RUN/run.XXXXXX")
-cleanup() { rm -rf "$tmp"; close_ssh_master; }
+# A zstd frame cut short makes zstdcat stop there and hide every frame appended after it,
+# so the file being appended to and its size before the append are kept until the append
+# completes; a failed or interrupted append is cut back to that size.
+undo_dst=""
+undo_size=0
+cleanup() {
+  if [[ -n "$undo_dst" ]]; then
+    if (( undo_size > 0 )); then
+      truncate -s "$undo_size" -- "$undo_dst" || true
+    else
+      rm -f -- "$undo_dst"
+    fi
+  fi
+  rm -rf "$tmp"
+  close_ssh_master
+}
 trap cleanup EXIT
 trap 'exit 124' TERM
 # Staging directories left behind by runs killed with SIGKILL.
@@ -69,8 +84,13 @@ commit_file() {  # mode source relative-path
   mkdir -p "$DATA/$(dirname "$rel")"
   case $mode in
     append)
+      # Compressed locally first, so only the short cat writes to the store.
       dst="$DATA/$rel.zst"
-      zstd -q -"$ZSTD_LEVEL" -c -- "$src" >>"$dst" ;;
+      zstd -q -"$ZSTD_LEVEL" -c -- "$src" >"$tmp/frame.zst" || return 1
+      undo_size=$(stat -c %s -- "$dst" 2>/dev/null || echo 0)
+      undo_dst=$dst
+      cat -- "$tmp/frame.zst" >>"$dst" || return 1
+      undo_dst="" ;;
     new)
       dst="$DATA/$rel.zst"
       zstd -q -19 -c -- "$src" >"$dst.part" && mv -f -- "$dst.part" "$dst" ;;
