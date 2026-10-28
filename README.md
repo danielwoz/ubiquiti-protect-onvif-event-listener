@@ -23,10 +23,13 @@ and run it. The GUI:
 1. Walks you through enabling SSH on your router
    (**UniFi OS → System → Advanced → SSH**).
 2. Tests the connection with the root password you set.
-3. Selects the release channel matching your Protect channel. Keep it and
-   onvif-recorder follows Protect when you change Protect's channel; pick
-   another and onvif-recorder stays on that one until you change it on the
-   admin page.
+3. Lets you pick a [release channel](#release-channels) from a drop-down
+   that shows each channel's current version. It preselects the channel
+   the device is pinned to, or the one an existing install is on; a new
+   install starts on **Latest (alpha)**. Pick the channel that matches your
+   Protect channel and onvif-recorder follows Protect when you change
+   Protect's channel; pick another and onvif-recorder stays on that one
+   until you change it on the admin page.
 4. Adds the apt repository + installs the package, streaming progress live.
 5. Saves the credentials (password encrypted with Windows DPAPI) in
    `HKCU\Software\OnvifRecorderInstaller` so subsequent launches offer
@@ -47,8 +50,10 @@ curl -fsSL https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener/ins
 That's it. The installer:
 
 1. Installs the signing key to `/usr/share/keyrings/onvif-recorder-archive-keyring.gpg`.
-2. Detects your UniFi Protect release channel (Stable / Release Candidate /
-   Early Access) and configures APT to pull matching builds.
+2. Detects your UniFi Protect release channel (Release / Release Candidate /
+   Early Access) and configures APT to pull the matching onvif-recorder
+   channel (Stable / Release Candidate / Latest); see
+   [Release channels](#release-channels).
 3. `apt-get install onvif-recorder`, which auto-enables the systemd service
    plus two daily timers: channel sync and auto-updates.
 
@@ -77,7 +82,8 @@ After install, manage the package without SSH at
 `https://<device>/onvif/admin/`:
 
 - Force an update check
-- Switch release channel (stable / rc / early-access)
+- Switch release channel (`stable` / `rc` / `early-access`, which the
+  Windows installer shows as Stable / Release Candidate / Latest (alpha))
 - Enable / disable auto-updates and change the schedule
 - Uninstall the package
 
@@ -87,6 +93,20 @@ Auto-updates are **on by default**. The `onvif-recorder-autoupdate.timer` runs
 daily with up to 2h random jitter; `onvif-recorder-channel.timer` keeps the
 APT suite in sync with your Protect channel. Both can be disabled via the
 admin UI or `systemctl disable --now <timer>`.
+
+### Release channels
+
+| Channel | apt suite | Gets | Matches Protect's |
+|---|---|---|---|
+| **Latest (alpha)** | `early-access` | every tagged release as soon as it is published | Early Access |
+| **Release Candidate** | `rc` | releases promoted from Latest after testing on a live device | Release Candidate |
+| **Stable** | `stable` | releases promoted from Release Candidate after wider testing | Release |
+
+"Latest" is only a name: the suite, the `/etc/onvif-recorder/channel` value
+and the admin page all still say `early-access`. The current version in each
+channel is published at
+[`channels.json`](https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener/channels.json),
+which the Windows installer reads.
 
 ### Uninstall
 

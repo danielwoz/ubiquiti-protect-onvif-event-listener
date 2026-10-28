@@ -140,6 +140,7 @@ test/
   test_pullpoint_e2e.cpp          — Emulated camera → listener → hub → PullPoint service
   test_event_proxy_mode.cpp       — Event-sharing mode table and state-file tests
   test_debian_scripts.sh          — prerm / postinst upgrade-path checks
+  test_gen_channels_json.sh       — channels.json generator checks (fixtures in testdata/apt/)
   bench_onvif_listener.cpp        — ONVIF parsing throughput benchmark
   bench_jpeg_crop.cpp             — JPEG crop throughput benchmark
   bench_object_detect.cpp         — NanoDet-M inference latency benchmark
@@ -589,6 +590,15 @@ workflow (Actions → Promote apt suite → Run workflow):
 - `early-access` → `rc` once the release has been exercised on a dev device
 - `rc` → `stable` after wider testing
 
+Both `release-deb.yml` and `promote.yml` regenerate `channels.json` (the
+channel list with each suite's current version, read by the Windows
+installer) in the same gh-pages commit, using `scripts/gen_channels_json.py`
+and `gh-pages/channels.meta.json` from `main`. After a promotion, re-run the
+step 6 check below for the destination suite. "Latest (alpha)" is only the
+installer's label for `early-access`; there is no `latest` suite. Labels,
+descriptions and the default channel live in `gh-pages/channels.meta.json`;
+pushing a change to it on `main` publishes it via `channels-manifest.yml`.
+
 ### Required release notes
 
 Every release must have meaningful notes covering:
@@ -634,11 +644,25 @@ gh release view v<X.Y.Z> --json name,body,assets --jq \
   '{name, body_chars: (.body | length), assets: [.assets[].name]}'
 #   -> body_chars must be > 0
 #   -> assets must include both "onvif_recorder_arm64" and "onvif-recorder.service"
+
+# 6. CHANNEL MANIFEST CHECK (after release-deb.yml has published to early-access;
+#    GitHub Pages caches for 10 min, so allow ~10 min plus the Pages build)
+curl -s https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener/channels.json \
+  | python3 -m json.tool
+#   -> must parse, "schema": 1
+#   -> the "early-access" channel's "version" must be <X.Y.Z>
+#   -> rc / stable versions must match `promote.yml` runs so far
 ```
 
 If step 5 shows empty notes or missing assets, repair immediately with
 `gh release edit v<X.Y.Z> --notes-file NOTES.md` and
 `gh release upload v<X.Y.Z> <path>#<asset_name>` before doing anything else.
+
+If step 6 shows an old version or a 404, check the release-deb run's
+"Publish to gh-pages apt repo" step, then run **Actions → Channel manifest →
+Run workflow** (`channels-manifest.yml`), which regenerates `channels.json`
+from the apt suites and commits it only if it changed. Never edit
+`channels.json` on gh-pages by hand.
 
 ## Command-line flags (runtime)
 

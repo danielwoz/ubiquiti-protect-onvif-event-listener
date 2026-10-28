@@ -42,7 +42,78 @@ root directory.
   pool/main/o/onvif-recorder/onvif-recorder_*_arm64.deb
   onvif-recorder.gpg                    public key (ASCII-armoured)
   install.sh                            one-line installer
+  channels.json                         release channel manifest (see below)
 ```
+
+## Channel manifest (`channels.json`)
+
+`channels.json` lists the release channels with their labels and the
+onvif-recorder version currently in each suite. The Windows installer reads
+it to fill its channel drop-down.
+
+- **Source.** `channels.meta.json` in this directory on `main` holds the
+  ids, aliases, labels, descriptions, order and default.
+  `scripts/gen_channels_json.py` adds each suite's version (from
+  `dists/<id>/main/binary-arm64/Packages`) and `updated_at` (the suite's
+  `Release` `Date:`). A suite with no build gets `"version": null`.
+- **Publishing.** `release-deb.yml` and `promote.yml` regenerate it in the
+  same gh-pages commit as their reprepro change, always with the generator
+  and metadata from `main`. `channels-manifest.yml` regenerates it on a push
+  to `main` that touches the metadata or the generator, or when run by hand,
+  and commits only when it changed. All three share the `gh-pages-publish`
+  concurrency group. Never edit `channels.json` on gh-pages by hand.
+- **Latest = early-access.** "Latest (alpha)" is the label of the
+  `early-access` suite, with `latest` as an alias. The suite, the channel
+  file on the router and the admin page keep the id `early-access`.
+- **Changing labels or the default.** Edit `channels.meta.json` on `main`
+  and push; `channels-manifest.yml` publishes it. The installer embeds the
+  same file as its offline list, so the next installer build picks it up
+  too.
+- **Adding a channel.** Add the suite to `conf/distributions` and to
+  `channels.meta.json` only after the router side accepts it:
+  `debian/install-apt-source.sh`, `debian/detect-channel.sh` and the admin
+  page only know `stable`, `rc` and `early-access`.
+
+### Schema 1
+
+```json
+{
+  "schema": 1,
+  "generated_at": "2026-10-28T06:00:00Z",
+  "default": "early-access",
+  "channels": [
+    { "id": "early-access", "aliases": ["latest"], "label": "Latest (alpha)",
+      "description": "…", "version": "1.6.32", "updated_at": "2026-10-22T19:37:09Z" }
+  ],
+  "installer": { "min_version": null, "download_url": "https://github.com/…/releases/latest" }
+}
+```
+
+What readers rely on, so changes must keep it:
+
+- `schema` is the integer `1`. A breaking change ships as
+  `channels-v2.json` while `channels.json` keeps being generated. Adding
+  fields never changes the schema; readers ignore unknown fields.
+- `id` matches `^[a-z][a-z0-9-]{0,30}[a-z0-9]$`, because the installer
+  writes it into a root shell script on the router. The generator refuses
+  any other id; the installer drops it.
+- `label` is at most 40 characters and `description` at most 200, single
+  line.
+- `version` is a dpkg version or `null` (no build in that suite yet).
+- `default` is one of the ids.
+- `installer.min_version`: installers older than this show a banner
+  pointing at `installer.download_url` (https only). It never blocks.
+- The file stays under 64 KiB.
+
+Check the published copy with:
+
+```bash
+curl -s https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener/channels.json \
+  | python3 -m json.tool
+```
+
+GitHub Pages serves it with `cache-control: max-age=600`, so a new version
+can take about ten minutes plus the Pages build to show up.
 
 ## Secrets
 
