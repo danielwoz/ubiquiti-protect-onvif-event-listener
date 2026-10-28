@@ -354,7 +354,7 @@ public sealed class ChannelCatalog {
     // Starts the HTTPS fetch so it is usually done by the time the channel
     // page loads the list.
     public void StartRemoteFetch() {
-        _remote ??= FetchRemoteAsync();
+        _remote ??= StartFetch();
     }
 
     // Runs the fallback chain. Never throws. A successful HTTPS fetch is
@@ -362,7 +362,7 @@ public sealed class ChannelCatalog {
     public async Task<ChannelCatalogResult> LoadAsync(CancellationToken ct = default) {
         var newer = false;
 
-        _remote ??= FetchRemoteAsync();
+        _remote ??= StartFetch();
         var remoteTask = _remote;
         var body = await remoteTask;
         var status = ChannelManifest.TryParse(body, out var manifest);
@@ -454,6 +454,11 @@ public sealed class ChannelCatalog {
             // A cache that cannot be written only loses the offline fallback.
         }
     }
+
+    // Runs FetchRemoteAsync on a thread-pool thread: the first request
+    // resolves the system proxy synchronously (WPAD auto-detection can take
+    // seconds), which must not block the UI thread that starts the fetch.
+    private Task<string?> StartFetch() => Task.Run(FetchRemoteAsync);
 
     // channels.json as fetched over HTTPS, or null on any failure: a
     // non-200 status, a body over ChannelManifest.MaxBytes, invalid UTF-8,
