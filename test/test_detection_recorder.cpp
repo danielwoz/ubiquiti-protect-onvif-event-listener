@@ -64,6 +64,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1672,6 +1673,12 @@ static void test_onvif_bbox_crop(const std::string& ubv_dir) {
 
 // The actions member of an alarm that notifies the "test-user-id" UniFi OS
 // user by push.  AlarmNotifier sends nothing for an alarm without one.
+// The AlarmNotifier tests below run against a fake Protect on a Local
+// Alarm Manager console: no UniFi OS (nothing listens on port 1) and the
+// mode fixed to Local, so nothing on the test host is contacted.
+static constexpr char kNoUos[] = "http://127.0.0.1:1";
+static std::optional<bool> local_console() { return false; }
+
 static const char kPushAction[] =
     R"("actions":[{"type":"SEND_NOTIFICATION","metadata":{"receivers":[)"
     R"({"user":"test-protect-user","ucoreUser":"test-user-id",)"
@@ -1692,7 +1699,8 @@ static void test_alarm_notify_person() {
   uos.start();
 
   onvif::ProtectUserIdProvider uid("test-user-id", "");
-  onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+  onvif::AlarmNotifier notifier(uos.base_url(), &uid, "", kNoUos);
+  notifier.set_mode_probe(local_console);
   notifier.refresh_alarms();
   notifier.notify("person", "AABBCCDDEEFF", "event-uuid-abc", 1234567890000ULL);
 
@@ -1727,7 +1735,8 @@ static void test_alarm_type_filtering() {
   uos.start();
 
   onvif::ProtectUserIdProvider uid("test-user-id", "");
-  onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+  onvif::AlarmNotifier notifier(uos.base_url(), &uid, "", kNoUos);
+  notifier.set_mode_probe(local_console);
   notifier.refresh_alarms();
 
   // Person detection → only person automation fires.
@@ -1770,7 +1779,8 @@ static void test_alarm_no_alarms() {
   uos.start();
 
   onvif::ProtectUserIdProvider uid("test-user-id", "");
-  onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+  onvif::AlarmNotifier notifier(uos.base_url(), &uid, "", kNoUos);
+  notifier.set_mode_probe(local_console);
   notifier.refresh_alarms();
   notifier.notify("person", "AABBCCDDEEFF", "evt-x", 999ULL);
 
@@ -1785,7 +1795,8 @@ static void test_alarm_no_alarms() {
 static void test_alarm_uos_unreachable() {
   // Port 1 is never open for regular users; curl returns ECONNREFUSED immediately.
   onvif::ProtectUserIdProvider uid("test-user-id", "");
-  onvif::AlarmNotifier notifier("http://127.0.0.1:1", &uid);
+  onvif::AlarmNotifier notifier("http://127.0.0.1:1", &uid, "", kNoUos);
+  notifier.set_mode_probe(local_console);
   notifier.refresh_alarms();  // must not crash
   notifier.notify("person", "AABBCCDDEEFF", "evt-y", 500ULL);  // must not crash
   CHECK(true, "alarm_uos_unreachable: did not crash or hang");
@@ -1815,7 +1826,8 @@ static void test_alarm_integration_e2e(const std::string& ubv_dir) {
   uos.start();
 
   onvif::ProtectUserIdProvider uid("test-user-id", "");
-  onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+  onvif::AlarmNotifier notifier(uos.base_url(), &uid, "", kNoUos);
+  notifier.set_mode_probe(local_console);
   notifier.refresh_alarms();
 
   TestContext ctx;
@@ -1997,7 +2009,8 @@ static void test_alarm_notify_animal() {
   uos.start();
 
   onvif::ProtectUserIdProvider uid("test-user-id", "");
-  onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+  onvif::AlarmNotifier notifier(uos.base_url(), &uid, "", kNoUos);
+  notifier.set_mode_probe(local_console);
   notifier.refresh_alarms();
 
   // Animal detection → only animal automation fires.
@@ -3163,7 +3176,8 @@ static void test_uos_notify_payload_and_retry() {
                         kPushAction + "}]");
     uos.start();
 
-    onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+    onvif::AlarmNotifier notifier(uos.base_url(), &uid, "", kNoUos);
+    notifier.set_mode_probe(local_console);
     notifier.refresh_alarms();
     notifier.notify("person", "AABBCCDDEEFF", "event-uuid-abc",
                     1234567890000ULL);
@@ -3210,7 +3224,8 @@ static void test_uos_notify_payload_and_retry() {
     uos.start();
     uos.set_notify_status(500);
 
-    onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+    onvif::AlarmNotifier notifier(uos.base_url(), &uid, "", kNoUos);
+    notifier.set_mode_probe(local_console);
     notifier.refresh_alarms();
     const size_t regs_before = uos.register_bodies().size();
 
@@ -3224,8 +3239,11 @@ static void test_uos_notify_payload_and_retry() {
           "UOS: a 500 must trigger a re-registration before the retry");
   }
 
-  // Part 3: Global Alarm Manager on (legacy /run refused with 400).  The
-  // notification must still be delivered through the UOS manager.
+  // Part 3: the legacy /run route refused with 400, as Protect does once
+  // Global Alarm Manager is on.  On the Local path the notification still
+  // goes through the automation manager and /run is not used.  (On a
+  // Global console the recorder sends to UniFi OS instead; see
+  // test_alarm_notifier.)
   {
     UosEmulator uos;
     uos.set_alarms_json(std::string(R"([{"id":"ccc333","name":"Drive person",
@@ -3234,18 +3252,19 @@ static void test_uos_notify_payload_and_retry() {
     uos.set_global_alarm_manager(true);
     uos.start();
 
-    onvif::AlarmNotifier notifier(uos.base_url(), &uid);
+    onvif::AlarmNotifier notifier(uos.base_url(), &uid, "", kNoUos);
+    notifier.set_mode_probe(local_console);
     notifier.refresh_alarms();
     notifier.notify("person", "AABBCCDDEEFF", "event-uuid-global",
                     1234567890000ULL);
 
     CHECK(uos.notify_bodies().size() == 1,
-          "UOS/global: notification must go through the UOS manager, got " +
+          "UOS/run refused: notification must go through the UOS manager, got " +
               std::to_string(uos.notify_bodies().size()));
     CHECK(uos.posted_events().empty(),
-          "UOS/global: the refused legacy path must not be used");
+          "UOS/run refused: the refused legacy path must not be used");
     CHECK(uos.rejected_internal_with_user() == 0,
-          "UOS/global: no /internal/ call may carry X-UserId");
+          "UOS/run refused: no /internal/ call may carry X-UserId");
   }
 }
 

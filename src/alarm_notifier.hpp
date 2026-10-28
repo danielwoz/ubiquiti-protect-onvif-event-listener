@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <ctime>
@@ -35,8 +36,11 @@ namespace onvif {
  *
  * Hands each smart detection the recorder records to UniFi Protect's
  * alarms.  Protect keeps its alarms in one of two places, and the notifier
- * follows whichever the console uses (refresh_alarms() decides it again on
- * every refresh, so a console moved from Local to Global is followed):
+ * follows whichever the console uses.  The mode is decided again at the
+ * first detection once the last decision is a minute old (10 s while it or
+ * the mode's alarm list is not settled), so a console moved from Local to
+ * Global is followed.  A detection that finds a refresh already running
+ * uses the alarms it has instead of waiting for it.
  *
  * Global Alarm Manager (nvrs.featureFlags.useExternalAlarmManager)
  * ----------------------------------------------------------------
@@ -50,7 +54,9 @@ namespace onvif {
  * matched is visible only in /data/unifi-core/logs/uos-agent.log.  Alarms
  * whose object trigger needs another trigger within a time window, or a
  * count of detections, are not sent (Protect's own matcher evaluates
- * those); each is named once in a warning.
+ * those); each is named once in a warning.  When neither the Protect DB
+ * nor the UniFi OS alarm list can be read before the first decision, the
+ * mode stays unknown and nothing is sent until one of them answers.
  *
  * Local Alarm Manager
  * -------------------
@@ -62,7 +68,8 @@ namespace onvif {
  * (which can carry a thumbnail), falling back to
  * /api/automations/<id>/run when those routes are absent.  It evaluates
  * each alarm's cameras (include or exclude), cooldown, schedule and
- * recipients itself and records history in Protect's DB.
+ * recipients itself and records history in Protect's DB.  Protect's
+ * automation list is re-read every 5 minutes.
  *
  * Thumbnails: Protect builds the notification from the event row and the
  * camera's DB UUID, so refresh_alarms() keeps a MAC -> cameras.id map.
@@ -240,6 +247,8 @@ class AlarmNotifier {
     bool paused = false;
     bool has_object_trigger = false;  // any protect:objects.* trigger
     std::vector<std::string> scope_keys;  // keys of scope.data, in order
+    // A scope.data value names a camera zone or button ("<MAC>:<key>=<id>").
+    bool zone_scoped = false;
     // Object types ("person", ...) a single detection fires it for.
     std::set<std::string> fire_types;
     // Object types it has a trigger for but that are not sent, and why.
@@ -257,8 +266,11 @@ class AlarmNotifier {
   std::string uos_url_;
   ModeProbe mode_probe_;  // empty = read the DB; protected by mu_
   int retry_delay_ms_ = 1500;  // before the one reconnect attempt
-  // Held for a whole refresh (HTTP and DB included) so concurrent
-  // detections run one refresh, not one each.  Never taken under mu_.
+  int uos_timeout_ms_ = 5000;  // whole-request limit for uos-agent calls
+  std::atomic<int> uos_posts_{0};  // POST /api/v1/alarms/events attempts
+  // Held for a whole refresh (HTTP and DB included) so only one runs at a
+  // time; detections only try it, and go on without waiting when another
+  // thread holds it.  Never taken under mu_.
   absl::Mutex refresh_mu_;
   Mode mode_ = Mode::kUnknown;           // protected by mu_
   std::vector<UosAlarm> uos_alarms_;     // protected by mu_
@@ -271,14 +283,20 @@ class AlarmNotifier {
   std::vector<AutomationEntry> automations_;  // protected by mu_
   std::map<std::string, uint64_t> last_fired_;   // automation_id → ms, protected by mu_
   std::map<std::string, std::string> mac_to_camera_id_;  // MAC → camera DB UUID, protected by mu_
-  std::chrono::steady_clock::time_point last_refresh_{};
+  // Start of the last refresh, whatever its outcome; protected by mu_.
+  std::chrono::steady_clock::time_point last_attempt_{};
+  // Protect's automation list was read (Local); protected by mu_.
+  bool local_loaded_ = false;
+  std::chrono::steady_clock::time_point local_loaded_at_{};  // by mu_
   std::set<std::string> warned_;  // first_warning() keys, protected by mu_
 
   // Global or Local from useExternalAlarmManager (@p flag).  When it
   // could not be read the previous decision stands; with none yet, a
-  // UniFi OS alarm list holding a protect:objects.* trigger means Global.
+  // UniFi OS alarm list (@p uos_has_object_alarms; nullopt = not read)
+  // holding a protect:objects.* trigger means Global and one without
+  // means Local.  With neither the mode stays kUnknown.
   static Mode decide_mode(std::optional<bool> flag, Mode previous,
-                          bool uos_has_object_alarms);
+                          std::optional<bool> uos_has_object_alarms);
   static const char* mode_name(Mode mode);
 
   // GET /api/v1/alarms body -> alarms; false if it is not a JSON array.
@@ -296,20 +314,28 @@ class AlarmNotifier {
                                       const std::string& camera_id,
                                       const std::string& event_id,
                                       uint64_t ts_ms);
-  // Request to uos-agent with X-Source: protect.  Returns the HTTP status
-  // (0 when curl failed; *curl_code says why).  @p body empty = GET.
+  // Request to uos-agent with X-Source: protect, limited to
+  // @p timeout_ms.  Returns the HTTP status (0 when curl failed;
+  // *curl_code says why).  @p body empty = GET.
   static long uos_request(const std::string& url,  // NOLINT(runtime/int)
                           const std::string& body, std::string* response,
-                          int* curl_code);
+                          int* curl_code, int timeout_ms);
+  // uos_request() with this notifier's timeout; counts POSTs.
+  long send_uos(const std::string& url,  // NOLINT(runtime/int)
+                const std::string& body, std::string* response,
+                int* curl_code);
 
-  // refresh_alarms() with refresh_mu_ held.
-  void refresh_locked();
+  // Whether a detection should refresh now (see the class comment).
+  bool refresh_due_locked(std::chrono::steady_clock::time_point now) const;
+  // refresh_alarms() with refresh_mu_ held.  @p force_local re-reads
+  // Protect's automation list in Local mode even when it is recent.
+  void refresh_locked(bool force_local);
   // Global part of a refresh: read the alarm list; false if unreadable.
   bool fetch_uos_alarms(std::vector<UosAlarm>* out);
   void store_uos_alarms(std::vector<UosAlarm> alarms);
   // Local part of a refresh (Protect's automation list).
   void refresh_local(const std::string& protect_url);
-  // Refresh if the current mode's list is missing or stale.
+  // Refresh when due, unless another thread is already refreshing.
   void maybe_refresh();
   void notify_global(const std::string& obj_type, const std::string& mac,
                      const std::string& event_id, uint64_t ts_ms);

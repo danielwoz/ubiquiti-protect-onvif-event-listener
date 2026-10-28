@@ -33,7 +33,11 @@
  * and connection failures are handled, against a fake uos-agent.
  */
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -47,6 +51,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -54,6 +59,7 @@
 #include "absl/log/log_sink.h"
 #include "absl/log/log_sink_registry.h"
 #include "absl/synchronization/mutex.h"
+#include "absl/synchronization/notification.h"
 #include "alarm_notifier.hpp"
 #include "camera_emulators.hpp"
 #include "onvif_camera_emulator.hpp"
@@ -106,7 +112,8 @@ struct AlarmNotifierTest {
   // Global Alarm Manager.
   using UosAlarm = AlarmNotifier::UosAlarm;
   using Mode = AlarmNotifier::Mode;
-  static Mode decide(std::optional<bool> flag, Mode previous, bool objects) {
+  static Mode decide(std::optional<bool> flag, Mode previous,
+                     std::optional<bool> objects) {
     return AlarmNotifier::decide_mode(flag, previous, objects);
   }
   static bool parse_uos(const std::string& json, std::vector<UosAlarm>* out) {
@@ -130,6 +137,21 @@ struct AlarmNotifierTest {
   }
   static void set_retry_delay_ms(AlarmNotifier* n, int ms) {
     n->retry_delay_ms_ = ms;
+  }
+  static void set_uos_timeout_ms(AlarmNotifier* n, int ms) {
+    n->uos_timeout_ms_ = ms;
+  }
+  // POST /api/v1/alarms/events attempts, connection failures included.
+  static int uos_posts(AlarmNotifier* n) { return n->uos_posts_.load(); }
+  // Make the last refresh (and the Local list) look @p by older.
+  static void age(AlarmNotifier* n, std::chrono::seconds by) {
+    absl::MutexLock lk(&n->mu_);
+    n->last_attempt_ -= by;
+    n->local_loaded_at_ -= by;
+  }
+  static absl::Mutex* refresh_mu(AlarmNotifier* n) { return &n->refresh_mu_; }
+  static void set_uos_url(AlarmNotifier* n, const std::string& url) {
+    n->uos_url_ = url;
   }
 };
 
@@ -248,7 +270,7 @@ static void test_parse_basics() {
       "name": "Porch person",
       "enable": true,
       "conditions": [{"source":"person"}],
-      "sources":    [{"device":"FC5F49CA68D4"}],
+      "sources":    [{"device":"AABBCCDDEEFF"}],
       "cooldown":   {"enable": true, "timeout": 15000}
     }])";
     auto v = AlarmNotifierTest::parse(json);
@@ -259,7 +281,7 @@ static void test_parse_basics() {
       check(v[0].enabled, "enabled=true parsed");
       check(v[0].trigger_types.count("person") == 1, "trigger person present");
       check(v[0].trigger_types.size() == 1, "trigger_types size 1");
-      check(v[0].source_devices.count("FC5F49CA68D4") == 1, "source MAC present");
+      check(v[0].source_devices.count("AABBCCDDEEFF") == 1, "source MAC present");
       check(v[0].cooldown_enabled, "cooldown_enabled true");
       check(v[0].cooldown_ms == 15000, "cooldown_ms 15000");
       check(!v[0].has_notify_action, "no actions -> no notify action");
@@ -1193,7 +1215,7 @@ static std::string synthetic_alarm_list() {
          uos_alarm("a-and", "Person after a vehicle",
                    "[[" + trig("protect:objects.person") + "],[" +
                        trig("protect:objects.vehicle", "null",
-                            R"({"interval":60})") +
+                            R"({"interval":"60"})") +
                        "]]",
                    kZonesAll) +
          "," +
@@ -1239,6 +1261,13 @@ static void test_mode_decision() {
         "first refresh, flag unreadable, object alarms in UniFi OS -> Global");
   check(decide(std::nullopt, Mode::kUnknown, false) == Mode::kLocal,
         "first refresh, flag unreadable, no object alarms -> Local");
+  check(decide(std::nullopt, Mode::kUnknown, std::nullopt) == Mode::kUnknown,
+        "first refresh, flag and UniFi OS list unreadable -> undecided");
+  check(decide(std::nullopt, Mode::kGlobal, std::nullopt) == Mode::kGlobal &&
+            decide(std::nullopt, Mode::kLocal, std::nullopt) == Mode::kLocal,
+        "nothing readable later: previous decision kept");
+  check(decide(true, Mode::kUnknown, std::nullopt) == Mode::kGlobal,
+        "flag readable, list unreadable -> flag decides");
 }
 
 static void test_uos_alarm_parsing() {
@@ -1295,6 +1324,54 @@ static void test_uos_alarm_parsing() {
   const auto* two = find_alarm(alarms, "a-twokeys");
   check(two && two->scope_keys.size() == 2, "both scope keys kept");
 
+  check(person && !person->zone_scoped && two && !two->zone_scoped,
+        "MAC and ALL_ITEMS scopes are not zone scopes");
+
+  // A count without a window is not applied by Protect: fires on one.
+  // site_id inside scope.data is not a scope key.  A "<MAC>:<key>=<id>"
+  // value limits the alarm to a zone or button.
+  std::vector<AlarmNotifierTest::UosAlarm> extra;
+  check(AlarmNotifierTest::parse_uos(
+            "[" +
+                uos_alarm("a-nowindow", "Five people, no window",
+                          "[[" + trig("protect:objects.person",
+                                      R"({"count":{"items":)"
+                                      R"({"primaryInput":"5"}}})") +
+                              "]]",
+                          kZonesAll) +
+                "," +
+                uos_alarm("a-site", "Site in scope",
+                          "[[" + trig("protect:objects.person") + "]]",
+                          R"({"mode":"include","data":{"site_id":"protect",)"
+                          R"("scope_all_smart_cameras_with_zones":)"
+                          R"(["024D4F434B01"]}})") +
+                "," +
+                uos_alarm("a-zone", "Driveway zone",
+                          "[[" + trig("protect:objects.vehicle") + "]]",
+                          R"({"mode":"include","data":{)"
+                          R"("scope_all_smart_cameras_with_zones":)"
+                          R"(["024D4F434B01:zone=1"]}})") +
+                "]",
+            &extra),
+        "extra alarm shapes parse");
+  const auto* nowindow = find_alarm(extra, "a-nowindow");
+  check(nowindow && nowindow->fire_types.count("person") == 1 &&
+            nowindow->skipped.empty(),
+        "count without a window fires on one detection");
+  const auto* site = find_alarm(extra, "a-site");
+  check(site && site->scope_keys == std::vector<std::string>{
+                                        "scope_all_smart_cameras_with_zones"},
+        "site_id in scope.data is not a scope key");
+  if (site) {
+    const std::string body = AlarmNotifierTest::uos_events(
+        {*site}, "person", kMockMac, kMockCameraId, "e", 1);
+    check(body.find("site_id") == body.rfind("site_id"),
+          "site_id appears once in the event scope");
+  }
+  const auto* zone = find_alarm(extra, "a-zone");
+  check(zone && zone->zone_scoped && zone->fire_types.count("vehicle") == 1,
+        "zone-scoped alarm detected and still sent");
+
   std::vector<AlarmNotifierTest::UosAlarm> none;
   check(!AlarmNotifierTest::parse_uos(R"({"error":"x"})", &none),
         "an object is not an alarm list");
@@ -1322,13 +1399,16 @@ static void test_uos_payload_golden() {
             R"("start":1793173174455,"smartDetectTypes":["person"]}}}}])",
         "golden POST /api/v1/alarms/events body");
 
-  // No camera id: sourceEvent.camera is left out.
+  // No camera id: sourceEvent is left out; Protect looks up eventId.
   const std::string no_cam = AlarmNotifierTest::uos_events(
       {a}, "person", kMockMac, "", "evt-2", 1793173174455ULL);
-  check(!contains(no_cam, "\"camera\"") &&
-            contains(no_cam, R"("sourceEvent":{"type":"smartDetectZone",)"
-                             R"("start":1793173174455)"),
-        "unknown camera id: no sourceEvent.camera");
+  check(no_cam ==
+            R"([{"id":"person","alarm_id":"01a1816a-0000-7000-8000-)"
+            R"(000000000001","scope":{"scope_all_smart_cameras_with_zones":)"
+            R"("024D4F434B01","site_id":"protect"},"metadata":{"event":{)"
+            R"("key":"person","device":"024D4F434B01","eventId":"evt-2",)"
+            R"("timestamp":1793173174455}}}])",
+        "unknown camera id: no sourceEvent");
 
   // No scope: the detection type's usual key.  Package uses its own.
   AlarmNotifierTest::UosAlarm bare;
@@ -1344,17 +1424,24 @@ static void test_uos_payload_golden() {
                  R"("024D4F434B01","site_id":"protect"})"),
         "no scope data, package: package key");
 
-  // Every key of the alarm's scope, in one scope object; the usual key
-  // added when the alarm's own keys lack it.
+  // Only the alarm's own scope keys, all in one scope object; the usual
+  // key is not added when the alarm has keys of its own.
   AlarmNotifierTest::UosAlarm odd;
   odd.id = "odd";
   odd.scope_keys = {"scope_all_smart_cameras"};
   check(contains(AlarmNotifierTest::uos_events({odd}, "person", kMockMac, "",
                                                "e", 1),
                  R"("scope":{"scope_all_smart_cameras":"024D4F434B01",)"
+                 R"("site_id":"protect"})"),
+        "alarm's own scope key only");
+  odd.scope_keys = {"scope_all_smart_cameras",
+                    "scope_all_smart_cameras_with_zones"};
+  check(contains(AlarmNotifierTest::uos_events({odd}, "person", kMockMac, "",
+                                               "e", 1),
+                 R"("scope":{"scope_all_smart_cameras":"024D4F434B01",)"
                  R"("scope_all_smart_cameras_with_zones":"024D4F434B01",)"
                  R"("site_id":"protect"})"),
-        "alarm's own scope key plus the usual one, one scope object");
+        "two scope keys: one scope object holding both");
 
   // Two alarms: two events, one per alarm id.
   const std::string two = AlarmNotifierTest::uos_events(
@@ -1385,6 +1472,11 @@ class FakeUosAgent : public OnvifCameraEmulator {
     events_status_ = status;
     events_body_ = body;
   }
+  // Answer each events POST only after @p ms (recorded on arrival).
+  void set_events_delay_ms(int ms) {
+    std::lock_guard<std::mutex> lk(mu_);
+    events_delay_ms_ = ms;
+  }
   std::vector<std::string> events() {
     std::lock_guard<std::mutex> lk(mu_);
     return events_;
@@ -1402,7 +1494,7 @@ class FakeUosAgent : public OnvifCameraEmulator {
   std::pair<int, std::string> handle(const std::string& path,
                                      const std::string& /*soap_action*/,
                                      const std::string& body) override {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::unique_lock<std::mutex> lk(mu_);
     if (request_header("X-Source") != "protect") {
       ++bad_requests_;
       return {400, R"({"error":"missing X-Source"})"};
@@ -1417,6 +1509,12 @@ class FakeUosAgent : public OnvifCameraEmulator {
         return {415, ""};
       }
       events_.push_back(body);
+      if (events_delay_ms_ > 0) {
+        const int delay = events_delay_ms_;
+        lk.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        lk.lock();
+      }
       return {events_status_, events_body_};
     }
     return {404, ""};
@@ -1427,6 +1525,7 @@ class FakeUosAgent : public OnvifCameraEmulator {
   std::string alarms_ = "[]";
   int alarms_status_ = 200;
   int events_status_ = 202;
+  int events_delay_ms_ = 0;
   std::string events_body_;
   std::vector<std::string> events_;
   int list_requests_ = 0;
@@ -1558,7 +1657,9 @@ static void test_global_errors() {
     notifier.set_mode_probe(global_console);
     notifier.refresh_alarms();
     notifier.notify("person", kMockMac, "evt-e1", 1);
-    check(uos.events().size() == 1, "HTTP 400: sent once, not retried");
+    check(uos.events().size() == 1 &&
+              AlarmNotifierTest::uos_posts(&notifier) == 1,
+          "HTTP 400: sent once, not retried");
     check(sink.count("rejected the alarm events for \"Person\" with HTTP "
                      "400: {\"error\":\"bad scope field\"}") == 1,
           "HTTP 400: logged with the body on one line");
@@ -1574,7 +1675,9 @@ static void test_global_errors() {
     notifier.set_mode_probe(global_console);
     notifier.refresh_alarms();
     notifier.notify("person", kMockMac, "evt-e2", 1);
-    check(uos.events().size() == 1, "HTTP 500: sent once, not retried");
+    check(uos.events().size() == 1 &&
+              AlarmNotifierTest::uos_posts(&notifier) == 1,
+          "HTTP 500: sent once, not retried");
     check(sink.count("answered HTTP 500") == 1, "HTTP 500 logged");
   }
   // Connection refused: one retry, then dropped.  The alarm list stays
@@ -1594,11 +1697,75 @@ static void test_global_errors() {
     const auto took = std::chrono::steady_clock::now() - start;
     check(sink.count("evt-e3): could not connect to") == 1,
           "connection refused: one retry announced");
+    check(AlarmNotifierTest::uos_posts(&notifier) == 2,
+          "connection refused: exactly two attempts (one retry)");
     check(sink.count("evt-e3) not handed to UniFi OS") == 1 &&
               sink.count("(after one retry); dropped") == 1,
           "connection refused twice: dropped with an error");
     check(took >= std::chrono::milliseconds(50),
           "the retry waits the retry delay");
+  }
+  // Timeout: UniFi OS may already be running the alarms, so no retry.
+  {
+    FakeUosAgent uos;
+    uos.set_alarms(list);
+    uos.set_events_delay_ms(800);
+    uos.start();
+    onvif::AlarmNotifier notifier("http://127.0.0.1:1", &provider, "",
+                                  uos.base_url());
+    notifier.set_mode_probe(global_console);
+    AlarmNotifierTest::set_retry_delay_ms(&notifier, 0);
+    notifier.refresh_alarms();
+    AlarmNotifierTest::set_uos_timeout_ms(&notifier, 200);
+    notifier.notify("person", kMockMac, "evt-e6", 1);
+    check(uos.events().size() == 1 &&
+              AlarmNotifierTest::uos_posts(&notifier) == 1,
+          "timeout: sent once, not retried");
+    check(sink.count("evt-e6) not handed to UniFi OS") == 1 &&
+              sink.count("evt-e6): could not connect") == 0 &&
+              sink.count("not retried, as UniFi OS may have run them") == 1,
+          "timeout: logged as not retried");
+  }
+  // Refused, then the retry times out: the log says it was retried.  The
+  // socket is bound but refuses connections until listen(), and then
+  // never answers.
+  {
+    FakeUosAgent uos;
+    uos.set_alarms(list);
+    uos.start();
+    onvif::AlarmNotifier notifier("http://127.0.0.1:1", &provider, "",
+                                  uos.base_url());
+    notifier.set_mode_probe(global_console);
+    notifier.refresh_alarms();
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t len = sizeof(addr);
+    const bool bound =
+        fd >= 0 &&
+        ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0 &&
+        ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) == 0;
+    check(bound, "silent socket bound");
+    if (bound) {
+      AlarmNotifierTest::set_uos_url(
+          &notifier, "http://127.0.0.1:" + std::to_string(ntohs(addr.sin_port)));
+      AlarmNotifierTest::set_uos_timeout_ms(&notifier, 200);
+      AlarmNotifierTest::set_retry_delay_ms(&notifier, 300);
+      std::thread opener([fd]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ::listen(fd, 4);
+      });
+      notifier.notify("person", kMockMac, "evt-e7", 1);
+      opener.join();
+      check(AlarmNotifierTest::uos_posts(&notifier) == 2,
+            "refused then timeout: two attempts, no third");
+      check(sink.count("evt-e7) not handed to UniFi OS for \"Person\": "
+                       "Timeout was reached (after one retry); not retried, "
+                       "as UniFi OS may have run them") == 1,
+            "refused then timeout: the error names the retry");
+    }
+    if (fd >= 0) ::close(fd);
   }
   // An unreadable list keeps the last good one.
   {
@@ -1680,15 +1847,35 @@ static void test_mode_at_run_time() {
           "flag unreadable, no object alarms in UniFi OS -> Local");
   }
   {
+    // Neither source answers: undecided, nothing sent anywhere, Protect's
+    // automations not read; decided once the UniFi OS list answers.
     FakeUosAgent uos;
     uos.set_alarms("nope", 404);
     uos.start();
-    onvif::AlarmNotifier notifier("http://127.0.0.1:1", &provider, "",
-                                  uos.base_url());
+    NoAlarmManagerProtect protect("[]");
+    protect.start();
+    onvif::AlarmNotifier notifier(
+        "http://127.0.0.1:" + std::to_string(protect.port()), &provider, "",
+        uos.base_url());
     notifier.set_mode_probe(unreadable_flag);
     notifier.refresh_alarms();
-    check(notifier.mode() == AlarmNotifierTest::Mode::kLocal,
-          "flag unreadable, no UniFi OS alarm list -> Local");
+    check(notifier.mode() == AlarmNotifierTest::Mode::kUnknown,
+          "flag unreadable, no UniFi OS alarm list -> undecided");
+    notifier.notify("person", kMockMac, "evt-u1", 1);
+    check(uos.events().empty() && protect.paths().empty(),
+          "undecided: nothing sent, no Protect automation calls");
+    check(sink.count("evt-u1) not sent: the alarm mode is not known") == 1,
+          "undecided: the dropped detection is logged");
+    check(sink.count("alarm mode not decided yet") == 1,
+          "undecided: warned once");
+    check(uos.list_requests() == 1,
+          "undecided: not re-read within 10 s");
+    uos.set_alarms(objects);
+    AlarmNotifierTest::age(&notifier, std::chrono::seconds(11));
+    notifier.notify("person", kMockMac, "evt-u2", 1);
+    check(notifier.mode() == AlarmNotifierTest::Mode::kGlobal &&
+              uos.events().size() == 1,
+          "undecided: re-read after 10 s, then Global and sent");
   }
   {
     // Local, then the user migrates to Global.
@@ -1722,7 +1909,127 @@ static void test_mode_at_run_time() {
     check(uos.events().size() == 1 && protect.notify_bodies().size() == 1,
           "Global: UniFi OS gets the detection, Protect's notify does not");
   }
+  {
+    // The move to Global is followed at the first detection once the last
+    // check is a minute old, without refresh_alarms(); Protect's own list
+    // is re-read only every 5 minutes meanwhile.
+    NoAlarmManagerProtect protect(
+        "[" +
+        alarm("local-person",
+              "[" + receiver(kOwnerPk, kOwner, R"(["push"])") + "]") +
+        "]");
+    protect.start();
+    FakeUosAgent uos;
+    uos.set_alarms(objects);
+    uos.start();
+    auto flag = std::make_shared<std::atomic<bool>>(false);
+    auto probes = std::make_shared<std::atomic<int>>(0);
+    onvif::AlarmNotifier notifier(
+        "http://127.0.0.1:" + std::to_string(protect.port()), &provider, "",
+        uos.base_url());
+    notifier.set_mode_probe([flag, probes]() -> std::optional<bool> {
+      ++*probes;
+      return flag->load();
+    });
+    notifier.refresh_alarms();
+    const auto list_reads = [&protect]() {
+      int n = 0;
+      for (const std::string& p : protect.paths()) {
+        if (p == "/api/automations") ++n;
+      }
+      return n;
+    };
+    notifier.notify("person", kMockMac, "evt-c1", 1700000000000ULL);
+    check(*probes == 1 && list_reads() == 1,
+          "Local: no refresh within the minute");
+    AlarmNotifierTest::age(&notifier, std::chrono::seconds(61));
+    notifier.notify("person", kMockMac, "evt-c2", 1700000100000ULL);
+    check(*probes == 2 && list_reads() == 1,
+          "Local: mode checked after a minute; automations not re-read");
+    AlarmNotifierTest::age(&notifier, std::chrono::seconds(301));
+    notifier.notify("person", kMockMac, "evt-c3", 1700000200000ULL);
+    check(*probes == 3 && list_reads() == 2,
+          "Local: automations re-read after 5 minutes");
+    flag->store(true);
+    AlarmNotifierTest::age(&notifier, std::chrono::seconds(61));
+    notifier.notify("person", kMockMac, "evt-c4", 1700000300000ULL);
+    check(notifier.mode() == AlarmNotifierTest::Mode::kGlobal &&
+              uos.events().size() == 1 && list_reads() == 2,
+          "Local -> Global followed at the next detection after a minute");
+  }
   absl::RemoveLogSink(&sink);
+}
+
+// Detections never wait for another thread's refresh, and a failing
+// refresh is not repeated on every detection.
+static void test_refresh_does_not_block() {
+  onvif::ProtectUserIdProvider provider("owner-user-id", "");
+  const std::string list =
+      "[" + uos_alarm("a-person", "Person",
+                      "[[" + trig("protect:objects.person") + "]]",
+                      kZonesAll) +
+      "]";
+  {
+    FakeUosAgent uos;
+    uos.set_alarms(list);
+    uos.start();
+    onvif::AlarmNotifier notifier("http://127.0.0.1:1", &provider, "",
+                                  uos.base_url());
+    notifier.set_mode_probe(global_console);
+    notifier.refresh_alarms();
+    AlarmNotifierTest::age(&notifier, std::chrono::seconds(61));
+    // Another thread is in the middle of a refresh.
+    absl::Notification held;
+    absl::Notification release;
+    std::thread refresher([&]() {
+      absl::MutexLock lk(AlarmNotifierTest::refresh_mu(&notifier));
+      held.Notify();
+      release.WaitForNotification();
+    });
+    held.WaitForNotification();
+    const auto start = std::chrono::steady_clock::now();
+    notifier.notify("person", kMockMac, "evt-b1", 1);
+    const auto took = std::chrono::steady_clock::now() - start;
+    release.Notify();
+    refresher.join();
+    check(took < std::chrono::seconds(2) && uos.events().size() == 1,
+          "a detection during another refresh is sent with the loaded list");
+    check(uos.list_requests() == 1,
+          "the detection did not refresh while another thread was");
+  }
+  {
+    // Global, list never readable: one read per 10 s, not per detection.
+    FakeUosAgent uos;
+    uos.set_alarms("", 500);
+    uos.start();
+    auto probes = std::make_shared<std::atomic<int>>(0);
+    onvif::AlarmNotifier notifier("http://127.0.0.1:1", &provider, "",
+                                  uos.base_url());
+    notifier.set_mode_probe([probes]() -> std::optional<bool> {
+      ++*probes;
+      return true;
+    });
+    notifier.refresh_alarms();
+    for (int i = 0; i < 5; ++i) notifier.notify("person", kMockMac, "e", 1);
+    check(uos.list_requests() == 1 && *probes == 1,
+          "unreadable list: not re-read on every detection");
+    AlarmNotifierTest::age(&notifier, std::chrono::seconds(11));
+    notifier.notify("person", kMockMac, "e", 1);
+    check(uos.list_requests() == 2, "unreadable list: re-read after 10 s");
+  }
+  {
+    // Local console without a Protect user id: no refresh per detection.
+    onvif::ProtectUserIdProvider no_user("", "");
+    auto probes = std::make_shared<std::atomic<int>>(0);
+    onvif::AlarmNotifier notifier("http://127.0.0.1:1", &no_user, "", kNoUos);
+    notifier.set_mode_probe([probes]() -> std::optional<bool> {
+      ++*probes;
+      return false;
+    });
+    notifier.refresh_alarms();
+    for (int i = 0; i < 5; ++i) notifier.notify("person", kMockMac, "e", 1);
+    check(*probes == 1, "Local without a user id: one refresh, not five");
+  }
 }
 
 // --trigger_automations=false: no notifier, so nothing is read or sent.
@@ -1764,6 +2071,7 @@ int main() {
   test_global_notify();
   test_global_errors();
   test_mode_at_run_time();
+  test_refresh_does_not_block();
   test_trigger_automations_off();
 
   std::cerr << "PASS " << g_pass << " / FAIL " << g_fail << '\n';
