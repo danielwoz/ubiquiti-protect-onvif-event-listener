@@ -3,8 +3,9 @@
 #
 #   curl -fsSL https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener/install.sh | sh
 #
-# Detects the user's UniFi Protect release channel (Stable / Release Candidate
-# / Early Access) and configures APT to pull matching onvif-recorder builds.
+# Detects the user's UniFi Protect release channel (Release / Release
+# Candidate / Early Access, Alpha, Internal or QA) and configures APT to pull
+# matching onvif-recorder builds.
 # Safe to re-run; it just (re)writes the keyring + sources list.
 set -e
 

@@ -3,11 +3,13 @@
 #   1. With no pinned marker, the channel follows the Protect runnables.yaml.
 #   2. With a pinned marker, the channel is forced to the pinned value
 #      regardless of what runnables.yaml says.
+#   3. Each UniFi OS release channel maps to the expected apt suite.
 #
-# We avoid the apt-suite reachability check by overriding ONVIF_REPO_URL
-# to a non-resolving URL and having the script gracefully skip writes
-# when no suite is reachable -- but case (2) doesn't reach that code path
-# because the pinned-marker branch returns early.
+# Cases 1-5 probe the real apt repo, so they only check that the result
+# is a valid channel (the script keeps the existing value when no suite
+# is reachable); the pinned cases return before the probe.  Case 6 puts
+# curl and logger stubs first on PATH, so every suite probe succeeds and
+# the written channel is exactly the mapped suite.
 #
 # Run via: bazel test --config=x86 //test:test_detect_channel
 set -eu
@@ -105,5 +107,38 @@ case "$got" in
 esac
 [ "$ok" = "1" ] || { echo "FAIL: post-removal invalid '$got'"; fail=1; }
 echo "PASS: marker removal restores auto-detection"
+
+# 6. Mapping from UniFi OS release channels to apt suites, with every
+#    suite reported as published.  Each known channel starts from a
+#    different channel than the one expected, so keeping the previous
+#    value fails it; an unknown channel must keep the previous value.
+mkdir -p "$TMP/bin"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/curl"
+printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/logger"
+chmod +x "$TMP/bin/curl" "$TMP/bin/logger"
+
+run_published() {
+    PATH="$TMP/bin:$PATH" ONVIF_RUNNABLES_YAML="$TMP/runnables/runnables.yaml" \
+        "$PATCHED" "$@"
+}
+
+check_mapping() {  # runnables.yaml protect value, starting channel, expected
+    echo "$2" > "$TMP/etc/channel"
+    write_runnables "$1"
+    run_published >/dev/null 2>&1 || { echo "FAIL: protect: $1 exited non-zero"; fail=1; }
+    got=$(cat "$TMP/etc/channel")
+    check "$got" "$3" "protect: $1 -> $3"
+}
+
+check_mapping release           early-access stable
+check_mapping release-candidate stable       rc
+check_mapping beta              stable       early-access
+check_mapping early-access      stable       early-access
+check_mapping alpha             stable       early-access
+check_mapping internal          stable       early-access
+check_mapping qa                stable       early-access
+check_mapping '"Alpha"'         rc           early-access
+check_mapping QA                rc           early-access
+check_mapping nightly           rc           rc
 
 exit $fail

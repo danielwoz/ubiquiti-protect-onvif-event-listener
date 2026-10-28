@@ -261,7 +261,7 @@ public class InstallScriptsTests {
         Assert.Contains(InstallScripts.RunnablesYaml, script);
         Assert.Contains("release)", script);
         Assert.Contains("release-candidate)", script);
-        Assert.Contains("beta|early-access)", script);
+        Assert.Contains("beta|early-access|alpha|internal|qa)", script);
         Assert.Contains("echo \"stable\"", script);
         Assert.Contains("echo \"rc\"", script);
         Assert.Contains("echo \"early-access\"", script);

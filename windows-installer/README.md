@@ -129,7 +129,10 @@ drop-down, so it can still be kept.
 ### Pinning
 
 The page also reads Protect's release channel from
-`/data/unifi-core/config/runnables.yaml`.
+`/data/unifi-core/config/runnables.yaml`, mapped to a channel the same way
+as `debian/detect-channel.sh`: Release is Stable, Release Candidate is
+Release Candidate, and Early Access, Alpha, Internal and QA are Latest
+(`early-access`). Any other value leaves Protect's channel unknown.
 
 - Choosing Protect's channel, unless it is the one already pinned, removes
   any pin, so the device keeps following Protect: `detect-channel.sh` (run

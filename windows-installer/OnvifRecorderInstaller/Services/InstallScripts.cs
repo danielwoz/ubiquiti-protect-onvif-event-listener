@@ -100,8 +100,11 @@ public static class InstallScripts {
             """;
     }
 
-    // Prints the Protect channel (stable | rc | early-access) or empty if
-    // unknown. Mirrors debian/detect-channel.sh.
+    // Prints the apt suite for Protect's release channel or empty if
+    // unknown: release -> stable, release-candidate -> rc, and the
+    // pre-release channels beta (Early Access; also accepted as
+    // early-access), alpha, internal and qa -> early-access. Keep the
+    // mapping identical to debian/detect-channel.sh.
     public static string BuildDetectChannelScript() {
         return $$"""
             set -e
@@ -123,7 +126,7 @@ public static class InstallScripts {
             case "$RAW" in
                 release)           echo "stable" ;;
                 release-candidate) echo "rc" ;;
-                beta|early-access) echo "early-access" ;;
+                beta|early-access|alpha|internal|qa) echo "early-access" ;;
                 *)                 echo "" ;;
             esac
             """;

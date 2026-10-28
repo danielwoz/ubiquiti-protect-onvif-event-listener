@@ -12,10 +12,14 @@
 #     access: release
 #     ...
 #
-# UniFi OS values (release | release-candidate | beta) map to our apt
-# suites (stable | rc | early-access). If the file is missing or
-# unparseable we leave the existing /etc/onvif-recorder/channel alone
-# (or default to stable on first run).
+# UniFi OS values map to our apt suites: release -> stable,
+# release-candidate -> rc, and the pre-release channels beta (Early
+# Access; also accepted as early-access), alpha, internal and qa ->
+# early-access.  If the file is missing or unparseable, or names any
+# other channel, we leave the existing /etc/onvif-recorder/channel alone
+# (or default to stable on first run).  Keep this mapping identical to
+# BuildDetectChannelScript() in
+# windows-installer/OnvifRecorderInstaller/Services/InstallScripts.cs.
 #
 # We also probe the apt repo: if the preferred suite has no Release file
 # published yet (happens while a release is still only in early-access),
@@ -86,7 +90,7 @@ RAW=$(awk '
 case "$RAW" in
     release)           PREFERRED=stable ;;
     release-candidate) PREFERRED=rc ;;
-    beta|early-access) PREFERRED=early-access ;;
+    beta|early-access|alpha|internal|qa) PREFERRED=early-access ;;
     *) exit 0 ;;  # unknown / empty — keep previous value
 esac
 

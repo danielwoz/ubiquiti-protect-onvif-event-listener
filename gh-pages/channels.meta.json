@@ -6,7 +6,7 @@
       "id": "early-access",
       "aliases": ["latest"],
       "label": "Latest (alpha)",
-      "description": "Every tagged release as soon as it is published. Matches UniFi Protect's Early Access channel."
+      "description": "Every tagged release as soon as it is published. Matches UniFi Protect's Early Access, Alpha, Internal and QA channels."
     },
     {
       "id": "rc",

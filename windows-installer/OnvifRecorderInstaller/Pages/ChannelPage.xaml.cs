@@ -196,10 +196,11 @@ public partial class ChannelPage : Page {
     private string LabelOf(string channel) => _manifest.LabelFor(channel);
 
     // Protect's own names for the channels detect-channel.sh maps to suites.
+    // early-access stands for every pre-release channel mapped to it.
     private static string ProtectChannelName(string channel) => channel switch {
         "stable" => "Release",
         "rc" => "Release Candidate",
-        "early-access" => "Early Access",
+        "early-access" => "Early Access, Alpha, Internal or QA",
         _ => channel,
     };
 

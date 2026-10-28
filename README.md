@@ -51,8 +51,8 @@ That's it. The installer:
 
 1. Installs the signing key to `/usr/share/keyrings/onvif-recorder-archive-keyring.gpg`.
 2. Detects your UniFi Protect release channel (Release / Release Candidate /
-   Early Access) and configures APT to pull the matching onvif-recorder
-   channel (Stable / Release Candidate / Latest); see
+   Early Access, Alpha, Internal or QA) and configures APT to pull the
+   matching onvif-recorder channel (Stable / Release Candidate / Latest); see
    [Release channels](#release-channels).
 3. `apt-get install onvif-recorder`, which auto-enables the systemd service
    plus two daily timers: channel sync and auto-updates.
@@ -98,7 +98,7 @@ admin UI or `systemctl disable --now <timer>`.
 
 | Channel | apt suite | Gets | Matches Protect's |
 |---|---|---|---|
-| **Latest (alpha)** | `early-access` | every tagged release as soon as it is published | Early Access |
+| **Latest (alpha)** | `early-access` | every tagged release as soon as it is published | Early Access, Alpha, Internal, QA |
 | **Release Candidate** | `rc` | releases promoted from Latest after testing on a live device | Release Candidate |
 | **Stable** | `stable` | releases promoted from Release Candidate after wider testing | Release |
 
