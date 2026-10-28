@@ -973,9 +973,12 @@ static void append_utf8(uint32_t cp, std::string* out) {
 }
 
 // The four hex digits of a \u escape at c->pos, consumed; false if they are
-// not four hex digits.
+// not four hex digits, with c->pos at the end of the text if it ends first.
 static bool parse_json_hex4(JsonCursor* c, uint32_t* cp) {
-  if (c->pos + 4 > c->s.size()) return false;
+  if (c->pos + 4 > c->s.size()) {
+    c->pos = c->s.size();
+    return false;
+  }
   *cp = 0;
   for (int i = 0; i < 4; ++i) {
     const char h = c->s[c->pos + i];
@@ -1051,6 +1054,11 @@ static absl::Status parse_json_string(JsonCursor* c, std::string* out) {
           // A high surrogate must be followed by an escaped low one.
           uint32_t low = 0;
           const bool escaped = c->s.compare(c->pos, 2, "\\u") == 0;
+          const size_t left = c->s.size() - c->pos;
+          if (!escaped && left < 2 &&
+              c->s.compare(c->pos, left, "\\u", left) == 0) {
+            c->pos = c->s.size();  // the text ends before the low half
+          }
           if (escaped) c->pos += 2;
           if (!escaped || !parse_json_hex4(c, &low) || low < 0xDC00 ||
               low > 0xDFFF) {
@@ -1217,6 +1225,27 @@ static bool json_separator_follows(JsonCursor* c) {
   return c->pos < c->s.size() && (c->s[c->pos] == ',' || c->s[c->pos] == ']');
 }
 
+// Whether a '{' after offset @p from and before @p to starts what looks
+// like an entry: white space, then "name", "file", "original" or
+// "replacement" and ':'.  In well-formed JSON such a '{' can only start a
+// nested object; after a missing or extra '"' it is usually the start of
+// the next entry, which a scan by quotes and brackets has run past.
+static bool holds_entry_start(const std::string& s, size_t from, size_t to) {
+  for (size_t at = s.find('{', from + 1); at < to; at = s.find('{', at + 1)) {
+    JsonCursor c{s, at + 1};
+    skip_json_ws(&c);
+    for (const char* key : {"\"name\"", "\"file\"", "\"original\"",
+                            "\"replacement\""}) {
+      const size_t n = std::strlen(key);
+      if (s.compare(c.pos, n, key) != 0) continue;
+      c.pos += n;
+      if (consume_json(&c, ':')) return true;
+      break;
+    }
+  }
+  return false;
+}
+
 // A local patches file as parse_local_patches_text() read it.
 struct ParsedLocalPatches {
   std::vector<LocalPatch> entries;  // the first kMaxLocalPatches
@@ -1225,18 +1254,23 @@ struct ParsedLocalPatches {
   // With `stopped`: offset of the first byte not read, the start of the
   // entry or text the error is in.  npos when the text is not an array.
   size_t rest_at = std::string::npos;
+  // With `stopped`: where the parser gave up, the end of the text when it
+  // ran out of text.
+  size_t stopped_at = std::string::npos;
 };
 
 // Parse the text of a local patches file; see parse_local_patches().  The
 // end of an entry that cannot be read is found with scan_json_value(), and
-// is trusted only when a ',' or ']' follows it.  Entries after the first
-// kMaxLocalPatches are skipped with scan_json_value() alone, only to count
-// them.
+// is trusted only when a ',' or ']' follows it and the text it skips does
+// not hold the start of another entry.  Entries after the first
+// kMaxLocalPatches are read the same way, only to count them.
 static ParsedLocalPatches parse_local_patches_text(const std::string& text) {
   ParsedLocalPatches out;
-  auto stop = [&out, &text](const absl::Status& why, size_t rest_at) {
+  auto stop = [&out, &text](const absl::Status& why, size_t stopped_at,
+                            size_t rest_at) {
     out.stopped = std::string(why.message()) + "; the rest of the file, from " +
                   json_where(text, rest_at) + ", is ignored";
+    out.stopped_at = stopped_at;
     out.rest_at = rest_at;
   };
   JsonCursor c{text};
@@ -1256,35 +1290,24 @@ static ParsedLocalPatches parse_local_patches_text(const std::string& text) {
   for (size_t index = 0; !closed; ++index) {
     skip_json_ws(&c);
     const size_t at = c.pos;
-    if (index >= kMaxLocalPatches) {
+    LocalPatch e;
+    bool has_file = false;
+    absl::Status s = parse_local_patch(&c, &e, &has_file);
+    if (s.ok()) {
+      s = check_local_patch(text, at, has_file, e);
+    } else {
       JsonCursor end{text, at};
-      if (scan_json_value(&end) == JsonScan::kEnd) {
-        if (ignored++ == 0) ignored_at = at;
-        c.pos = end.pos;
-      } else {
-        // Read it once more to say what is wrong with it.
-        LocalPatch unused;
-        bool has_file = false;
-        absl::Status s = parse_local_patch(&c, &unused, &has_file);
-        if (s.ok()) s = json_syntax_error(c, "expected ',' or ']'");
-        stop(s, at);
+      if (scan_json_value(&end) != JsonScan::kEnd ||
+          holds_entry_start(text, at, end.pos) ||
+          !json_separator_follows(&end)) {
+        stop(s, c.pos, at);
         break;
       }
+      c.pos = end.pos;
+    }
+    if (index >= kMaxLocalPatches) {
+      if (ignored++ == 0) ignored_at = at;
     } else {
-      LocalPatch e;
-      bool has_file = false;
-      absl::Status s = parse_local_patch(&c, &e, &has_file);
-      if (s.ok()) {
-        s = check_local_patch(text, at, has_file, e);
-      } else {
-        JsonCursor end{text, at};
-        if (scan_json_value(&end) != JsonScan::kEnd ||
-            !json_separator_follows(&end)) {
-          stop(s, at);
-          break;
-        }
-        c.pos = end.pos;
-      }
       if (!s.ok()) {
         // Only the name of an entry that cannot be used is kept.
         LocalPatch invalid;
@@ -1298,21 +1321,23 @@ static ParsedLocalPatches parse_local_patches_text(const std::string& text) {
     if (consume_json(&c, ',')) continue;
     closed = consume_json(&c, ']');
     if (!closed) {
-      stop(json_syntax_error(c, "expected ',' or ']'"), c.pos);
+      stop(json_syntax_error(c, "expected ',' or ']'"), c.pos, c.pos);
       break;
     }
   }
   if (closed) {
     skip_json_ws(&c);
     if (c.pos != text.size()) {
-      stop(json_syntax_error(c, "unexpected text after the array"), c.pos);
+      stop(json_syntax_error(c, "unexpected text after the array"), c.pos,
+           c.pos);
     }
   }
   if (ignored > 0) {
+    // Where reading stopped inside the array, more entries may follow.
+    const std::string count = ignored == 1 ? "one" : std::to_string(ignored);
     const std::string limit = std::to_string(kMaxLocalPatches);
     out.too_many = "more than " + limit + " entries; " +
-                   (ignored == 1 ? std::string("the one")
-                                 : "the " + std::to_string(ignored)) +
+                   (closed ? "the " : "at least ") + count +
                    " after the first " + limit + ", from " +
                    json_where(text, ignored_at) +
                    (ignored == 1 ? ", is ignored" : ", are ignored");
@@ -1366,13 +1391,15 @@ LocalPatches load_local_patches(const std::string& path) {
   if (too_big) {
     const std::string kib = std::to_string(kMaxLocalPatchesBytes / 1024);
     const std::string larger = "larger than " + kib + " KiB";
-    JsonCursor rest{text, p.rest_at};
     if (p.stopped.empty()) {
       p.stopped = larger + "; what follows its first " + kib +
                   " KiB is ignored";
     } else if (p.rest_at != std::string::npos &&
-               scan_json_value(&rest) == JsonScan::kTextEnds) {
-      // Reading stopped at an entry cut off by the size limit.
+               p.stopped_at >= text.size()) {
+      // The parser ran out of text, so the size limit cut off the entry
+      // (or the gap between entries) where reading stopped.  An error
+      // found before the end of the text is in the file itself and is
+      // reported as it is.
       p.stopped = larger + "; the rest of the file, from " +
                   json_where(text, p.rest_at) + ", is ignored";
     } else {

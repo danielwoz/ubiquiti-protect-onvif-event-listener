@@ -1171,6 +1171,10 @@ static void test_local_patch_entry_errors() {
                      "\"[{\",\"replacement\":\"x\" \"y\"}",
                      "expected ',' or '}'", "n"),
         "local skip: brackets inside strings of a broken entry");
+  check(skipped_with("{\"name\":\"n\",\"file\":\"service.js\",\"original\":"
+                     "\"f({\"a\":1},{\"b\":2})\",\"replacement\":\"r\"}",
+                     "expected ',' or '}'", "n"),
+        "local skip: unescaped quotes around object literals");
 
   // Two broken entries next to each other, and one first and last.
   const LocalPatches r = parse_local_patches(
@@ -1215,6 +1219,26 @@ static void test_local_patches_stop() {
                    "'}'; the rest of the file, from line 2, column 1, is "
                    "ignored"),
         "local stop: unterminated string in a middle entry");
+  // A missing '"' turns round which quotes open strings, and the escaped
+  // quote in the next entry turns it back, so the scan ends in that entry:
+  // reading stops instead of skipping it.
+  const std::string q = local_entry("q", "if(x===\"a\"){y()}", "z");
+  check(stops_with("[" + a + ",\n{\"name\":\"b\",\"file\":\"service.js\","
+                   "\"original\":\"o,\"replacement\":\"r\"},\n" + q + ",\n" +
+                       b + "]",
+                   {"a"},
+                   "not valid JSON at line 2, column 48: expected ',' or "
+                   "'}'; the rest of the file, from line 2, column 1, is "
+                   "ignored"),
+        "local stop: missing closing quote, escaped quote in the next entry");
+  check(stops_with("[" + a + ",\n{\"name\":\"b\",\"file\":\"service.js\","
+                   "\"original\":o\",\"replacement\":\"r\"},\n" + q + ",\n" +
+                       b + "]",
+                   {"a"},
+                   "line 2, column 44: the value of \"original\" must be a "
+                   "string; the rest of the file, from line 2, column 1, is "
+                   "ignored"),
+        "local stop: missing opening quote, escaped quote in the next entry");
   check(stops_with("[" + a + ",\n{\"name\":\"b\" \"x\"} y,\n" + b + "]", {"a"},
                    "not valid JSON at line 2, column 13: expected ',' or "
                    "'}'; the rest of the file, from line 2, column 1, is "
@@ -1295,11 +1319,26 @@ static void test_local_patches_too_many() {
   r = parse_local_patches(entries(kMaxLocalPatches + 2, none) +
                           ",\n{\"name\":\"x");
   check(r.entries.size() == kMaxLocalPatches &&
-            r.error == "more than 100 entries; the 2 after the first 100, "
-                       "from line 102, column 1, are ignored; not valid JSON "
-                       "at line 104, column 11: string not terminated; the "
-                       "rest of the file, from line 104, column 1, is ignored",
+            r.error == "more than 100 entries; at least 2 after the first "
+                       "100, from line 102, column 1, are ignored; not valid "
+                       "JSON at line 104, column 11: string not terminated; "
+                       "the rest of the file, from line 104, column 1, is "
+                       "ignored",
         "local many: malformed JSON among the ignored");
+
+  // Ignored entries are read as the others are: a broken one whose end is
+  // not certain stops the count rather than skipping the entry after it.
+  r = parse_local_patches(
+      entries(kMaxLocalPatches + 1, none) +
+      ",\n{\"name\":\"x,\"file\":\"y\"},\n" +
+      local_entry("q", "if(x===\"a\"){y()}", "z") + ",\n" +
+      local_entry("last", "o", "r") + "]");
+  check(r.entries.size() == kMaxLocalPatches &&
+            r.error == "more than 100 entries; at least one after the first "
+                       "100, from line 102, column 1, is ignored; not valid "
+                       "JSON at line 103, column 13: expected ',' or '}'; the "
+                       "rest of the file, from line 103, column 1, is ignored",
+        "local many: missing quote among the ignored");
 }
 
 // A missing file holds no entries and no error; one that cannot be read
@@ -1374,6 +1413,69 @@ static void test_load_local_patches() {
                        "'}'; the rest of the file, from line 2, column 1, is "
                        "ignored; the file is also larger than 1024 KiB",
         "local load: oversized file with malformed JSON");
+
+  // A missing '"' early on is reported as it is, not as the size limit,
+  // although the scan for the broken entry's end runs up to the limit.
+  std::string unquoted = "[" + local_entry("a", "x=1;", "x=2;") +
+                         ",\n{\"name\":\"b\",\"file\":\"service.js\","
+                         "\"original\":\"o,\"replacement\":\"r\"}";
+  while (unquoted.size() <= kMaxLocalPatchesBytes) {
+    unquoted += ",\n" + local_entry("e", "o", std::string(20000, 'r'));
+  }
+  write_test_file(path, unquoted + "]");
+  r = load_local_patches(path);
+  check(all_valid(LocalPatches{r.entries, ""}, {"a"}) &&
+            r.error == "not valid JSON at line 2, column 48: expected ',' or "
+                       "'}'; the rest of the file, from line 2, column 1, is "
+                       "ignored; the file is also larger than 1024 KiB",
+        "local load: oversized file with a missing quote");
+
+  // The limit falling anywhere inside a \u escape pair cuts the entry off;
+  // it is not reported as a bad escape.
+  const std::string head =
+      "[{\"name\":\"a\",\"file\":\"service.js\",\"original\":\"";
+  const std::string pair = "\\ud83d\\ude00";
+  for (size_t k = 0; k <= pair.size(); ++k) {
+    write_test_file(path, head +
+                              std::string(kMaxLocalPatchesBytes -
+                                              head.size() - k, 'x') +
+                              pair + "\",\"replacement\":\"r\"}]");
+    r = load_local_patches(path);
+    check(r.entries.empty() &&
+              r.error == "larger than 1024 KiB; the rest of the file, from "
+                         "line 1, column 2, is ignored",
+          ("local load: limit " + std::to_string(k) +
+           " bytes into a \\u escape pair").c_str());
+  }
+
+  // More than kMaxLocalPatches entries and over the size limit: the
+  // entries counted are those within the limit, so their number is a
+  // lower bound.
+  std::string many = "[\n";
+  size_t within = 0;     // entries that end within the limit
+  size_t many_cut = 0;   // line of the entry the limit cuts
+  for (size_t i = 0; i < 200; ++i) {
+    if (i > 0) many += ",\n";
+    const size_t start = many.size();
+    many += local_entry("e" + std::to_string(i), "o" + std::to_string(i),
+                        std::string(8000, 'r'));
+    if (many.size() <= kMaxLocalPatchesBytes) {
+      ++within;
+    } else if (many_cut == 0 && start < kMaxLocalPatchesBytes) {
+      many_cut = i + 2;
+    }
+  }
+  write_test_file(path, many + "]");
+  r = load_local_patches(path);
+  check(many_cut != 0 && within > kMaxLocalPatches + 1 &&
+            r.entries.size() == kMaxLocalPatches &&
+            r.error == "more than 100 entries; at least " +
+                           std::to_string(within - kMaxLocalPatches) +
+                           " after the first 100, from line 102, column 1, "
+                           "are ignored; larger than 1024 KiB; the rest of "
+                           "the file, from line " +
+                           std::to_string(many_cut) + ", column 1, is ignored",
+        "local load: too many entries and oversized");
 
   // An array closed within the limit is used in full.
   write_test_file(path, "[" + local_entry("a", "x=1;", "x=2;") + "]" +

@@ -78,10 +78,13 @@ struct LocalPatches {
 /// LocalPatch does not allow, or malformed JSON is kept with its error,
 /// and parsing goes on at the next entry.  After malformed JSON that
 /// happens only where the end of the broken entry can be found by its
-/// quotes and brackets and a ',' or ']' follows it; otherwise the rest of
-/// the text is not read and is reported in LocalPatches::error, as are the
-/// entries after the first kMaxLocalPatches.  Text that is not an array
-/// has no entries and an error.
+/// quotes and brackets, a ',' or ']' follows it, and the text up to it
+/// holds no '{' that starts like an entry (a '{' followed by one of the
+/// four keys and ':', as the next entry would after a missing or extra
+/// '"'); otherwise the rest of the text is not read and is reported in
+/// LocalPatches::error, as are the entries after the first
+/// kMaxLocalPatches.  Text that is not an array has no entries and an
+/// error.
 LocalPatches parse_local_patches(const std::string& text);
 
 /// Read and parse the local patches file at @p path.  A file that does not
