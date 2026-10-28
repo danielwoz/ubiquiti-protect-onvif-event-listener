@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <mutex>  // NOLINT(build/c++11)
 #include <set>
 #include <sstream>
 #include <string>
@@ -185,6 +186,25 @@ std::string maybe_rewrite_dahua_snapshot_url(const std::string& camera_type,
   return original_url.substr(0, path_start) + "/cgi-bin/snapshot.cgi";
 }
 
+bool LoggedLines::changed(const std::string& camera_id,
+                          const std::vector<std::string>& lines) {
+  std::lock_guard<std::mutex> lk(mu_);
+  auto it = lines_.find(camera_id);
+  if (it != lines_.end() && it->second == lines) return false;
+  lines_[camera_id] = lines;
+  return true;
+}
+
+void LoggedLines::retain(const std::set<std::string>& camera_ids) {
+  std::lock_guard<std::mutex> lk(mu_);
+  for (auto it = lines_.begin(); it != lines_.end();) {
+    if (camera_ids.count(it->first) == 0)
+      it = lines_.erase(it);
+    else
+      ++it;
+  }
+}
+
 }  // namespace internal
 
 // ---------------------------------------------------------------------------
@@ -217,6 +237,11 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     PQclear(res);
     return absl::InternalError("unifi::load_cameras query: " + err);
   }
+
+  // Each camera's stream configuration and snapshotUrl rewrite are logged
+  // on the first load and when they change, not on every periodic reload.
+  static internal::LoggedLines* const logged = new internal::LoggedLines();
+  std::set<std::string> loaded_ids;
 
   std::vector<onvif::CameraConfig> cameras;
   int nrows = PQntuples(res);
@@ -281,6 +306,8 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     if (!port.empty() && port != "80" && port != "0")
       ip += ":" + port;
 
+    std::vector<std::string> info_lines;
+
     // Auto-fix the well-known Dahua/Amcrest "advertises /onvif/snapshot but
     // serves from /cgi-bin/snapshot.cgi" trap (issue #32).  The manual
     // --camera_snapshot_urls flag still wins because it applies after this
@@ -289,9 +316,9 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
       const std::string fixed =
           internal::maybe_rewrite_dahua_snapshot_url(camera_type, snapshot_url);
       if (fixed != snapshot_url) {
-        LOG(INFO) << "[unifi_camera_config] rewriting snapshotUrl for "
-                  << camera_type << " (" << ip << "): "
-                  << snapshot_url << " -> " << fixed;
+        info_lines.push_back("[unifi_camera_config] rewriting snapshotUrl for " +
+                             camera_type + " (" + ip + "): " + snapshot_url +
+                             " -> " + fixed);
         snapshot_url = fixed;
       }
     }
@@ -383,7 +410,7 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
         if (bitrate_bps > 0) os << " " << (bitrate_bps / 1000) << "kbps";
         if (idr_sec > 0) os << " IDR=" << idr_sec << "s";
         os << " " << rc;
-        LOG(INFO) << os.str();
+        info_lines.push_back(os.str());
       };
 
       size_t depth = 0;
@@ -402,6 +429,11 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
       }
     }
 
+    loaded_ids.insert(id_c);
+    if (logged->changed(id_c, info_lines)) {
+      for (const std::string& line : info_lines) LOG(INFO) << line;
+    }
+
     onvif::CameraConfig cam;
     cam.id       = std::string(id_c);
     cam.mac      = mac_c ? std::string(mac_c) : std::string();
@@ -417,6 +449,7 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
 
     cameras.push_back(cam);
   }
+  logged->retain(loaded_ids);
 
   PQclear(res);
   return cameras;

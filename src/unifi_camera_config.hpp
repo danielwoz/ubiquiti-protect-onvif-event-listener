@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <map>
+#include <mutex>  // NOLINT(build/c++11)
 #include <set>
 #include <string>
 #include <vector>
@@ -74,6 +75,24 @@ std::string pg_array(const std::vector<std::string>& ids);
 /// Exposed for testing.
 std::string maybe_rewrite_dahua_snapshot_url(const std::string& camera_type,
                                               const std::string& original_url);
+
+/// The informational lines last logged for each camera, so that a reload
+/// logs a camera's stream configuration and snapshotUrl rewrite only on
+/// the first load and when they change.  Thread-safe.  Exposed for testing.
+class LoggedLines {
+ public:
+  /// Stores @p lines for @p camera_id.  True when they differ from the
+  /// lines stored before, or none were.
+  bool changed(const std::string& camera_id, const std::vector<std::string>& lines);
+
+  /// Forgets every camera not in @p camera_ids, so one that is removed and
+  /// comes back is logged again.
+  void retain(const std::set<std::string>& camera_ids);
+
+ private:
+  std::mutex mu_;
+  std::map<std::string, std::vector<std::string>> lines_;
+};
 
 }  // namespace internal
 

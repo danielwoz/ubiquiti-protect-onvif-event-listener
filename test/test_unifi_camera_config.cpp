@@ -224,6 +224,33 @@ static void test_dahua_rewrite_empty_inputs() {
         "dahua-rewrite: empty type does not match");
 }
 
+// ---------------------------------------------------------------
+// LoggedLines
+// ---------------------------------------------------------------
+static void test_logged_lines_change_only() {
+  unifi::internal::LoggedLines logged;
+  const std::vector<std::string> streams = {"cam ch0: 1920x1080 h264", "cam ch1: 640x360 h264"};
+  check(logged.changed("a", streams), "logged-lines: first load logs");
+  check(!logged.changed("a", streams), "logged-lines: same lines on a reload stay quiet");
+  check(logged.changed("b", streams), "logged-lines: each camera is tracked on its own");
+  const std::vector<std::string> new_bitrate = {"cam ch0: 1920x1080 h264 4096kbps",
+                                                "cam ch1: 640x360 h264"};
+  check(logged.changed("a", new_bitrate), "logged-lines: a changed line logs again");
+  check(!logged.changed("a", new_bitrate), "logged-lines: and then stays quiet");
+  check(logged.changed("a", {}), "logged-lines: losing every line is a change");
+  check(!logged.changed("a", {}), "logged-lines: no lines twice stays quiet");
+}
+
+static void test_logged_lines_retain() {
+  unifi::internal::LoggedLines logged;
+  const std::vector<std::string> lines = {"cam ch0: 1920x1080 h264"};
+  logged.changed("a", lines);
+  logged.changed("b", lines);
+  logged.retain({"b"});
+  check(logged.changed("a", lines), "logged-lines: a camera that comes back logs again");
+  check(!logged.changed("b", lines), "logged-lines: a retained camera stays quiet");
+}
+
 int main() {
   test_build_connstr_default();
   test_build_connstr_with_password();
@@ -249,6 +276,9 @@ int main() {
   test_dahua_rewrite_false_positive_guard();
   test_dahua_rewrite_malformed_url();
   test_dahua_rewrite_empty_inputs();
+
+  test_logged_lines_change_only();
+  test_logged_lines_retain();
 
   std::cout << "test_unifi_camera_config: "
             << g_pass << " passed, " << g_fail << " failed\n";
