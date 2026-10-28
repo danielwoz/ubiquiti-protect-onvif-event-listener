@@ -596,8 +596,8 @@ channel list with each suite's current version, read by the Windows
 installer) in the same gh-pages commit, using `scripts/gen_channels_json.py`
 and `gh-pages/channels.meta.json` from `main`. The same commit copies
 `main`'s `gh-pages/install.sh` to `install.sh` (the `curl … | sh` installer)
-unless it fails `sh -n`, which leaves the published copy and an error
-annotation on the run. After a promotion, re-run the
+unless it is missing or fails `sh -n`, which leaves the published copy and an
+error annotation on the run. After a promotion, re-run the
 step 6 check below for the destination suite. "Latest (alpha)" is only the
 installer's label for `early-access`; there is no `latest` suite. Labels,
 descriptions and the default channel live in `gh-pages/channels.meta.json`;
@@ -677,9 +677,10 @@ If step 6 shows an old version or a 404, check the release-deb run's
 **Actions → Channel manifest → Run workflow** (`channels-manifest.yml`),
 which regenerates `channels.json` from the apt suites, copies `main`'s
 `gh-pages/install.sh`, and commits only what changed. If the published
-`install.sh` still differs from `main`'s, look for a `fails sh -n` error on
-that run and fix `gh-pages/install.sh` on `main`; the push re-runs the
-workflow. Never edit `channels.json` or `install.sh` on gh-pages by hand.
+`install.sh` still differs from `main`'s, look for an `install.sh` error
+(`is missing` or `fails sh -n`) on that run and fix `gh-pages/install.sh` on
+`main`; the push re-runs the workflow. Never edit `channels.json` or
+`install.sh` on gh-pages by hand.
 
 ## Command-line flags (runtime)
 

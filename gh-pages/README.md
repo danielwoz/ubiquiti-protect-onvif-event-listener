@@ -131,10 +131,13 @@ on `main`; the package also ships that file as
   with `channels.json` made only when either changed. It always comes from
   `main`, never from a tag, so re-running an old release does not bring
   back an old installer.
-- **Syntax gate.** A copy that fails `sh -n` is not published: the copy
-  already on gh-pages stays and the run shows an error annotation
-  (`channels-manifest.yml` also fails the run). `//test:test_debian_scripts`
-  runs the same check in CI.
+- **Syntax gate.** A copy that is missing or fails `sh -n` is not
+  published: the copy already on gh-pages stays and the run shows an error
+  annotation (`channels-manifest.yml` also fails the run).
+  `//test:test_debian_scripts` runs the same check in CI. In
+  `channels-manifest.yml` the two files are published independently, so a
+  `channels.json` the generator cannot build does not hold back the
+  installer, and the other way round.
 - Never edit `install.sh` on gh-pages by hand; change it here and push.
 
 Check the published copy against `main` with:

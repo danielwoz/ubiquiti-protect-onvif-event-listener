@@ -50,25 +50,37 @@ jobs:
             gh-pages/install.sh
           sparse-checkout-cone-mode: false
 
-      # An install.sh that fails `sh -n` is not published: the copy already
-      # on gh-pages stays, channels.json is still committed, and the run
-      # fails so the error is seen.
+      # Each file is published on its own: an install.sh that is missing or
+      # fails `sh -n`, or a channels.json the generator cannot build, leaves
+      # that file's published copy as it is, the other is still committed,
+      # and the run fails so the error is seen.
       - name: Regenerate channels.json and publish install.sh
         run: |
           git -C apt config user.name "onvif-recorder-release-bot"
           git -C apt config user.email "noreply@github.com"
           MAIN_SHA=$(git -C src rev-parse --short HEAD)
           cd apt
-          python3 ../src/scripts/gen_channels_json.py --apt-root . \
-            --meta ../src/gh-pages/channels.meta.json --out channels.json
+          json_ok=true
+          if ! python3 ../src/scripts/gen_channels_json.py --apt-root . \
+              --meta ../src/gh-pages/channels.meta.json --out channels.json; then
+            json_ok=false
+            echo "::error::channels.json could not be regenerated from main ($MAIN_SHA); the published channels.json is unchanged"
+          fi
           installer_ok=true
-          if sh -n ../src/gh-pages/install.sh; then
+          if [ ! -f ../src/gh-pages/install.sh ]; then
+            installer_ok=false
+            echo "::error::gh-pages/install.sh is missing on main ($MAIN_SHA); the published install.sh is unchanged"
+          elif sh -n ../src/gh-pages/install.sh; then
             install -m 0755 ../src/gh-pages/install.sh install.sh
           else
             installer_ok=false
             echo "::error::gh-pages/install.sh on main ($MAIN_SHA) fails sh -n; the published install.sh is unchanged"
           fi
-          git add channels.json install.sh
+          for f in channels.json install.sh; do
+            if [ -e "$f" ]; then
+              git add "$f"
+            fi
+          done
           json=false
           installer=false
           git diff --cached --quiet -- channels.json || json=true
@@ -85,4 +97,6 @@ jobs:
           else
             echo "channels.json and install.sh are unchanged"
           fi
-          [ "$installer_ok" = true ]
+          if [ "$json_ok" != true ] || [ "$installer_ok" != true ]; then
+            exit 1
+          fi

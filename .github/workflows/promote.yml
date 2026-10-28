@@ -67,9 +67,9 @@ jobs:
       # channels.json is regenerated in the same gh-pages commit as the
       # reprepro change; its versions are read from the resulting Packages
       # files, not from the version input.  main's install.sh goes into the
-      # same commit; one that fails `sh -n` is left out with an error
-      # annotation, keeping the published copy, and does not hold up the
-      # promotion.
+      # same commit; one that is missing or fails `sh -n` is left out with an
+      # error annotation, keeping the published copy, and does not hold up
+      # the promotion.
       - name: Promote
         run: |
           git -C apt config user.name "onvif-recorder-release-bot"
@@ -80,7 +80,9 @@ jobs:
             onvif-recorder "${{ inputs.version }}"
           python3 ../src/scripts/gen_channels_json.py --apt-root . \
             --meta ../src/gh-pages/channels.meta.json --out channels.json
-          if sh -n ../src/gh-pages/install.sh; then
+          if [ ! -f ../src/gh-pages/install.sh ]; then
+            echo "::error::gh-pages/install.sh is missing on main ($MAIN_SHA); the published install.sh is unchanged"
+          elif sh -n ../src/gh-pages/install.sh; then
             install -m 0755 ../src/gh-pages/install.sh install.sh
           else
             echo "::error::gh-pages/install.sh on main ($MAIN_SHA) fails sh -n; the published install.sh is unchanged"
