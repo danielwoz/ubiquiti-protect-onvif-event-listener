@@ -286,12 +286,20 @@ Protect, so they come back by themselves after a Protect or UniFi OS update.
   five minutes after it changes the file. That restart counts towards the four automatic
   Protect restarts allowed per day. With `--auto_heal_protect=false`, restart Protect
   yourself.
-- The **Status** card on the admin page shows how many entries are applied and names any that
-  are not. Log lines start with `[ui_patch] local patch`. An entry that doesn't apply is
-  logged as a warning.
-- If the file can't be read or isn't valid (bad JSON, a missing or unknown key, a `file`
-  other than `service.js`), none of its entries is applied, and the error is logged and shown
-  on the Status card. onvif-recorder's own patches still apply.
+- The **Status** card on the admin page shows how many entries are applied, names any that
+  are not and says why. Log lines start with `[ui_patch] local patch`. An entry that doesn't
+  apply is logged as an error when that first happens or the reason changes, not again each
+  time onvif-recorder re-patches Protect.
+- Each entry stands alone. An entry that isn't valid (bad JSON, a missing or unknown key, a
+  `file` other than `service.js`) is skipped with its own error, giving its line and column,
+  and the other entries still apply.
+- Where broken JSON makes it unclear where an entry ends (for example a missing closing `"`),
+  the entries before it still apply and the rest of the file is ignored, with one error for
+  it. Only the first 100 entries and the first 1 MiB of the file are used; the rest is
+  ignored the same way.
+- If the file can't be read at all, or isn't a JSON array, none of its entries is applied.
+  Errors about the file are logged and shown on the Status card too. onvif-recorder's own
+  patches still apply.
 - The file is on `/data`, so UniFi OS updates and `apt purge` leave it in place.
 
 **Caveats:**

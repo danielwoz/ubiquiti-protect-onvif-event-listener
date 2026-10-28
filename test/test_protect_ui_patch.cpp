@@ -32,9 +32,16 @@ using namespace protect_ui;  // NOLINT(build/namespaces)
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>  // NOLINT(build/c++11)
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+#include "absl/log/log_entry.h"
+#include "absl/log/log_sink.h"
+#include "absl/log/log_sink_registry.h"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -904,7 +911,9 @@ static void test_patch_outcomes() {
             std::string(patch_outcome_name(PatchOutcome::kNotApplicable)) ==
                 "not_applicable" &&
             std::string(patch_outcome_name(PatchOutcome::kAmbiguous)) ==
-                "ambiguous",
+                "ambiguous" &&
+            std::string(patch_outcome_name(PatchOutcome::kInvalid)) ==
+                "invalid",
         "outcomes: names");
 }
 
@@ -984,14 +993,66 @@ static std::string local_entry(const std::string& name,
          ",\"replacement\":" + json_quote(replacement) + "}";
 }
 
-// Whether parsing @p text fails with a message containing @p part.
-static bool parse_fails_with(const std::string& text, const std::string& part) {
-  const auto r = parse_local_patches(text);
-  if (r.ok()) return false;
-  const std::string m(r.status().message());
-  if (m.find(part) != std::string::npos) return true;
-  std::cerr << "  message was: " << m << '\n';
-  return false;
+// Whether a valid entry @p e has @p name and @p replacement.
+static bool valid_entry(const LocalPatch& e, const std::string& name,
+                        const std::string& replacement) {
+  return e.error.empty() && e.name == name && e.file == "service.js" &&
+         e.replacement == replacement;
+}
+
+// Whether @p r has no error and its entries are valid entries named as in
+// @p names.
+static bool all_valid(const LocalPatches& r,
+                      const std::vector<std::string>& names) {
+  if (!r.error.empty() || r.entries.size() != names.size()) return false;
+  for (size_t i = 0; i < names.size(); ++i) {
+    if (!r.entries[i].error.empty() || r.entries[i].name != names[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Whether @p bad, on line 2 between two valid entries, is the only entry
+// skipped: named @p name, with only its name kept and an error containing
+// @p part, while the file has no error.
+static bool skipped_with(const std::string& bad, const std::string& part,
+                         const std::string& name = "entry 2") {
+  const std::string text = "[" + local_entry("a", "x=1;", "x=2;") + ",\n" +
+                           bad + ",\n" + local_entry("c", "z=1;", "z=2;") +
+                           "]";
+  const LocalPatches r = parse_local_patches(text);
+  const bool ok =
+      r.error.empty() && r.entries.size() == 3 &&
+      valid_entry(r.entries[0], "a", "x=2;") &&
+      valid_entry(r.entries[2], "c", "z=2;") && r.entries[1].name == name &&
+      r.entries[1].file.empty() && r.entries[1].original.empty() &&
+      r.entries[1].replacement.empty() &&
+      r.entries[1].error.find(part) != std::string::npos;
+  if (!ok) {
+    std::cerr << "  file error: " << r.error
+              << "\n  entries: " << r.entries.size() << '\n';
+    for (const LocalPatch& e : r.entries) {
+      std::cerr << "    " << e.name << ": " << e.error << '\n';
+    }
+  }
+  return ok;
+}
+
+// Whether parsing @p text keeps the valid entries named @p names and
+// reports the file error @p error exactly.
+static bool stops_with(const std::string& text,
+                       const std::vector<std::string>& names,
+                       const std::string& error) {
+  LocalPatches r = parse_local_patches(text);
+  const std::string got = r.error;
+  r.error.clear();
+  const bool ok = all_valid(r, names) && got == error;
+  if (!ok) {
+    std::cerr << "  file error: " << got << "\n  entries: " << r.entries.size()
+              << '\n';
+  }
+  return ok;
 }
 
 // The file format: an array of objects with four string members.
@@ -1003,121 +1064,325 @@ static void test_parse_local_patches() {
       "  {\"file\": \"service.js\", \"original\": \"y\\u00e9\\ud83d\\ude00"
       "\\n\\\"\\\\\\/\", \"replacement\": \"z\"}\n"
       "]\n";
-  const auto r = parse_local_patches(text);
-  check(r.ok() && r->size() == 2, "local parse: two entries");
-  if (r.ok() && r->size() == 2) {
-    const LocalPatch& a = (*r)[0];
-    const LocalPatch& b = (*r)[1];
+  const LocalPatches r = parse_local_patches(text);
+  check(all_valid(r, {"a", "entry 2"}), "local parse: two entries");
+  if (r.entries.size() == 2) {
+    const LocalPatch& a = r.entries[0];
+    const LocalPatch& b = r.entries[1];
     check(a.name == "a" && a.file == "service.js" && a.original == "x=1;" &&
               a.replacement == "x=2;",
           "local parse: first entry");
-    check(b.name == "entry 2", "local parse: default name");
     check(b.original == "y\xC3\xA9\xF0\x9F\x98\x80\n\"\\/",
           "local parse: escapes and surrogate pairs decoded");
   }
   for (const char* empty : {"", " \n\t", "\xEF\xBB\xBF", "[]", " [ ]\n"}) {
-    const auto e = parse_local_patches(empty);
-    check(e.ok() && e->empty(), "local parse: no entries");
+    check(all_valid(parse_local_patches(empty), {}),
+          "local parse: no entries");
   }
-
-  const std::string ok_entry = local_entry("a", "x=1;", "x=2;");
-  check(parse_fails_with("{\"name\":\"a\"}", "expected '['"),
-        "local parse: not an array");
-  check(parse_fails_with("[" + ok_entry + " " + ok_entry + "]",
-                         "line 1, column 74: expected ',' or ']'"),
-        "local parse: missing comma, with position");
-  check(parse_fails_with("[\n" + ok_entry + ",\n\n  {\"name\" \"b\"}]",
-                         "line 4, column 11: expected ':'"),
-        "local parse: position on a later line");
-  check(parse_fails_with("[\"x\"]", "expected '{'"),
-        "local parse: entry not an object");
-  check(parse_fails_with("[" + ok_entry + ",]", "expected '{'"),
-        "local parse: trailing comma");
-  check(parse_fails_with("[{\"file\":\"service.js\",\"original\":1,"
-                         "\"replacement\":\"b\"}]",
-                         "the value of \"original\" must be a string"),
-        "local parse: non-string value");
-  check(parse_fails_with("[{\"enabled\":\"false\"}]",
-                         "unknown key \"enabled\""),
-        "local parse: unknown key");
-  check(parse_fails_with("[{\"name\":\"a\",\"name\":\"b\"}]",
-                         "\"name\" given twice"),
-        "local parse: duplicate key");
-  check(parse_fails_with("[{\"original\":\"a\",\"replacement\":\"b\"}]",
-                         "entry 1 (line 1, column 2): \"file\" is missing"),
-        "local parse: file missing");
-  check(parse_fails_with("[" + local_entry("ui", "a", "b", "swai.js") + "]",
-                         "entry 1 \"ui\" (line 1, column 2): \"file\" is "
-                         "\"swai.js\"; only \"service.js\" can be patched"),
-        "local parse: wrong file");
-  check(parse_fails_with("[{\"file\":\"service.js\",\"replacement\":\"b\"}]",
-                         "\"original\" is missing or empty"),
-        "local parse: original missing");
-  check(parse_fails_with("[" + local_entry("a", "", "b") + "]",
-                         "\"original\" is missing or empty"),
-        "local parse: original empty");
-  check(parse_fails_with("[" + local_entry("a", "x", "") + "]",
-                         "\"replacement\" is missing or empty"),
-        "local parse: replacement empty");
-  check(parse_fails_with("[" + local_entry("a", "x=1", "x=1;y=2") + "]",
-                         "\"replacement\" contains \"original\""),
-        "local parse: replacement contains original");
-  check(parse_fails_with("[{\"name\":\"a\",\"file\":\"service.js\","
-                         "\"original\":\"x\\u0000\",\"replacement\":\"y\"}]",
-                         "\\u0000"),
-        "local parse: NUL character");
-  check(parse_fails_with("[{\"name\":\"a", "string not terminated"),
-        "local parse: unterminated string");
-  check(parse_fails_with("[{\"name\":\"a\nb\"}]", "control character"),
-        "local parse: raw line break in a string");
-  check(parse_fails_with("[{\"name\":\"\\q\"}]", "unknown escape"),
-        "local parse: unknown escape");
-  check(parse_fails_with("[{\"name\":\"\\ud83d\"}]", "unpaired"),
-        "local parse: unpaired surrogate");
-  check(parse_fails_with("[{\"name\":\"\\u12\"}]", "four hex digits"),
-        "local parse: short \\u escape");
-  check(parse_fails_with("[] x", "unexpected text after the array"),
-        "local parse: trailing text");
-
-  std::string many = "[";
-  for (size_t i = 0; i <= kMaxLocalPatches; ++i) {
-    if (i > 0) many += ',';
-    many += local_entry("e" + std::to_string(i), "o" + std::to_string(i),
-                        "r" + std::to_string(i));
-  }
-  many += "]";
-  check(parse_fails_with(many, "more than 100 entries"),
-        "local parse: too many entries");
 }
 
-// A missing file holds no entries; a directory or an oversized file is an
-// error.
+// Each entry stands alone: one that cannot be used is skipped with its own
+// error (and position) and keeps only its name, and the entries around it
+// are still read.
+static void test_local_patch_entry_errors() {
+  // Valid JSON, not a valid entry.
+  check(skipped_with("\"x\"", "line 2, column 1: each entry must be an object"),
+        "local skip: string entry");
+  check(skipped_with("42", "each entry must be an object"),
+        "local skip: number entry");
+  check(skipped_with("null", "each entry must be an object"),
+        "local skip: null entry");
+  check(skipped_with("[1, {\"a\": \"]\"}]", "each entry must be an object"),
+        "local skip: array entry");
+  check(skipped_with("{\"enabled\":\"false\"}",
+                     "line 2, column 2: unknown key \"enabled\" (allowed: "
+                     "name, file, original, replacement)"),
+        "local skip: unknown key");
+  check(skipped_with("{\"name\":\"n\",\"name\":\"m\"}",
+                     "line 2, column 13: \"name\" given twice", "n"),
+        "local skip: duplicate key, first name kept");
+  check(skipped_with("{\"name\":\"n\",\"file\":\"service.js\",\"original\":1,"
+                     "\"replacement\":\"b\"}",
+                     "the value of \"original\" must be a string", "n"),
+        "local skip: non-string value");
+  check(skipped_with("{\"name\":\"n\",\"file\":[\"x\",{\"y\":\"]\"}],"
+                     "\"original\":\"o\",\"replacement\":\"r\"}",
+                     "the value of \"file\" must be a string", "n"),
+        "local skip: nested value skipped by its brackets");
+  check(skipped_with("{}", "line 2, column 1: \"file\" is missing; use "
+                           "\"service.js\""),
+        "local skip: empty object");
+  check(skipped_with("{\"original\":\"a\",\"replacement\":\"b\"}",
+                     "line 2, column 1: \"file\" is missing"),
+        "local skip: file missing");
+  check(skipped_with(local_entry("ui", "a", "b", "swai.js"),
+                     "line 2, column 1: \"file\" is \"swai.js\"; only "
+                     "\"service.js\" can be patched",
+                     "ui"),
+        "local skip: wrong file");
+  check(skipped_with("{\"file\":\"service.js\",\"replacement\":\"b\"}",
+                     "\"original\" is missing or empty"),
+        "local skip: original missing");
+  check(skipped_with(local_entry("n", "", "b"),
+                     "\"original\" is missing or empty", "n"),
+        "local skip: original empty");
+  check(skipped_with(local_entry("n", "x", ""),
+                     "\"replacement\" is missing or empty", "n"),
+        "local skip: replacement empty");
+  check(skipped_with(local_entry("n", "x=1", "x=1;y=2"),
+                     "\"replacement\" contains \"original\"", "n"),
+        "local skip: replacement contains original");
+  check(skipped_with("{\"name\":\"n\",\"file\":\"service.js\","
+                     "\"original\":\"x\\u0000\",\"replacement\":\"y\"}",
+                     "contains a \\u0000 character", "n"),
+        "local skip: NUL character");
+  check(skipped_with(local_entry("a\nb", "o", "r", "x\"y"),
+                     "\"file\" is \"x\\\"y\"", "a\nb"),
+        "local skip: values quoted in the error");
+
+  // Malformed JSON inside an entry: skipped up to its closing brace.
+  check(skipped_with("{\"name\":\"n\",\"file\":\"service.js\",\"original\":"
+                     "\"a\nb\",\"replacement\":\"c\"}",
+                     "not valid JSON at line 2, column 46: line break or "
+                     "control character inside a string",
+                     "n"),
+        "local skip: raw line break in a string");
+  check(skipped_with("{\"name\":\"\\q\"}", "unknown escape"),
+        "local skip: unknown escape, name not read");
+  check(skipped_with("{\"name\":\"n\",\"original\":\"\\ud83d\"}", "unpaired",
+                     "n"),
+        "local skip: unpaired surrogate");
+  check(skipped_with("{\"name\":\"\\u12\"}", "four hex digits"),
+        "local skip: short \\u escape");
+  check(skipped_with("{\"name\" \"b\"}",
+                     "not valid JSON at line 2, column 9: expected ':'"),
+        "local skip: missing colon, with position");
+  check(skipped_with("{\"name\":\"n\" \"file\":\"service.js\"}",
+                     "expected ',' or '}'", "n"),
+        "local skip: missing comma between members");
+  check(skipped_with("{\"name\":\"n\",}", "expected a string", "n"),
+        "local skip: trailing comma in an object");
+  check(skipped_with("{\"name\":\"n\\\"}{[\",\"oops\":\"x\"}",
+                     "unknown key \"oops\"", "n\"}{["),
+        "local skip: brackets and escaped quote inside a string");
+  check(skipped_with("{'name':'n'}", "expected a string"),
+        "local skip: single quotes");
+  check(skipped_with("{\"name\":\"n\",\"file\":\"service.js\",\"original\":"
+                     "\"[{\",\"replacement\":\"x\" \"y\"}",
+                     "expected ',' or '}'", "n"),
+        "local skip: brackets inside strings of a broken entry");
+
+  // Two broken entries next to each other, and one first and last.
+  const LocalPatches r = parse_local_patches(
+      "[{\"x\":\"1\"},{\"y\" 2},\n" + local_entry("a", "o", "r") +
+      ",{\"name\":\"z\"}]");
+  check(r.error.empty() && r.entries.size() == 4 &&
+            r.entries[0].name == "entry 1" &&
+            r.entries[0].error.find("unknown key \"x\"") != std::string::npos &&
+            r.entries[1].name == "entry 2" &&
+            r.entries[1].error.find("expected ':'") != std::string::npos &&
+            valid_entry(r.entries[2], "a", "r") &&
+            r.entries[3].name == "z" &&
+            r.entries[3].error.find("\"file\" is missing") !=
+                std::string::npos,
+        "local skip: broken entries first, together and last");
+}
+
+// Where the end of a broken entry cannot be found, or text follows an
+// entry that is not ',' or ']', the entries before it are kept and the
+// rest of the file is one error.
+static void test_local_patches_stop() {
+  const std::string a = local_entry("a", "x=1;", "x=2;");
+  const std::string b = local_entry("b", "y=1;", "y=2;");
+  check(stops_with("{\"name\":\"a\"}", {},
+                   "not valid JSON at line 1, column 1: expected '[' (the "
+                   "file holds an array of entries)"),
+        "local stop: not an array");
+  check(stops_with("[" + a + " " + b + "]", {"a"},
+                   "not valid JSON at line 1, column 74: expected ',' or "
+                   "']'; the rest of the file, from line 1, column 74, is "
+                   "ignored"),
+        "local stop: missing comma between entries");
+  check(stops_with("[" + a + ",\n{\"name\":\"b", {"a"},
+                   "not valid JSON at line 2, column 11: string not "
+                   "terminated; the rest of the file, from line 2, column 1, "
+                   "is ignored"),
+        "local stop: unterminated string at the end");
+  check(stops_with("[" + a + ",\n{\"name\":\"b, \"file\":\"service.js\","
+                   "\"original\":\"o\",\"replacement\":\"r\"},\n" + b + "]",
+                   {"a"},
+                   "not valid JSON at line 2, column 14: expected ',' or "
+                   "'}'; the rest of the file, from line 2, column 1, is "
+                   "ignored"),
+        "local stop: unterminated string in a middle entry");
+  check(stops_with("[" + a + ",\n{\"name\":\"b\" \"x\"} y,\n" + b + "]", {"a"},
+                   "not valid JSON at line 2, column 13: expected ',' or "
+                   "'}'; the rest of the file, from line 2, column 1, is "
+                   "ignored"),
+        "local stop: text after a broken entry");
+  check(stops_with("[" + a + ",\n{\"name\":\"b\",\"file\":[},\n" + b + "]",
+                   {"a"},
+                   "line 2, column 20: the value of \"file\" must be a "
+                   "string; the rest of the file, from line 2, column 1, is "
+                   "ignored"),
+        "local stop: brackets that do not match");
+  check(stops_with("[" + a + ",\n:,\n" + b + "]", {"a"},
+                   "not valid JSON at line 2, column 1: expected '{' (each "
+                   "entry is an object); the rest of the file, from line 2, "
+                   "column 1, is ignored"),
+        "local stop: text between entries");
+  check(stops_with("[" + a + ",]", {"a"},
+                   "not valid JSON at line 1, column 74: expected '{' (each "
+                   "entry is an object); the rest of the file, from line 1, "
+                   "column 74, is ignored"),
+        "local stop: trailing comma");
+  check(stops_with("[" + a + "]\nx", {"a"},
+                   "not valid JSON at line 2, column 1: unexpected text "
+                   "after the array; the rest of the file, from line 2, "
+                   "column 1, is ignored"),
+        "local stop: text after the array");
+  check(stops_with("[" + a + "\n", {"a"},
+                   "not valid JSON at line 2, column 1: expected ',' or "
+                   "']'; the rest of the file, from line 2, column 1, is "
+                   "ignored"),
+        "local stop: file ends after an entry");
+  check(stops_with("[", {},
+                   "not valid JSON at line 1, column 2: expected '{' (each "
+                   "entry is an object); the rest of the file, from line 1, "
+                   "column 2, is ignored"),
+        "local stop: file ends after '['");
+}
+
+// Of more than kMaxLocalPatches entries the first ones are used, valid or
+// not, and the rest is one error saying how many are ignored.
+static void test_local_patches_too_many() {
+  auto entries = [](size_t n, size_t invalid) {
+    std::string s = "[\n";
+    for (size_t i = 0; i < n; ++i) {
+      if (i > 0) s += ",\n";
+      s += i == invalid ? std::string("{\"name\":\"bad\" 1}")
+                        : local_entry("e" + std::to_string(i),
+                                      "o" + std::to_string(i),
+                                      "r" + std::to_string(i));
+    }
+    return s;
+  };
+  const size_t none = static_cast<size_t>(-1);
+
+  LocalPatches r = parse_local_patches(entries(kMaxLocalPatches, none) + "]");
+  check(r.error.empty() && r.entries.size() == kMaxLocalPatches,
+        "local many: 100 entries are all used");
+
+  r = parse_local_patches(entries(kMaxLocalPatches + 1, none) + "]");
+  check(r.entries.size() == kMaxLocalPatches &&
+            r.entries.back().name == "e99" &&
+            r.error == "more than 100 entries; the one after the first 100, "
+                       "from line 102, column 1, is ignored",
+        "local many: one ignored");
+
+  r = parse_local_patches(entries(kMaxLocalPatches + 3, 101) + "]");
+  check(r.entries.size() == kMaxLocalPatches &&
+            r.error == "more than 100 entries; the 3 after the first 100, "
+                       "from line 102, column 1, are ignored",
+        "local many: invalid entries among the ignored are counted");
+
+  r = parse_local_patches(entries(kMaxLocalPatches + 1, 49) + "]");
+  check(r.entries.size() == kMaxLocalPatches && r.entries[49].name == "bad" &&
+            !r.entries[49].error.empty() && r.entries[50].error.empty() &&
+            r.error.find("the one after the first 100") != std::string::npos,
+        "local many: an invalid entry counts towards the 100");
+
+  r = parse_local_patches(entries(kMaxLocalPatches + 2, none) +
+                          ",\n{\"name\":\"x");
+  check(r.entries.size() == kMaxLocalPatches &&
+            r.error == "more than 100 entries; the 2 after the first 100, "
+                       "from line 102, column 1, are ignored; not valid JSON "
+                       "at line 104, column 11: string not terminated; the "
+                       "rest of the file, from line 104, column 1, is ignored",
+        "local many: malformed JSON among the ignored");
+}
+
+// A missing file holds no entries and no error; one that cannot be read
+// holds no entries and an error.  Of an oversized file the entries that
+// end within the size limit are used.
 static void test_load_local_patches() {
   const std::string path = temp_dir() + "/test_local_patches_load.json";
   std::remove(path.c_str());
-  auto r = load_local_patches(path);
-  check(r.ok() && r->empty(), "local load: missing file has no entries");
+  LocalPatches r = load_local_patches(path);
+  check(r.entries.empty() && r.error.empty(),
+        "local load: missing file has no entries");
 
-  check(!load_local_patches(temp_dir()).ok(), "local load: directory");
+  r = load_local_patches(temp_dir());
+  check(r.entries.empty() && r.error == "not a regular file",
+        "local load: directory");
 
   write_test_file(path, std::string(kMaxLocalPatchesBytes + 1, ' '));
   r = load_local_patches(path);
-  check(!r.ok() && std::string(r.status().message()).find("larger than") !=
-                       std::string::npos,
+  check(r.entries.empty() &&
+            r.error == "larger than 1024 KiB; what follows its first 1024 "
+                       "KiB is ignored",
         "local load: oversized file");
   write_test_file(path, std::string(kMaxLocalPatchesBytes, ' '));
   r = load_local_patches(path);
-  check(r.ok() && r->empty(), "local load: file at the size limit");
+  check(r.entries.empty() && r.error.empty(),
+        "local load: file at the size limit");
 
   write_test_file(path, "[" + local_entry("a", "x=1;", "x=2;") + "]");
   r = load_local_patches(path);
-  check(r.ok() && r->size() == 1 && (*r)[0].replacement == "x=2;",
+  check(all_valid(r, {"a"}) && r.entries[0].replacement == "x=2;",
         "local load: entries read");
-  write_test_file(path, "[");
+  write_test_file(path, "[" + local_entry("a", "x=1;", "x=2;") + ",");
   r = load_local_patches(path);
-  check(!r.ok() && std::string(r.status().message()).find("not valid JSON") !=
-                       std::string::npos,
-        "local load: parse error");
+  check(r.entries.size() == 1 && r.entries[0].error.empty() &&
+            r.error.find("not valid JSON") != std::string::npos,
+        "local load: parse error keeps the entries before it");
+
+  // Entries of about 20 KiB, one per line: the limit cuts one of them.
+  std::string big = "[\n";
+  size_t whole = 0;      // entries that end within the limit
+  size_t cut_line = 0;   // line of the entry the limit cuts
+  for (size_t i = 0; i < 60; ++i) {
+    if (i > 0) big += ",\n";
+    const size_t start = big.size();
+    big += local_entry("e" + std::to_string(i), "o" + std::to_string(i),
+                       std::string(20000, 'r'));
+    if (big.size() <= kMaxLocalPatchesBytes) {
+      ++whole;
+    } else if (cut_line == 0 && start < kMaxLocalPatchesBytes) {
+      cut_line = i + 2;
+    }
+  }
+  big += "]\n";
+  check(cut_line != 0, "local load: the limit falls inside an entry");
+  write_test_file(path, big);
+  r = load_local_patches(path);
+  check(r.entries.size() == whole && whole > 40 &&
+            r.entries.back().error.empty() &&
+            r.entries.back().replacement == std::string(20000, 'r') &&
+            r.error == "larger than 1024 KiB; the rest of the file, from "
+                       "line " + std::to_string(cut_line) +
+                       ", column 1, is ignored",
+        "local load: entries within the limit used");
+
+  // Malformed JSON before the limit is reported as well.
+  write_test_file(path, "[" + local_entry("a", "x=1;", "x=2;") +
+                            ",\n{\"name\":\"b\" \"c\"} x,\n" +
+                            std::string(kMaxLocalPatchesBytes, ' ') + "]");
+  r = load_local_patches(path);
+  check(all_valid(LocalPatches{r.entries, ""}, {"a"}) &&
+            r.error == "not valid JSON at line 2, column 13: expected ',' or "
+                       "'}'; the rest of the file, from line 2, column 1, is "
+                       "ignored; the file is also larger than 1024 KiB",
+        "local load: oversized file with malformed JSON");
+
+  // An array closed within the limit is used in full.
+  write_test_file(path, "[" + local_entry("a", "x=1;", "x=2;") + "]" +
+                            std::string(kMaxLocalPatchesBytes, '\n'));
+  r = load_local_patches(path);
+  check(all_valid(LocalPatches{r.entries, ""}, {"a"}) &&
+            r.error == "larger than 1024 KiB; what follows its first 1024 "
+                       "KiB is ignored",
+        "local load: oversized after the array");
   std::remove(path.c_str());
 }
 
@@ -1125,14 +1390,30 @@ static void test_load_local_patches() {
 static void test_local_patches_json() {
   PatchReport rep;
   rep.local_patches_path = "/data/onvif-recorder/local-patches.json";
-  rep.local_patches = {{"say \"hi\"\n", PatchOutcome::kApplied},
-                       {"b", PatchOutcome::kNotApplicable}};
+  rep.local_patches = {
+      {"say \"hi\"\n", PatchOutcome::kApplied},
+      {"b", PatchOutcome::kNotApplicable},
+      {"entry 3", PatchOutcome::kInvalid,
+       "line 4, column 2: unknown key \"a\\\\b\"\t<x>"}};
   check(local_patches_json(rep) ==
             "{\"path\":\"/data/onvif-recorder/local-patches.json\","
             "\"error\":\"\",\"entries\":[{\"name\":\"say \\\"hi\\\"\\u000a\","
-            "\"outcome\":\"applied\"},{\"name\":\"b\",\"outcome\":"
-            "\"not_applicable\"}]}",
+            "\"outcome\":\"applied\",\"error\":\"\"},{\"name\":\"b\","
+            "\"outcome\":\"not_applicable\",\"error\":\"\"},{\"name\":"
+            "\"entry 3\",\"outcome\":\"invalid\",\"error\":\"line 4, column "
+            "2: unknown key \\\"a\\\\\\\\b\\\"\\u0009<x>\"}]}",
         "local json: entries");
+  // The output reads back as JSON: the error string decodes to the
+  // original text.
+  const std::string json = local_patches_json(rep);
+  std::string decoded;
+  JsonCursor c{json};
+  c.pos = json.find("\"line 4");
+  check(c.pos != std::string::npos &&
+            parse_json_string(&c, &decoded).ok() &&
+            decoded == rep.local_patches[2].error,
+        "local json: error string round-trips");
+
   PatchReport broken;
   broken.local_patches_path = "p";
   broken.local_patches_error = "not valid JSON at line 1, column 1: x\\y";
@@ -1142,9 +1423,97 @@ static void test_local_patches_json() {
         "local json: error");
 }
 
-// Local patches follow ours in patch_service_js(): each is reported, a
-// broken file applies none of them while ours still apply, and with a
-// verified .bak removing an entry restores the original text.
+// Each local patch not applied and the file's error are logged, a line
+// again only when the previous pass did not log it.
+static void test_local_patch_log_lines() {
+  PatchReport rep;
+  rep.local_patches_path = "/p.json";
+  rep.local_patches_error = "more than 100 entries; ...";
+  rep.local_patches = {{"ok", PatchOutcome::kApplied},
+                       {"same", PatchOutcome::kAlready},
+                       {"gone", PatchOutcome::kNotApplicable},
+                       {"twice", PatchOutcome::kAmbiguous},
+                       {"q\"\n", PatchOutcome::kInvalid, "line 1: bad"},
+                       {"later", PatchOutcome::kNotRun}};
+  const std::vector<std::string> lines = local_patch_errors(rep);
+  check(lines.size() == 4 &&
+            lines[0] == "local patches /p.json: more than 100 entries; ..." &&
+            lines[1].rfind("local patch \"gone\" not applied: its original "
+                           "text is not in service.js", 0) == 0 &&
+            lines[2] == "local patch \"twice\" not applied: its original text "
+                        "occurs more than once in service.js" &&
+            lines[3] == "local patch \"q\\\"\\u000a\" not applied: line 1: bad",
+        "local log: one line per error, names quoted");
+
+  PatchReport unreadable;
+  unreadable.local_patches_path = "/p.json";
+  unreadable.local_patches_error = "not a regular file";
+  check(local_patch_errors(unreadable) ==
+            std::vector<std::string>{"local patches /p.json: not a regular "
+                                     "file -- none of its entries is applied"},
+        "local log: unreadable file");
+  check(local_patch_errors(PatchReport{}).empty(), "local log: nothing");
+
+  std::set<std::string> last;
+  check(new_lines({"a", "b"}, &last) == std::vector<std::string>{"a", "b"},
+        "local log: first pass logs all");
+  check(new_lines({"a", "b"}, &last).empty(),
+        "local log: unchanged pass logs nothing");
+  check(new_lines({"a", "c"}, &last) == std::vector<std::string>{"c"},
+        "local log: changed line logged");
+  check(new_lines({"c"}, &last).empty() &&
+            new_lines({"a", "c"}, &last) == std::vector<std::string>{"a"},
+        "local log: line back after a pass without it logged again");
+}
+
+// The text of the ERROR lines logged while it is registered.
+class ErrorLines : public absl::LogSink {
+ public:
+  void Send(const absl::LogEntry& entry) override {
+    if (entry.log_severity() != absl::LogSeverity::kError) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    lines_.emplace_back(entry.text_message());
+  }
+  // The lines logged since the last call.
+  std::vector<std::string> take() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return std::exchange(lines_, {});
+  }
+
+ private:
+  std::mutex mu_;
+  std::vector<std::string> lines_;
+};
+
+// Repeated passes over unchanged local patches log their errors once.
+static void test_log_local_patches_once() {
+  ErrorLines sink;
+  absl::AddLogSink(&sink);
+  PatchReport rep;
+  rep.local_patches_path = "/p.json";
+  rep.local_patches = {{"ok", PatchOutcome::kApplied},
+                       {"gone", PatchOutcome::kNotApplicable},
+                       {"bad", PatchOutcome::kInvalid, "line 2, column 1: x"}};
+  log_local_patches(rep);
+  const std::vector<std::string> first = sink.take();
+  log_local_patches(rep);
+  const std::vector<std::string> second = sink.take();
+  rep.local_patches[2].error = "line 2, column 1: y";
+  log_local_patches(rep);
+  const std::vector<std::string> third = sink.take();
+  log_local_patches(PatchReport{});
+  absl::RemoveLogSink(&sink);
+  check(first.size() == 2 && second.empty(),
+        "local log once: logged on the first pass only");
+  check(third == std::vector<std::string>{"[ui_patch] local patch \"bad\" not "
+                                          "applied: line 2, column 1: y"},
+        "local log once: changed error logged again");
+}
+
+// Local patches follow ours in patch_service_js(): each is reported, the
+// valid ones apply while invalid ones are skipped, ours apply whatever the
+// file holds, and with a verified .bak removing an entry restores the
+// original text.
 static void test_local_patches_service_js() {
   const std::string path = temp_dir() + "/test_local_service.js";
   const std::string bak = path + ".bak";
@@ -1213,28 +1582,71 @@ static void test_local_patches_service_js() {
             rep.onvif_addressing == PatchOutcome::kAlready,
         "local: already, not applicable, ambiguous");
 
-  // A file that is not valid applies none of its entries; ours still
-  // apply.
-  write_test_file(lp, "[" + local_entry("a", "var A=1;", "var A=10;"));
+  // Invalid entries are skipped with their errors; the valid ones around
+  // them, and ours, still apply.
+  write_test_file(
+      lp, "[" + local_entry("a", "var A=1;", "var A=10;") + ",\n" +
+              local_entry("ui", "x", "y", "swai.js") + ",\n" +
+              "{\"name\":\"raw\",\"file\":\"service.js\",\"original\":\"var\n"
+              "C=3;\",\"replacement\":\"x\"},\n" +
+              local_entry("b", "var B=2;", "var B=20;") + ",\n" +
+              local_entry("gone", "var Z=9;", "var Z=90;") + "]");
+  write_test_file(path, original);
+  check(patch_service_js(path, opts, md5sums, &rep) == 3,
+        "local mixed: ours and the two valid entries written");
+  check(read_test_file(path) == wsa_ab, "local mixed: valid entries applied");
+  check(rep.local_patches_error.empty() && rep.local_patches.size() == 5 &&
+            rep.local_patches[0].outcome == PatchOutcome::kApplied &&
+            rep.local_patches[0].error.empty() &&
+            rep.local_patches[1].name == "ui" &&
+            rep.local_patches[1].outcome == PatchOutcome::kInvalid &&
+            rep.local_patches[1].error ==
+                "line 2, column 1: \"file\" is \"swai.js\"; only "
+                "\"service.js\" can be patched" &&
+            rep.local_patches[2].name == "raw" &&
+            rep.local_patches[2].outcome == PatchOutcome::kInvalid &&
+            rep.local_patches[2].error.find("control character") !=
+                std::string::npos &&
+            rep.local_patches[3].name == "b" &&
+            rep.local_patches[3].outcome == PatchOutcome::kApplied &&
+            rep.local_patches[4].outcome == PatchOutcome::kNotApplicable &&
+            rep.local_patches[4].error.empty() &&
+            rep.onvif_addressing == PatchOutcome::kApplied,
+        "local mixed: outcomes and errors");
+
+  // Where the file cannot be read further, the entries before that still
+  // apply and the rest is the file's error.
+  write_test_file(lp, "[" + local_entry("a", "var A=1;", "var A=10;") +
+                          ",\n{\"name\":\"b\",\"original\":\"var B=2;");
   patch_service_js(path, opts, md5sums, &rep);
-  check(read_test_file(path) == wsa_only, "local invalid: no entry applied");
+  check(read_test_file(path) == wsa_a, "local cut: earlier entry applied");
+  check(rep.local_patches.size() == 1 &&
+            rep.local_patches[0].outcome == PatchOutcome::kAlready &&
+            rep.local_patches_error ==
+                "not valid JSON at line 2, column 33: string not terminated; "
+                "the rest of the file, from line 2, column 1, is ignored",
+        "local cut: error reported");
+
+  // A file that is not an array applies none; ours still apply.
+  write_test_file(lp, local_entry("a", "var A=1;", "var A=10;"));
+  patch_service_js(path, opts, md5sums, &rep);
+  check(read_test_file(path) == wsa_only, "local not array: none applied");
   check(rep.local_patches.empty() &&
-            rep.local_patches_error.find("not valid JSON") !=
+            rep.local_patches_error.find("expected '['") !=
                 std::string::npos &&
             rep.onvif_addressing == PatchOutcome::kAlready,
-        "local invalid: error reported, ours applied");
+        "local not array: error reported, ours applied");
 
-  // So does one with an entry for another file.
+  // Without service.js the valid entries are not run; invalid ones are
+  // still reported.
   write_test_file(lp, "[" + local_entry("a", "var A=1;", "var A=10;") + "," +
                           local_entry("ui", "x", "y", "swai.js") + "]");
-  write_test_file(path, original);
-  check(patch_service_js(path, opts, md5sums, &rep) == 1,
-        "local wrong file: only ours written");
-  check(read_test_file(path) == wsa_only, "local wrong file: none applied");
-  check(rep.local_patches.empty() &&
-            rep.local_patches_error.find("only \"service.js\"") !=
-                std::string::npos,
-        "local wrong file: error reported");
+  check(patch_service_js("/nonexistent/service.js", opts, md5sums, &rep) ==
+                -1 &&
+            rep.local_patches.size() == 2 &&
+            rep.local_patches[0].outcome == PatchOutcome::kNotRun &&
+            rep.local_patches[1].outcome == PatchOutcome::kInvalid,
+        "local: missing service.js");
 
   // No file, then no path: no entries and no error.
   std::remove(lp.c_str());
@@ -1709,8 +2121,13 @@ int main() {
   test_patch_outcomes();
   test_service_js_report();
   test_parse_local_patches();
+  test_local_patch_entry_errors();
+  test_local_patches_stop();
+  test_local_patches_too_many();
   test_load_local_patches();
   test_local_patches_json();
+  test_local_patch_log_lines();
+  test_log_local_patches_once();
   test_local_patches_service_js();
   test_local_patch_forms_original_again();
   test_local_patches_after_ours();

@@ -28,6 +28,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
+#include <mutex>  // NOLINT(build/c++11)
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -926,6 +929,31 @@ static absl::Status json_syntax_error(const JsonCursor& c,
                                     json_where(c.s, c.pos) + ": " + what);
 }
 
+// An entry that is well-formed JSON but not a valid entry, at c.pos.
+static absl::Status json_entry_error(const JsonCursor& c,
+                                     const std::string& what) {
+  return absl::InvalidArgumentError(json_where(c.s, c.pos) + ": " + what);
+}
+
+// @p s as a JSON string literal.
+static std::string json_quote(const std::string& s) {
+  std::string out = "\"";
+  for (const char ch : s) {
+    if (ch == '"' || ch == '\\') {
+      out.push_back('\\');
+      out.push_back(ch);
+    } else if (static_cast<unsigned char>(ch) < 0x20) {
+      char buf[8];
+      std::snprintf(buf, sizeof(buf), "\\u%04x", ch);
+      out += buf;
+    } else {
+      out.push_back(ch);
+    }
+  }
+  out.push_back('"');
+  return out;
+}
+
 static void append_utf8(uint32_t cp, std::string* out) {
   if (cp < 0x80) {
     out->push_back(static_cast<char>(cp));
@@ -1041,45 +1069,54 @@ static absl::Status parse_json_string(JsonCursor* c, std::string* out) {
   return json_syntax_error(*c, "string not terminated");
 }
 
-// Check one parsed entry and give it its default name.  @p index counts
-// from 0; @p at is the offset of the entry's '{'.
+// Check the values of one entry parsed from @p text; @p at is the offset
+// of its '{'.
 static absl::Status check_local_patch(const std::string& text, size_t at,
-                                      size_t index, bool has_file,
-                                      LocalPatch* e) {
-  const std::string number = "entry " + std::to_string(index + 1);
-  const std::string where =
-      number + (e->name.empty() ? "" : " \"" + e->name + "\"") + " (" +
-      json_where(text, at) + "): ";
-  if (e->name.empty()) e->name = number;
-  auto bad = [&where](const std::string& what) {
-    return absl::InvalidArgumentError(where + what);
+                                      bool has_file, const LocalPatch& e) {
+  auto bad = [&text, at](const std::string& what) {
+    return absl::InvalidArgumentError(json_where(text, at) + ": " + what);
   };
   if (!has_file) return bad("\"file\" is missing; use \"service.js\"");
-  if (e->file != kLocalPatchFile) {
-    return bad("\"file\" is \"" + e->file +
-               "\"; only \"service.js\" can be patched");
+  if (e.file != kLocalPatchFile) {
+    return bad("\"file\" is " + json_quote(e.file) +
+               "; only \"service.js\" can be patched");
   }
-  if (e->original.empty()) return bad("\"original\" is missing or empty");
-  if (e->replacement.empty()) {
+  if (e.original.empty()) return bad("\"original\" is missing or empty");
+  if (e.replacement.empty()) {
     return bad("\"replacement\" is missing or empty");
   }
-  for (const std::string* s : {&e->name, &e->original, &e->replacement}) {
+  for (const std::string* s : {&e.name, &e.original, &e.replacement}) {
     if (s->find('\0') != std::string::npos) {
       return bad("contains a \\u0000 character");
     }
   }
-  if (e->replacement.find(e->original) != std::string::npos) {
+  if (e.replacement.find(e.original) != std::string::npos) {
     return bad("\"replacement\" contains \"original\", so it would be "
                "applied again on every pass");
   }
   return absl::OkStatus();
 }
 
-// Parse one entry object starting at c->pos into @p e.
-static absl::Status parse_local_patch(JsonCursor* c, size_t index,
-                                      LocalPatch* e) {
-  const size_t at = c->pos;
+// Whether @p ch can be part of a JSON number or of true, false or null.
+static bool is_json_token_char(char ch) {
+  return std::isalnum(static_cast<unsigned char>(ch)) || ch == '+' ||
+         ch == '-' || ch == '.';
+}
+
+// Parse the entry at c->pos into @p e, leaving c->pos after it.  Returns
+// why it cannot be read: malformed JSON, a value that is not an object, or
+// a member that is unknown, repeated or not a string; c->pos is then
+// somewhere inside it.  A member of @p e is set only once its string has
+// been read in full.  @p has_file tells whether "file" was given.
+static absl::Status parse_local_patch(JsonCursor* c, LocalPatch* e,
+                                      bool* has_file) {
+  skip_json_ws(c);
   if (!consume_json(c, '{')) {
+    if (c->pos < c->s.size() &&
+        (c->s[c->pos] == '"' || c->s[c->pos] == '[' ||
+         is_json_token_char(c->s[c->pos]))) {
+      return json_entry_error(*c, "each entry must be an object ({...})");
+    }
     return json_syntax_error(*c, "expected '{' (each entry is an object)");
   }
   std::vector<std::string> seen;
@@ -1099,127 +1136,265 @@ static absl::Status parse_local_patch(JsonCursor* c, size_t index,
       if (field == nullptr ||
           std::count(seen.begin(), seen.end(), key) > 0) {
         JsonCursor k{c->s, key_at};
-        return json_syntax_error(
+        return json_entry_error(
             k, field == nullptr
-                   ? "unknown key \"" + key +
-                         "\" (allowed: name, file, original, replacement)"
-                   : "\"" + key + "\" given twice");
+                   ? "unknown key " + json_quote(key) +
+                         " (allowed: name, file, original, replacement)"
+                   : json_quote(key) + " given twice");
       }
       seen.push_back(key);
       skip_json_ws(c);
       if (c->pos >= c->s.size() || c->s[c->pos] != '"') {
-        return json_syntax_error(*c, "the value of \"" + key +
-                                         "\" must be a string");
+        return json_entry_error(*c, "the value of " + json_quote(key) +
+                                        " must be a string");
       }
-      s = parse_json_string(c, field);
+      std::string value;
+      s = parse_json_string(c, &value);
       if (!s.ok()) return s;
+      *field = std::move(value);
     } while (consume_json(c, ','));
     if (!consume_json(c, '}')) {
       return json_syntax_error(*c, "expected ',' or '}'");
     }
   }
-  const bool has_file =
-      std::count(seen.begin(), seen.end(), std::string("file")) > 0;
-  return check_local_patch(c->s, at, index, has_file, e);
+  *has_file = std::count(seen.begin(), seen.end(), std::string("file")) > 0;
+  return absl::OkStatus();
 }
 
-absl::StatusOr<std::vector<LocalPatch>> parse_local_patches(
-    const std::string& text) {
+// How scan_json_value() ended.
+enum class JsonScan {
+  kEnd,        // after the value
+  kTextEnds,   // the text ends inside the value, or before one starts
+  kNotValue,   // no value starts here, or its brackets do not match
+};
+
+// Skip the JSON value at c->pos (after white space) by its quotes and
+// brackets alone: a string, an array or object up to its matching bracket,
+// or a run of number and literal characters.  Nothing else in it is
+// checked, so a value with malformed JSON inside can be skipped too.
+static JsonScan scan_json_value(JsonCursor* c) {
+  const std::string& s = c->s;
+  skip_json_ws(c);
+  if (c->pos >= s.size()) return JsonScan::kTextEnds;
+  if (is_json_token_char(s[c->pos])) {
+    while (c->pos < s.size() && is_json_token_char(s[c->pos])) ++c->pos;
+    return c->pos < s.size() ? JsonScan::kEnd : JsonScan::kTextEnds;
+  }
+  if (s[c->pos] != '"' && s[c->pos] != '[' && s[c->pos] != '{') {
+    return JsonScan::kNotValue;
+  }
+  std::string closers;  // brackets still open, innermost last
+  while (c->pos < s.size()) {
+    const char ch = s[c->pos++];
+    if (ch == '"') {
+      bool closed = false;
+      while (!closed && c->pos < s.size()) {
+        const char in = s[c->pos++];
+        if (in == '\\') {
+          ++c->pos;
+        } else {
+          closed = in == '"';
+        }
+      }
+      if (!closed) {
+        c->pos = s.size();
+        return JsonScan::kTextEnds;
+      }
+    } else if (ch == '{' || ch == '[') {
+      closers.push_back(ch == '{' ? '}' : ']');
+    } else if (ch == '}' || ch == ']') {
+      if (closers.empty() || closers.back() != ch) return JsonScan::kNotValue;
+      closers.pop_back();
+    }
+    if (closers.empty()) return JsonScan::kEnd;
+  }
+  return JsonScan::kTextEnds;
+}
+
+// Whether a ',' or ']' follows at c->pos, after white space.
+static bool json_separator_follows(JsonCursor* c) {
+  skip_json_ws(c);
+  return c->pos < c->s.size() && (c->s[c->pos] == ',' || c->s[c->pos] == ']');
+}
+
+// A local patches file as parse_local_patches_text() read it.
+struct ParsedLocalPatches {
+  std::vector<LocalPatch> entries;  // the first kMaxLocalPatches
+  std::string too_many;  // about the entries after those, or empty
+  std::string stopped;   // the JSON error that ended reading, or empty
+  // With `stopped`: offset of the first byte not read, the start of the
+  // entry or text the error is in.  npos when the text is not an array.
+  size_t rest_at = std::string::npos;
+};
+
+// Parse the text of a local patches file; see parse_local_patches().  The
+// end of an entry that cannot be read is found with scan_json_value(), and
+// is trusted only when a ',' or ']' follows it.  Entries after the first
+// kMaxLocalPatches are skipped with scan_json_value() alone, only to count
+// them.
+static ParsedLocalPatches parse_local_patches_text(const std::string& text) {
+  ParsedLocalPatches out;
+  auto stop = [&out, &text](const absl::Status& why, size_t rest_at) {
+    out.stopped = std::string(why.message()) + "; the rest of the file, from " +
+                  json_where(text, rest_at) + ", is ignored";
+    out.rest_at = rest_at;
+  };
   JsonCursor c{text};
   // A UTF-8 byte order mark, as some editors write, is skipped.
   if (text.compare(0, 3, "\xEF\xBB\xBF") == 0) c.pos = 3;
-  std::vector<LocalPatch> entries;
   skip_json_ws(&c);
-  if (c.pos == text.size()) return entries;
+  if (c.pos == text.size()) return out;
   if (!consume_json(&c, '[')) {
-    return json_syntax_error(
-        c, "expected '[' (the file holds an array of entries)");
+    out.stopped = std::string(
+        json_syntax_error(c, "expected '[' (the file holds an array of "
+                             "entries)").message());
+    return out;
   }
-  if (!consume_json(&c, ']')) {
-    do {
-      if (entries.size() == kMaxLocalPatches) {
-        return absl::InvalidArgumentError(
-            "more than " + std::to_string(kMaxLocalPatches) + " entries");
+  size_t ignored = 0;     // entries after the first kMaxLocalPatches
+  size_t ignored_at = 0;  // offset of the first of them
+  bool closed = consume_json(&c, ']');
+  for (size_t index = 0; !closed; ++index) {
+    skip_json_ws(&c);
+    const size_t at = c.pos;
+    if (index >= kMaxLocalPatches) {
+      JsonCursor end{text, at};
+      if (scan_json_value(&end) == JsonScan::kEnd) {
+        if (ignored++ == 0) ignored_at = at;
+        c.pos = end.pos;
+      } else {
+        // Read it once more to say what is wrong with it.
+        LocalPatch unused;
+        bool has_file = false;
+        absl::Status s = parse_local_patch(&c, &unused, &has_file);
+        if (s.ok()) s = json_syntax_error(c, "expected ',' or ']'");
+        stop(s, at);
+        break;
       }
-      skip_json_ws(&c);
-      LocalPatch e;
-      absl::Status s = parse_local_patch(&c, entries.size(), &e);
-      if (!s.ok()) return s;
-      entries.push_back(std::move(e));
-    } while (consume_json(&c, ','));
-    if (!consume_json(&c, ']')) {
-      return json_syntax_error(c, "expected ',' or ']'");
-    }
-  }
-  skip_json_ws(&c);
-  if (c.pos != text.size()) {
-    return json_syntax_error(c, "unexpected text after the array");
-  }
-  return entries;
-}
-
-absl::StatusOr<std::vector<LocalPatch>> load_local_patches(
-    const std::string& path) {
-  struct stat st;
-  if (stat(path.c_str(), &st) != 0) {
-    if (errno == ENOENT) return std::vector<LocalPatch>{};
-    return absl::FailedPreconditionError(std::strerror(errno));
-  }
-  if (!S_ISREG(st.st_mode)) {
-    return absl::FailedPreconditionError("not a regular file");
-  }
-  const std::string too_big = "larger than " +
-                              std::to_string(kMaxLocalPatchesBytes / 1024) +
-                              " KiB";
-  if (static_cast<uint64_t>(st.st_size) > kMaxLocalPatchesBytes) {
-    return absl::FailedPreconditionError(too_big);
-  }
-  std::ifstream f(path, std::ios::binary);
-  if (!f) return absl::FailedPreconditionError(std::strerror(errno));
-  std::string text(kMaxLocalPatchesBytes + 1, '\0');
-  f.read(&text[0], static_cast<std::streamsize>(text.size()));
-  if (f.bad()) return absl::FailedPreconditionError("read failed");
-  text.resize(static_cast<size_t>(f.gcount()));
-  if (text.size() > kMaxLocalPatchesBytes) {
-    return absl::FailedPreconditionError(too_big);
-  }
-  return parse_local_patches(text);
-}
-
-// @p s as a JSON string literal.
-static std::string json_quote(const std::string& s) {
-  std::string out = "\"";
-  for (const char ch : s) {
-    if (ch == '"' || ch == '\\') {
-      out.push_back('\\');
-      out.push_back(ch);
-    } else if (static_cast<unsigned char>(ch) < 0x20) {
-      char buf[8];
-      std::snprintf(buf, sizeof(buf), "\\u%04x", ch);
-      out += buf;
     } else {
-      out.push_back(ch);
+      LocalPatch e;
+      bool has_file = false;
+      absl::Status s = parse_local_patch(&c, &e, &has_file);
+      if (s.ok()) {
+        s = check_local_patch(text, at, has_file, e);
+      } else {
+        JsonCursor end{text, at};
+        if (scan_json_value(&end) != JsonScan::kEnd ||
+            !json_separator_follows(&end)) {
+          stop(s, at);
+          break;
+        }
+        c.pos = end.pos;
+      }
+      if (!s.ok()) {
+        // Only the name of an entry that cannot be used is kept.
+        LocalPatch invalid;
+        invalid.name = std::move(e.name);
+        invalid.error = std::string(s.message());
+        e = std::move(invalid);
+      }
+      if (e.name.empty()) e.name = "entry " + std::to_string(index + 1);
+      out.entries.push_back(std::move(e));
+    }
+    if (consume_json(&c, ',')) continue;
+    closed = consume_json(&c, ']');
+    if (!closed) {
+      stop(json_syntax_error(c, "expected ',' or ']'"), c.pos);
+      break;
     }
   }
-  out.push_back('"');
+  if (closed) {
+    skip_json_ws(&c);
+    if (c.pos != text.size()) {
+      stop(json_syntax_error(c, "unexpected text after the array"), c.pos);
+    }
+  }
+  if (ignored > 0) {
+    const std::string limit = std::to_string(kMaxLocalPatches);
+    out.too_many = "more than " + limit + " entries; " +
+                   (ignored == 1 ? std::string("the one")
+                                 : "the " + std::to_string(ignored)) +
+                   " after the first " + limit + ", from " +
+                   json_where(text, ignored_at) +
+                   (ignored == 1 ? ", is ignored" : ", are ignored");
+  }
   return out;
 }
 
-// The entries of the local patches file of @p opts, or none when it is
-// not configured, does not exist or cannot be used.  Records the path
-// and, for a file that cannot be used, why in @p rep.
-static std::vector<LocalPatch> read_local_patches(const PatchOptions& opts,
-                                                  PatchReport* rep) {
+// @p parts that are not empty, joined by "; ".
+static std::string join_errors(std::initializer_list<std::string> parts) {
+  std::string out;
+  for (const std::string& p : parts) {
+    if (p.empty()) continue;
+    if (!out.empty()) out += "; ";
+    out += p;
+  }
+  return out;
+}
+
+LocalPatches parse_local_patches(const std::string& text) {
+  ParsedLocalPatches p = parse_local_patches_text(text);
+  return {std::move(p.entries), join_errors({p.too_many, p.stopped})};
+}
+
+LocalPatches load_local_patches(const std::string& path) {
+  LocalPatches out;
+  struct stat st;
+  if (stat(path.c_str(), &st) != 0) {
+    if (errno != ENOENT) out.error = std::strerror(errno);
+    return out;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    out.error = "not a regular file";
+    return out;
+  }
+  std::ifstream f(path, std::ios::binary);
+  if (!f) {
+    out.error = std::strerror(errno);
+    return out;
+  }
+  // One byte more than is parsed shows whether the file is larger.
+  std::string text(kMaxLocalPatchesBytes + 1, '\0');
+  f.read(&text[0], static_cast<std::streamsize>(text.size()));
+  if (f.bad()) {
+    out.error = "read failed";
+    return out;
+  }
+  text.resize(static_cast<size_t>(f.gcount()));
+  const bool too_big = text.size() > kMaxLocalPatchesBytes;
+  if (too_big) text.resize(kMaxLocalPatchesBytes);
+  ParsedLocalPatches p = parse_local_patches_text(text);
+  if (too_big) {
+    const std::string kib = std::to_string(kMaxLocalPatchesBytes / 1024);
+    const std::string larger = "larger than " + kib + " KiB";
+    JsonCursor rest{text, p.rest_at};
+    if (p.stopped.empty()) {
+      p.stopped = larger + "; what follows its first " + kib +
+                  " KiB is ignored";
+    } else if (p.rest_at != std::string::npos &&
+               scan_json_value(&rest) == JsonScan::kTextEnds) {
+      // Reading stopped at an entry cut off by the size limit.
+      p.stopped = larger + "; the rest of the file, from " +
+                  json_where(text, p.rest_at) + ", is ignored";
+    } else {
+      p.stopped += "; the file is also " + larger;
+    }
+  }
+  out.entries = std::move(p.entries);
+  out.error = join_errors({p.too_many, p.stopped});
+  return out;
+}
+
+// The entries of the local patches file of @p opts, none when it is not
+// configured or does not exist.  Records the path and the file's error in
+// @p rep.
+static LocalPatches read_local_patches(const PatchOptions& opts,
+                                       PatchReport* rep) {
   rep->local_patches_path = opts.local_patches;
   rep->local_patches_error.clear();
   if (opts.local_patches.empty()) return {};
-  absl::StatusOr<std::vector<LocalPatch>> loaded =
-      load_local_patches(opts.local_patches);
-  if (!loaded.ok()) {
-    rep->local_patches_error = std::string(loaded.status().message());
-    return {};
-  }
-  return std::move(*loaded);
+  LocalPatches loaded = load_local_patches(opts.local_patches);
+  rep->local_patches_error = loaded.error;
+  return loaded;
 }
 
 // Patch the service.js at @p path: the backend scope filter always, the
@@ -1244,11 +1419,14 @@ static int patch_service_js(
   const size_t route = add(kBackendPatchRoute, opts.event_proxy);
   const size_t retired = removed.size();
   for (const Patch& p : kRetiredRoutePatches) removed.push_back(p);
-  // Local patches go last, so they apply to the file with ours in place.
-  // Their Patch entries point into `local`.
-  const std::vector<LocalPatch> local = read_local_patches(opts, rep);
-  const size_t first_local = backend.size();
-  for (const LocalPatch& lp : local) {
+  // Valid local patches go last, so they apply to the file with ours in
+  // place.  Their Patch entries point into `local`.
+  const LocalPatches local = read_local_patches(opts, rep);
+  // Index in `backend` of each entry, used only for the valid ones.
+  std::vector<size_t> local_at;
+  for (const LocalPatch& lp : local.entries) {
+    local_at.push_back(backend.size());
+    if (!lp.error.empty()) continue;
     backend.push_back({lp.original.c_str(), lp.replacement.c_str()});
   }
   std::vector<PatchOutcome> outcomes(backend.size(), PatchOutcome::kNotRun);
@@ -1268,39 +1446,87 @@ static int patch_service_js(
     }
   }
   rep->local_patches.clear();
-  for (size_t i = 0; i < local.size(); ++i) {
-    rep->local_patches.push_back({local[i].name, outcomes[first_local + i]});
+  for (size_t i = 0; i < local.entries.size(); ++i) {
+    const LocalPatch& lp = local.entries[i];
+    if (!lp.error.empty()) {
+      rep->local_patches.push_back({lp.name, PatchOutcome::kInvalid, lp.error});
+    } else {
+      rep->local_patches.push_back({lp.name, outcomes[local_at[i]]});
+    }
   }
   return n;
 }
 
-// Log what became of the local patches in @p rep.  Entries that do not
-// apply are warnings, a file that cannot be used is an error.
-static void log_local_patches(const PatchReport& rep) {
+// The error lines for the local patches in @p rep: the file's error, and
+// each entry not applied with why.
+static std::vector<std::string> local_patch_errors(const PatchReport& rep) {
+  std::vector<std::string> lines;
   if (!rep.local_patches_error.empty()) {
-    LOG(ERROR) << "[ui_patch] local patches " << rep.local_patches_path
-               << ": " << rep.local_patches_error
-               << " -- none of its entries is applied";
-    return;
+    lines.push_back("local patches " + rep.local_patches_path + ": " +
+                    rep.local_patches_error +
+                    (rep.local_patches.empty()
+                         ? " -- none of its entries is applied"
+                         : ""));
   }
   for (const LocalPatchOutcome& e : rep.local_patches) {
+    const std::string head =
+        "local patch " + json_quote(e.name) + " not applied: ";
     switch (e.outcome) {
+      case PatchOutcome::kInvalid:
+        lines.push_back(head + e.error);
+        break;
       case PatchOutcome::kNotApplicable:
-        LOG(WARNING) << "[ui_patch] local patch \"" << e.name
-                     << "\" not applied: its original text is not in "
-                        "service.js (a Protect update may have changed it), "
-                        "or its replacement would form that text again";
+        lines.push_back(head +
+                        "its original text is not in service.js (a Protect "
+                        "update may have changed it), or its replacement "
+                        "would form that text again");
         break;
       case PatchOutcome::kAmbiguous:
-        LOG(WARNING) << "[ui_patch] local patch \"" << e.name
-                     << "\" not applied: its original text occurs more "
-                        "than once in service.js";
+        lines.push_back(head +
+                        "its original text occurs more than once in "
+                        "service.js");
         break;
-      default:
-        LOG(INFO) << "[ui_patch] local patch \"" << e.name
-                  << "\": " << patch_outcome_name(e.outcome);
+      case PatchOutcome::kNotRun:
+      case PatchOutcome::kApplied:
+      case PatchOutcome::kAlready:
+      case PatchOutcome::kRemoved:
+      case PatchOutcome::kAbsent:
         break;
     }
+  }
+  return lines;
+}
+
+// The lines of @p lines that are not in @p last, which then holds
+// @p lines.
+static std::vector<std::string> new_lines(const std::vector<std::string>& lines,
+                                          std::set<std::string>* last) {
+  std::vector<std::string> fresh;
+  for (const std::string& line : lines) {
+    if (last->count(line) == 0) fresh.push_back(line);
+  }
+  last->clear();
+  last->insert(lines.begin(), lines.end());
+  return fresh;
+}
+
+// Log what became of the local patches in @p rep.  The file's error and
+// each entry not applied are errors.  Patch passes repeat with nothing
+// changed (the patch watcher also fires on onvif-recorder's own writes),
+// so an error line is logged only when the previous pass did not log it.
+static void log_local_patches(const PatchReport& rep) {
+  static std::mutex mu;
+  static auto* const last_pass = new std::set<std::string>();
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    for (const std::string& line :
+         new_lines(local_patch_errors(rep), last_pass)) {
+      LOG(ERROR) << "[ui_patch] " << line;
+    }
+  }
+  for (const LocalPatchOutcome& e : rep.local_patches) {
+    LOG(INFO) << "[ui_patch] local patch " << json_quote(e.name) << ": "
+              << patch_outcome_name(e.outcome);
   }
 }
 
@@ -1333,6 +1559,8 @@ const char* patch_outcome_name(PatchOutcome outcome) {
       return "not_applicable";
     case PatchOutcome::kAmbiguous:
       return "ambiguous";
+    case PatchOutcome::kInvalid:
+      return "invalid";
   }
   return "not_run";
 }
@@ -1345,7 +1573,8 @@ std::string local_patches_json(const PatchReport& report) {
     const LocalPatchOutcome& e = report.local_patches[i];
     if (i > 0) j += ',';
     j += "{\"name\":" + json_quote(e.name) + ",\"outcome\":\"" +
-         patch_outcome_name(e.outcome) + "\"}";
+         patch_outcome_name(e.outcome) + "\",\"error\":" +
+         json_quote(e.error) + "}";
   }
   j += "]}";
   return j;

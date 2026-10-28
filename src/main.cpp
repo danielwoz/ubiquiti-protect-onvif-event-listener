@@ -451,10 +451,12 @@ ABSL_FLAG(std::string, local_patches, "/data/onvif-recorder/local-patches.json",
     "Protect: an array of {\"name\", \"file\": \"service.js\", \"original\", "
     "\"replacement\"} objects. An entry is applied only where its original "
     "text occurs exactly once; removing an entry undoes it. A missing file "
-    "holds no patches; a file that is not valid applies none of them. Read "
-    "at start-up and whenever onvif-recorder re-patches Protect, so restart "
-    "onvif-recorder after editing it. Needs --patch_alarm_picker. Empty "
-    "disables.");
+    "holds no patches. Each entry stands alone: an invalid one is skipped "
+    "and logged, and the others still apply. From broken JSON that hides "
+    "where an entry ends, and after the first 100 entries or 1 MiB, the "
+    "rest of the file is ignored and logged. Read at start-up and "
+    "whenever onvif-recorder re-patches Protect, so restart onvif-recorder "
+    "after editing it. Needs --patch_alarm_picker. Empty disables.");
 ABSL_FLAG(std::string, protect_event_proxy_cameras, "",
     "Comma-separated MAC addresses of third-party cameras whose ONVIF "
     "event subscription Protect (7.1+) gets through onvif-recorder "

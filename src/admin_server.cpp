@@ -264,20 +264,26 @@ async function fetchStatus(){
   document.getElementById('autoupdate-enabled').value = String(!!j.autoupdate_enabled);
   document.getElementById('autoupdate-schedule').value = j.autoupdate_schedule || 'daily';
 }
-// Status line for the user's own service.js patches (/api/status
-// local_patches): how many apply, and which do not.
+// Status lines for the user's own service.js patches (/api/status
+// local_patches): how many apply, each one that does not and why, and
+// what is wrong with the file.
 function localPatchesText(lp){
   const where = `<span class="help" title="${escHtml(lp.path)}">?</span>`;
+  const entries = lp.entries || [];
+  const lines = [];
+  if (entries.length) {
+    const ok = e => e.outcome === 'applied' || e.outcome === 'already';
+    const bad = entries.filter(e => !ok(e));
+    lines.push(`${entries.length - bad.length} of ${entries.length} applied`);
+    for (const e of bad)
+      lines.push('<span style="color:#f0c674">not applied: ' + escHtml(e.name)
+               + ` (${escHtml(e.outcome.replace('_', ' '))}`
+               + (e.error ? ': ' + escHtml(e.error) : '') + ')</span>');
+  }
   if (lp.error)
-    return `<span style="color:#e0a0a0">${escHtml(lp.error)}; none applied</span>${where}`;
-  const ok = e => e.outcome === 'applied' || e.outcome === 'already';
-  const bad = lp.entries.filter(e => !ok(e));
-  let s = `${lp.entries.length - bad.length} of ${lp.entries.length} applied`;
-  if (bad.length)
-    s += '; <span style="color:#f0c674">not applied: '
-       + bad.map(e => `${escHtml(e.name)} (${e.outcome.replace('_', ' ')})`).join(', ')
-       + '</span>';
-  return s + where;
+    lines.push(`<span style="color:#e0a0a0">${escHtml(lp.error)}`
+             + (entries.length ? '' : '; none applied') + '</span>');
+  return lines.join('<br>') + where;
 }
 function msg(id, text, ok){
   const e = document.getElementById(id);

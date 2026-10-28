@@ -283,6 +283,9 @@ cc_test(
     deps = [
         ":protect_ui_patch_internal",
         "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/log:log_entry",
+        "@com_google_absl//absl/log:log_sink",
+        "@com_google_absl//absl/log:log_sink_registry",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
     ],

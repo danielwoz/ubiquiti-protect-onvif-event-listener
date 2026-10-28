@@ -44,30 +44,52 @@ struct PatchOptions {
 /// Protect's files, applied after onvif-recorder's own patches and by the
 /// same rules.
 struct LocalPatch {
-  std::string name;         // "entry <n>" when the file gives none
+  std::string name;         // "entry <n>" (from 1) when the file gives none,
+                            // or it could not be read
   std::string file;         // only "service.js"
   std::string original;     // non-empty; must occur exactly once
   std::string replacement;  // non-empty; must not contain original
+  /// Why the entry cannot be used, with its line and column; empty for a
+  /// valid entry.  An invalid entry has only its name, and is never
+  /// applied.
+  std::string error;
 };
 
-/// Largest local patches file read, in bytes.
+/// Largest part of a local patches file read, in bytes.
 inline constexpr size_t kMaxLocalPatchesBytes = 1024 * 1024;
-/// Most entries a local patches file may hold.
+/// Most entries of a local patches file used; later ones are ignored.
 inline constexpr size_t kMaxLocalPatches = 100;
+
+/// What a local patches file holds.
+struct LocalPatches {
+  /// Its first kMaxLocalPatches entries, valid or not, in file order.
+  std::vector<LocalPatch> entries;
+  /// Why the file, or the part of it after some of its entries, is not
+  /// used; empty when all of it was read.  Entries read before the
+  /// problem are still in `entries`.
+  std::string error;
+};
 
 /// Parse the text of a local patches file: a JSON array of objects with
 /// the string members "name" (optional), "file" ("service.js"), "original"
 /// and "replacement", and no others.  Text that is empty or only white
-/// space holds no entries.  Returns InvalidArgumentError naming the
-/// problem (with line and column for malformed JSON) otherwise.
-absl::StatusOr<std::vector<LocalPatch>> parse_local_patches(
-    const std::string& text);
+/// space holds no entries.  Each entry stands alone: one that is not an
+/// object, has a missing, unknown, repeated or non-string member, a value
+/// LocalPatch does not allow, or malformed JSON is kept with its error,
+/// and parsing goes on at the next entry.  After malformed JSON that
+/// happens only where the end of the broken entry can be found by its
+/// quotes and brackets and a ',' or ']' follows it; otherwise the rest of
+/// the text is not read and is reported in LocalPatches::error, as are the
+/// entries after the first kMaxLocalPatches.  Text that is not an array
+/// has no entries and an error.
+LocalPatches parse_local_patches(const std::string& text);
 
 /// Read and parse the local patches file at @p path.  A file that does not
-/// exist holds no entries.  Returns an error for a file that cannot be
-/// read, is larger than kMaxLocalPatchesBytes or does not parse.
-absl::StatusOr<std::vector<LocalPatch>> load_local_patches(
-    const std::string& path);
+/// exist holds no entries and no error.  A file that cannot be read or is
+/// not a regular file has no entries and an error.  Of a file larger than
+/// kMaxLocalPatchesBytes only the entries that end within that size are
+/// read, and the rest is reported as an error.
+LocalPatches load_local_patches(const std::string& path);
 
 /// What patch_alarm_picker() did with one optional patch.
 enum class PatchOutcome {
@@ -79,18 +101,21 @@ enum class PatchOutcome {
   kAbsent,         // disabled and not present
   kNotApplicable,  // anchor not found, or safety scan refused
   kAmbiguous,      // anchor found more than once
+  kInvalid,        // local patch entry not valid, so skipped
 };
 
 /// Lower-case name of @p outcome: "not_run", "applied", "already",
-/// "removed", "absent", "not_applicable" or "ambiguous".
+/// "removed", "absent", "not_applicable", "ambiguous" or "invalid".
 const char* patch_outcome_name(PatchOutcome outcome);
 
 /// What patch_alarm_picker() did with one local patch.
 struct LocalPatchOutcome {
   std::string name;
-  /// kApplied, kAlready, kNotApplicable, kAmbiguous, or kNotRun when
-  /// service.js was not patched.
+  /// kApplied, kAlready, kNotApplicable, kAmbiguous, kInvalid, or kNotRun
+  /// when service.js was not patched.
   PatchOutcome outcome = PatchOutcome::kNotRun;
+  /// LocalPatch::error of a kInvalid entry; empty otherwise.
+  std::string error{};
 };
 
 /// Outcome of each optional service.js patch in one patch_alarm_picker()
@@ -100,16 +125,18 @@ struct PatchReport {
   PatchOutcome event_proxy = PatchOutcome::kNotRun;
   /// PatchOptions::local_patches of the call.
   std::string local_patches_path;
-  /// Why no local patch was applied: the file could not be read or is
-  /// not valid.  Empty when it was used or does not exist.
+  /// LocalPatches::error of the local patches file: it could not be read,
+  /// or part of it was not used.  Entries read before the problem are
+  /// still in `local_patches` and applied.  Empty when all of it was used
+  /// or it does not exist.
   std::string local_patches_error;
-  /// Each entry of the local patches file, in file order.
+  /// Each entry read from the local patches file, in file order.
   std::vector<LocalPatchOutcome> local_patches;
 };
 
 /// JSON object for /api/status describing the local patches of @p report:
-/// {"path":..., "error":..., "entries":[{"name":..., "outcome":...}]},
-/// with outcomes named as by patch_outcome_name().
+/// {"path":..., "error":..., "entries":[{"name":..., "outcome":...,
+/// "error":...}]}, with outcomes named as by patch_outcome_name().
 std::string local_patches_json(const PatchReport& report);
 
 /// Live-patch the Protect UI to allow third-party cameras in the alarm picker.
@@ -127,10 +154,12 @@ std::string local_patches_json(const PatchReport& report);
 /// 7.1+), which some cameras (Reolink) require.  With @p opts.event_proxy it
 /// routes Protect's ONVIF event subscriptions through onvif-recorder (see
 /// PatchOptions).  An option that is off removes its change again.  The
-/// entries of the local patches file @p opts.local_patches follow
-/// onvif-recorder's own patches; when the file cannot be read or is not
-/// valid, none of them is applied.  Changes to service.js load at
-/// Protect's next start.
+/// valid entries of the local patches file @p opts.local_patches follow
+/// onvif-recorder's own patches; invalid ones are skipped (see
+/// parse_local_patches()).  Each local patch not applied and each problem
+/// with the file is logged as an error, again only once it has changed or
+/// gone away in between, since passes repeat.  Changes to service.js load
+/// at Protect's next start.
 ///
 /// Each patch is applied only where its target code occurs exactly once,
 /// and only when its replacement does not form that code again.
