@@ -108,10 +108,17 @@ unlock door, light, PTZ preset) configured in **Protect → Alarms**.
    appear in the alarm creation scope picker.
 2. The recorder follows Protect's Alarm Manager setting
    (`nvrs.featureFlags.useExternalAlarmManager` in the Protect database). It
-   logs the mode it uses at start-up and whenever it changes, for example after
-   a console moves from Local to Global.
+   reads the setting at start-up and again at the first detection once the last
+   read is a minute old, so a console moved from Local to Global is followed
+   within about a minute of the next detection. The mode, and each change, is
+   logged as an info line (log viewer, or the journal with `--verbose`). If
+   neither the database nor the UniFi OS alarm list can be read at start-up, no
+   alarms are triggered until one of them answers (checked every 10 s while
+   detections arrive).
 3. **Global Alarm Manager** (alarms kept by UniFi OS): the recorder reads the
-   alarm list from UniFi OS about once a minute. For each new detection it sends
+   alarm list from UniFi OS at start-up and at the first detection once the last
+   read is a minute old (a failed read keeps the last good list). A detection
+   never waits for another camera's read. For each new detection it sends
    UniFi OS one event per alarm with a matching Person, Vehicle, Animal or
    Package trigger, as Protect does for its own cameras. UniFi OS then applies
    the alarm's cameras, schedule, cooldown, pause and recipients, runs all of its
@@ -121,7 +128,10 @@ unlock door, light, PTZ preset) configured in **Protect → Alarms**.
    events ... matched=N`, `Alarm executed successfully alarm_id=...`). Alarms
    whose object trigger also needs another trigger within a time window, or a
    count of detections, are not triggered by the recorder; each is named once in
-   a warning.
+   a warning. An alarm limited to camera zones or buttons is still sent, with a
+   one-time warning, but UniFi OS may not match it, as the recorder's detections
+   carry no zone. The event is sent with the Protect camera id (`sourceEvent`)
+   when the camera is known, and with only the event id otherwise.
 4. **Local Alarm Manager** (alarms kept by Protect): the recorder refreshes the
    automations from the Protect API every five minutes, triggers matching
    automations via the local Protect API (port 7080), records history in
@@ -145,7 +155,7 @@ unlock door, light, PTZ preset) configured in **Protect → Alarms**.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--protect_url` | `http://localhost:7080` | Base URL for the local Protect API. Only change this if running off-device. |
+| `--protect_url` | `http://localhost:7080` | Base URL for the local Protect API (camera checks, snapshots, and Local Alarm Manager automations; the Global Alarm Manager path talks to UniFi OS on 127.0.0.1:11010 instead). Only change this if running off-device. |
 | `--protect_user_id` | _(auto-discovered)_ | Protect user ID for API auth. Auto-discovered from the unifi-core DB and cached to `/var/lib/onvif-recorder/protect-user-id`. Pass explicitly to override. |
 | `--patch_alarm_picker` | `true` | Live-patch the Protect UI so third-party cameras appear in the alarm creation picker. `false` stops onvif-recorder patching Protect files, including `--patch_onvif_addressing`; patches already applied stay until Protect is updated or `--rollback` runs. |
 

@@ -164,7 +164,9 @@ Admin UI -> Detection -> camera_object_types
 
 onvif-recorder triggers Protect's alarms (**Protect → Alarms**) for the detections it records,
 so an alarm with a Person, Vehicle, Animal or Package trigger fires for your ONVIF cameras too.
-It follows Protect's Alarm Manager setting and logs which one it uses at start-up:
+It follows Protect's Alarm Manager setting, checking it again about once a minute while
+detections arrive. The mode it uses, and any change, is logged as an info line, which shows in
+the log viewer (`https://<device>/onvif/events/log`) and, with `--verbose`, in the journal:
 
 - **Global Alarm Manager** (alarms kept by UniFi OS): each detection is handed to UniFi OS,
   which applies the alarm's cameras, schedule, cooldown and recipients and runs all of its
@@ -172,12 +174,12 @@ It follows Protect's Alarm Manager setting and logs which one it uses at start-u
   alarm history appears in the Alarm Manager. To see which alarms a detection matched, look in
   `/data/unifi-core/logs/uos-agent.log` on the console (`Processed alarm events ... matched=N`
   and `Alarm executed successfully alarm_id=...`). An alarm whose trigger also needs another
-  trigger within a time window, or a count of detections, is not triggered by onvif-recorder;
-  it is named once in a warning in the journal.
+  trigger within a time window, or a count of detections, is not triggered by onvif-recorder,
+  and an alarm limited to camera zones may not match; each is named once in a warning (log
+  viewer, or the journal with `--verbose`).
 - **Local Alarm Manager** (alarms kept by Protect): onvif-recorder checks each alarm's cameras,
   schedule, cooldown and recipients itself and sends its notifications. Notifications on this
-  path usually arrive without a thumbnail; switching Protect to the Global Alarm Manager adds
-  them. See [`THUMBNAILS.md`](THUMBNAILS.md).
+  path may arrive without a thumbnail. See [`THUMBNAILS.md`](THUMBNAILS.md).
 
 Turn `trigger_automations` off to record detections without triggering any alarm. See
 [Security alarms](FLAGS.md#security-alarms) for the details.
@@ -479,7 +481,7 @@ libldap.so.2  liblber.so.2
 main.cpp                      — Binary entry point
 onvif_listener.hpp/.cpp       — WS-PullPoint ONVIF subscription library
 detection_recorder.hpp/.cpp   — Detection -> PostgreSQL recorder
-alarm_notifier.hpp/.cpp       — Protect automation trigger + history
+alarm_notifier.hpp/.cpp       — Hands detections to Protect's alarms (UniFi OS or Local)
 motion_poller.hpp/.cpp        — First-party camera motion -> smart detect poller
 camera_change_log.hpp/.cpp    — Cameras-table change log and rollback
 protect_ui_patch.hpp/.cpp     — Live-patch Protect UI alarm picker
