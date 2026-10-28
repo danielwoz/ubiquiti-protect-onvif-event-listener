@@ -81,7 +81,8 @@ redaction filter. It replaces these with `[redacted]`:
 - the credential after an `Authorization` scheme (`Basic`, `Bearer`, `Digest`, …), and
   whole `Cookie` values;
 - UniFi user ids (`user_id`, `userId`, `X-UserId`), since an `X-UserId` header is a
-  Protect API credential on the router;
+  Protect API credential on the router. Protect's automation dumps also name users in
+  other fields, such as `created_by` and `receivers`; those are kept;
 - `wsse:Password` and `user:pass@` in a URL.
 
 ## Layout
