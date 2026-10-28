@@ -771,3 +771,30 @@ scp ~/.cache/bazel/arm64_release/execroot/_main/bazel-out/k8-fastbuild/bin/onvif
 scp onvif-recorder.service root@<router-ip>:/etc/systemd/system/
 ssh root@<router-ip> "systemctl daemon-reload && systemctl restart onvif-recorder"
 ```
+
+## Router log collection (dev)
+
+ceph-server-01 pulls the dev router's logs every 15 minutes, read-only, using cron as
+`danielwoz`. The data is kept for 180 days in `/mnt/cephfs/ssd/onvif-router-logs/`:
+
+- the whole journal;
+- Protect and UniFi OS log files;
+- recorder API snapshots.
+
+A daily summary goes to `summary/YYYY-MM-DD.md`. It covers:
+
+- E/W/F counts;
+- restarts and healer actions;
+- event-sharing hand-backs;
+- alarms;
+- per-camera errors.
+
+Look there first when investigating something that happened on the router more than
+about 18 h ago, which is all the router's own journal holds. The scripts are in
+`scripts/router-logs/` and must stay on `main` here, because cron runs them from this
+checkout. See `scripts/router-logs/README.md` for:
+
+- the layout;
+- `zstdgrep` queries;
+- how to stop or start the cron jobs;
+- failure handling.
