@@ -137,8 +137,19 @@ paths="etc/onvif-recorder"
 [ -f /etc/default/onvif-recorder ]       && paths="$paths etc/default/onvif-recorder"
 [ -f /etc/default/onvif-recorder.local ] && paths="$paths etc/default/onvif-recorder.local"
 [ -d /var/lib/onvif-recorder ]           && paths="$paths var/lib/onvif-recorder"
+# GNU tar exits 1 when a file changed or vanished while it was read (the
+# recorder rewriting a state file); the archive is still usable.  Any
+# other failure stops the backup and shows tar's own messages.
+err="$BACKUP_DIR/.tar.err"
+rc=0
 # shellcheck disable=SC2086
-tar -czf "$tmp" -C / $paths 2>/dev/null
+tar -czf "$tmp" -C / $paths 2>"$err" || rc=$?
+if [ "$rc" -gt 1 ]; then
+    cat "$err" >&2
+    rm -f "$tmp" "$err"
+    exit "$rc"
+fi
+rm -f "$err"
 mv -f "$tmp" "$BACKUP_DIR/config-current.tar.gz"
 
 # Keep one dated snapshot per week (Sundays), prune to the last 4.
