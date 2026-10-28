@@ -261,20 +261,6 @@ static std::set<std::string> parse_conditions(const std::string& arr) {
   return types;
 }
 
-// Parse "sources" array: extract each device MAC string.
-static std::set<std::string> parse_sources(const std::string& arr) {
-  std::set<std::string> devs;
-  size_t pos = 0;
-  while (pos < arr.size()) {
-    size_t p = find_key(arr, pos, "device");
-    if (p == std::string::npos) break;
-    std::string val = extract_string(arr, p);
-    if (!val.empty()) devs.insert(val);
-    pos = p;
-  }
-  return devs;
-}
-
 
 }  // namespace
 
@@ -363,12 +349,20 @@ std::vector<AlarmNotifier::AutomationEntry> AlarmNotifier::parse_automations(
           entry.trigger_types = parse_conditions(arr);
         }
 
-        // Parse "sources" array (camera device filters)
-        p = member(obj, 0, "sources");
-        if (p != std::string::npos && obj[p] == '[') {
-          std::string arr = extract_balanced(obj, p);
-          entry.source_devices = parse_sources(arr);
-        }
+        // Camera filters: [{"device":"<MAC>","type":"include"|"exclude"}].
+        // A source without a type counts as included; any other type is
+        // ignored, as Protect's filterEventsBySources does.
+        for_each_element(obj, member(obj, 0, "sources"), [&](size_t sp) {
+          const std::string dev = string_at(obj, member(obj, sp, "device"));
+          if (dev.empty()) return;
+          const size_t tp = member(obj, sp, "type");
+          const std::string type = string_at(obj, tp);
+          if (type == "exclude") {
+            entry.excluded_devices.insert(dev);
+          } else if (tp == std::string::npos || type == "include") {
+            entry.source_devices.insert(dev);
+          }
+        });
 
         // Parse "cooldown" object
         p = member(obj, 0, "cooldown");
@@ -532,6 +526,13 @@ bool AlarmNotifier::schedules_match(const std::vector<Schedule>& schedules,
     if (schedule_matches(s, clock, user_away, all_away)) return true;
   }
   return false;
+}
+
+bool AlarmNotifier::covers_camera(const AutomationEntry& automation,
+                                  const std::string& mac) {
+  if (automation.excluded_devices.count(mac)) return false;
+  return automation.source_devices.empty() ||
+         automation.source_devices.count(mac) > 0;
 }
 
 bool AlarmNotifier::alarm_schedule_open(const AutomationEntry& automation,
@@ -1098,6 +1099,7 @@ void AlarmNotifier::refresh_alarms() {
     LOG(INFO) << "[alarm]   " << a.id << " enabled=" << a.enabled
               << " types=" << a.trigger_types.size()
               << " sources=" << a.source_devices.size()
+              << " excluded=" << a.excluded_devices.size()
               << " cooldown=" << a.cooldown_enabled
               << "/" << a.cooldown_ms << "ms"
               << " notify=" << a.has_notify_action
@@ -1183,12 +1185,8 @@ void AlarmNotifier::notify(const std::string& obj_type,
     // Check if this detection type matches an automation condition.
     if (!automation.trigger_types.count(obj_type)) continue;
 
-    // Check if this camera is in the automation's source list.
-    // Empty sources list means all cameras.
-    if (!automation.source_devices.empty() &&
-        !automation.source_devices.count(camera_mac)) {
-      continue;
-    }
+    // Check the automation's include / exclude camera lists.
+    if (!covers_camera(automation, camera_mac)) continue;
 
     // Enforce cooldown: skip if last fire was within the cooldown window.
     if (automation.cooldown_enabled && automation.cooldown_ms > 0) {

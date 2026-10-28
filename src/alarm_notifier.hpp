@@ -182,7 +182,10 @@ class AlarmNotifier {
     std::string id;
     std::string name;
     std::set<std::string> trigger_types;   // "person", "vehicle", etc.
-    std::set<std::string> source_devices;  // camera MACs (empty = all cameras)
+    // "include" sources: the cameras it covers (empty = all cameras).
+    std::set<std::string> source_devices;
+    // "exclude" sources: cameras it never covers, whatever is included.
+    std::set<std::string> excluded_devices;
     bool enabled = false;
     bool cooldown_enabled = false;
     uint64_t cooldown_ms = 0;
@@ -248,6 +251,10 @@ class AlarmNotifier {
   static bool schedule_matches(const Schedule& schedule,
                                const ScheduleClock& clock,
                                bool user_away, bool all_away);
+  // Whether @p automation covers the camera @p mac (Protect's
+  // filterEventsBySources: excluded never, else included or no includes).
+  static bool covers_camera(const AutomationEntry& automation,
+                            const std::string& mac);
   // Whether @p automation's own schedules let it fire at @p clock.
   static bool alarm_schedule_open(const AutomationEntry& automation,
                                   const ScheduleClock& clock);

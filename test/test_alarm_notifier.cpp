@@ -87,6 +87,9 @@ struct AlarmNotifierTest {
     absl::MutexLock lk(&n->mu_);
     return n->last_fired_;
   }
+  static bool covers(const Entry& entry, const std::string& mac) {
+    return AlarmNotifier::covers_camera(entry, mac);
+  }
 };
 
 }  // namespace onvif
@@ -967,6 +970,71 @@ static void test_recipient_resolved_through_users() {
   }
 }
 
+// ---------------------------------------------------------------------
+// Local Alarm Manager: include / exclude sources
+// ---------------------------------------------------------------------
+
+// "exclude" sources leave those cameras out and cover every other one;
+// an alarm can mix both, as Protect's filterEventsBySources allows.
+static void test_local_exclude_sources() {
+  const auto with_sources = [](const std::string& id,
+                               const std::string& sources) {
+    return R"({"id":")" + id + R"(","name":")" + id +
+           R"(","enable":true,"conditions":[{"condition":{"type":"is",)"
+           R"("source":"person"}}],"sources":)" + sources + "}";
+  };
+  const auto exclude = parse_one(with_sources(
+      "exclude", R"([{"device":"AABBCCDDEEFF","type":"exclude"}])"));
+  check(exclude.source_devices.empty() &&
+            exclude.excluded_devices.count("AABBCCDDEEFF") == 1,
+        "exclude source parsed as excluded, not included");
+  check(!AlarmNotifierTest::covers(exclude, "AABBCCDDEEFF"),
+        "exclude: the excluded camera is not covered");
+  check(AlarmNotifierTest::covers(exclude, "024D4F434B01"),
+        "exclude: every other camera is covered");
+
+  const auto include = parse_one(with_sources(
+      "include", R"([{"device":"AABBCCDDEEFF","type":"include"}])"));
+  check(AlarmNotifierTest::covers(include, "AABBCCDDEEFF") &&
+            !AlarmNotifierTest::covers(include, "024D4F434B01"),
+        "include: only the included camera is covered");
+
+  const auto mixed = parse_one(with_sources(
+      "mixed", R"([{"device":"AABBCCDDEEFF","type":"include"},)"
+               R"({"device":"024D4F434B01","type":"include"},)"
+               R"({"device":"024D4F434B01","type":"exclude"}])"));
+  check(AlarmNotifierTest::covers(mixed, "AABBCCDDEEFF") &&
+            !AlarmNotifierTest::covers(mixed, "024D4F434B01"),
+        "mixed: an excluded camera stays out even when included");
+
+  const auto unknown = parse_one(with_sources(
+      "unknown", R"([{"device":"AABBCCDDEEFF","type":"other"}])"));
+  check(unknown.source_devices.empty() && unknown.excluded_devices.empty(),
+        "a source of an unknown type is ignored");
+
+  // End to end on a Local console: the excluded camera fires nothing.
+  UosEmulator protect;
+  protect.set_alarms_json(
+      R"([{"id":"not-gate","name":"Not the gate","enable":true,)"
+      R"("conditions":[{"condition":{"type":"is","source":"person"}}],)"
+      R"("sources":[{"device":"AABBCCDDEEFF","type":"exclude"}],)"
+      R"("actions":[{"type":"SEND_NOTIFICATION","metadata":{"receivers":[)" +
+      receiver(kOwnerPk, kOwner, R"(["push"])") + R"(]},"order":-1}]}])");
+  protect.start();
+  onvif::ProtectUserIdProvider provider("owner-user-id", "");
+  {
+    onvif::AlarmNotifier notifier(protect.base_url(), &provider);
+    notifier.refresh_alarms();
+    notifier.notify("person", "AABBCCDDEEFF", "evt-x1", 1700000000000ULL);
+    check(protect.notify_bodies().empty(),
+          "Local: excluded camera does not fire the alarm");
+    notifier.notify("person", "024D4F434B01", "evt-x2", 1700000100000ULL);
+    const auto bodies = protect.notify_bodies();
+    check(bodies.size() == 1 && contains(bodies[0], R"("alarm_id":"not-gate")"),
+          "Local: a camera not excluded fires the alarm");
+  }
+}
+
 int main() {
   test_parse_basics();
   test_parse_real_alarm_push_off();
@@ -981,6 +1049,7 @@ int main() {
   test_notify_skips_but_records();
   test_legacy_path_without_alarm_manager();
   test_recipient_resolved_through_users();
+  test_local_exclude_sources();
 
   std::cerr << "PASS " << g_pass << " / FAIL " << g_fail << '\n';
   return g_fail == 0 ? 0 : 1;
