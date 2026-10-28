@@ -173,6 +173,49 @@ class SummaryParseTest(unittest.TestCase):
         self.assertEqual(d.alarm_post_codes["200"], 1)
         self.assertEqual(d.alarm["post_failed"], 0)
 
+    def test_global_alarm_lines(self):
+        d = summarize.Day("2026-10-28")
+        d.journal_line(self.PREFIX + "I1028 12:21:13.511854  583602 alarm_notifier.cpp:1746] "
+                       "[alarm] person on 024D4F434B01 (event 6ae1) handed to UniFi OS for "
+                       "\"TEST a\", \"Person\" (HTTP 202); which alarms matched is logged in "
+                       "/data/unifi-core/logs/uos-agent.log")
+        d.journal_line(self.PREFIX + "E1028 12:21:14.511854  583602 alarm_notifier.cpp:1739] "
+                       "[alarm] vehicle on 024D4F434B01 (event 6ae2) not handed to UniFi OS "
+                       "for \"TEST b\": Couldn't connect to server (after one retry); dropped")
+        d.journal_line(self.PREFIX + "I1028 12:21:15.511854  583602 alarm_notifier.cpp:1705] "
+                       "[alarm] animal on 024D4F434B01 (event 6ae3): no UniFi OS alarm fires "
+                       "on a single animal detection, nothing sent")
+        self.assertEqual(d.alarm["handed"], 1)
+        self.assertEqual(d.alarm_handed["person on 024D4F434B01"], 1)
+        self.assertEqual(d.alarm["handed_failed"], 1)
+        self.assertEqual(d.alarm["no_uos_alarm"], 1)
+
+    def test_uos_agent_lines(self):
+        d = summarize.Day("2026-10-28")
+        state = {"day_ok": True}
+        name = "unifi-core/uos-agent.log"
+        uos_lines = [
+            ("2026-10-27T23:59:59.000000001+08:00  INFO Processed alarm events "
+             "source=protect event_ids=[\"person\"] candidates=9 matched=9"),
+            ("2026-10-28T16:29:23.520108958+08:00  INFO Processed alarm events "
+             "source=protect event_ids=[\"person\"] candidates=3 matched=1 unscoped=2"),
+            ("2026-10-28T16:29:23.719031483+08:00  INFO Alarm executed successfully "
+             "alarm_id=\"01a1\" succeeded=[\"protect:webhook\"]"),
+            ("2026-10-28T16:29:24.0+08:00  WARN No valid notification receivers at this "
+             "time, skipping Notify action execution"),
+            ("2026-10-28T16:29:25.0+08:00  INFO Processed alarm events source=network "
+             "event_ids=[\"event.threat_detected\"] candidates=0"),
+        ]
+        for line in uos_lines:
+            d.file_line(name, line, state)
+        self.assertEqual(d.uos["protect_batches"], 1)
+        self.assertEqual(d.uos_protect["matched"], 1)
+        self.assertEqual(d.uos_protect["unscoped"], 2)
+        self.assertEqual(d.uos["executed"], 1)
+        self.assertEqual(d.uos["no_receivers"], 1)
+        self.assertEqual(d.pfile[name]["info"], 3)
+        self.assertEqual(d.pfile[name]["warn"], 1)
+
     def test_healer_recording_stuck(self):
         d = summarize.Day("2026-10-28")
         d.journal_line(self.PREFIX + "E1028 12:21:13.511854  583602 wedge_healer.cpp:262] "

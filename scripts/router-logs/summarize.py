@@ -37,6 +37,8 @@ _UUID = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
                    r"[0-9a-fA-F]{12}\b")
 _NUM = re.compile(r"\d+")
 _KV_INT = re.compile(r"(\w+)=(-?\d+)")
+_UOS = re.compile(r"^(\d{4}-\d\d-\d\dT[\d:.]+(?:Z|[+-]\d\d:?\d\d))\s+(TRACE|DEBUG|INFO|WARN|ERROR)"
+                  r"\s+(.*)$")
 _UNIT_START = re.compile(r"^Started ([\w@.\\-]+)\.service\b")
 _UNIT_STOP = re.compile(r"^Stopping ([\w@.\\-]+)\.service\b")
 _UNIT_EVENT = re.compile(r"^([\w@.\\-]+)\.service: (Main process exited, .*|Failed with result .*"
@@ -118,6 +120,9 @@ class Day:
         self.alarm_post_codes = collections.Counter()
         self.alarm_triggered = collections.Counter()
         self.alarm_lines = collections.Counter()
+        self.alarm_handed = collections.Counter()
+        self.uos = collections.Counter()
+        self.uos_protect = collections.Counter()
         self.cam = collections.defaultdict(collections.Counter)
         self.cam_alive = {}
         self.cam_renew_more = collections.Counter()
@@ -290,6 +295,15 @@ class Day:
         if m:
             a["triggered"] += 1
             self.alarm_triggered["%s (%s)" % m.groups()] += 1
+        m = re.match(r"\[alarm\] (\S+) on (\S+) \(event \S+\) handed to UniFi OS for ", text)
+        if m:
+            a["handed"] += 1
+            self.alarm_handed["%s on %s" % m.groups()] += 1
+        if " not handed to UniFi OS " in text or ": UniFi OS answered HTTP " in text \
+                or ": UniFi OS rejected the alarm events " in text:
+            a["handed_failed"] += 1
+        if ": no UniFi OS alarm fires on a single " in text:
+            a["no_uos_alarm"] += 1
         m = re.match(r"\[alarm\] POST \S+ → (\d+)", text)
         if m:
             self.alarm_post_codes[m.group(1)] += 1
@@ -309,6 +323,9 @@ class Day:
     # -- Protect / UniFi OS files ----------------------------------------------------------
 
     def file_line(self, name, line, state):
+        if name == "unifi-core/uos-agent.log":
+            self.uos_line(name, line, state)
+            return
         m = _PROTECT.match(line)
         if not m:
             if state["day_ok"]:
@@ -335,6 +352,34 @@ class Day:
             m2 = re.search(r'Sending push notification "([^"]+)" to mobile app "([^"]+)"', msg)
             if m2:
                 self.cloud_push["%s → %s" % m2.groups()] += 1
+
+    def uos_line(self, name, line, state):
+        m = _UOS.match(line)
+        if not m:
+            if state["day_ok"]:
+                self.pfile[name]["continuation"] += 1
+            return
+        ts, level, msg = m.groups()
+        state["day_ok"] = to_local(ts).strftime("%Y-%m-%d") == self.day
+        if not state["day_ok"]:
+            return
+        level = level.lower()
+        self.pfile[name][level] += 1
+        if level in ("warn", "error"):
+            self.ptop[name][level[0].upper() + " " + normalise(msg)] += 1
+        u = self.uos
+        if msg.startswith("Processed alarm events source=protect "):
+            u["protect_batches"] += 1
+            for k, v in _KV_INT.findall(msg):
+                self.uos_protect[k] += int(v)
+        elif msg.startswith("Alarm executed successfully"):
+            u["executed"] += 1
+        elif msg.startswith("Alarm executed partially"):
+            u["partial"] += 1
+        elif msg.startswith("Failed to execute alarm action"):
+            u["action_failed"] += 1
+        elif "No valid notification receivers" in msg:
+            u["no_receivers"] += 1
 
 
 # ---------------------------------------------------------------------------------------
@@ -676,7 +721,19 @@ def render(d, args, collector, gaps, db, db_error, sink):
             out.append("- Recorder setting `trigger_automations`: override %s, flag %s"
                        % (code(str(t.get("override"))), code(str(t.get("flag_default")))))
     a = d.alarm
-    out.append("- Recorder `[alarm] triggering automation`: %d%s" % (a["triggered"], (
+    out.append("- Recorder `[alarm] … handed to UniFi OS` (Global Alarm Manager): %d%s; "
+               "failed: %d; no alarm for the type: %d"
+               % (a["handed"], (" (" + ", ".join("%s ×%d" % kv for kv in
+                                                  d.alarm_handed.most_common(8)) + ")")
+                  if d.alarm_handed else "", a["handed_failed"], a["no_uos_alarm"]))
+    uos = d.pfile.get("unifi-core/uos-agent.log", collections.Counter())
+    out.append("- uos-agent.log: %d info, %d warn, %d error; Protect event batches %d (%s); "
+               "alarms executed %d, partially %d; action failures %d; no valid receivers %d"
+               % (uos["info"], uos["warn"], uos["error"], d.uos["protect_batches"],
+                  ", ".join("%s %d" % kv for kv in sorted(d.uos_protect.items())) or "none",
+                  d.uos["executed"], d.uos["partial"], d.uos["action_failed"],
+                  d.uos["no_receivers"]))
+    out.append("- Recorder `[alarm] triggering automation` (Local Alarm Manager): %d%s" % (a["triggered"], (
         " (" + ", ".join("%s ×%d" % kv for kv in d.alarm_triggered.most_common(8)) + ")")
         if d.alarm_triggered else ""))
     out.append("- `[alarm] POST` results: %s; failed POSTs: %d"

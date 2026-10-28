@@ -46,6 +46,10 @@ LOG_FILES = [
     ("protect", PROTECT_DIR, "armAlarm.log"),
     ("unifi-core", CORE_DIR, "notifications.log"),
     ("unifi-core", CORE_DIR, "cloud.notifications.log"),
+    # Global Alarm Manager: which alarms matched each event and what their actions did.
+    # logrotate renames it to uos-agent.log.1.gz, which is not followed: a rotation
+    # loses the lines written since the previous run and is recorded in gaps.txt.
+    ("unifi-core", CORE_DIR, "uos-agent.log"),
 ]
 HEAD_LEN = 64
 # A base-file chunk without any newline is held back (the writer is mid-line) unless it

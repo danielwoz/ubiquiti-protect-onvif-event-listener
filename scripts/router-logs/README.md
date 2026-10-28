@@ -45,7 +45,11 @@ on. Protect's own files rotate at 5 MiB. This collector keeps 180 days of both.
   - `automationManager.log`, `events.cameras.log`, `errors.log`, `thumbnails.log`
   - `notifications.log`, `notifications.push.log`, `notifications.email.log`
   - `alarmIntegrations.log`, `armAlarm.log`
-- UniFi OS, in `/data/unifi-core/logs/`: `notifications.log`, `cloud.notifications.log`.
+- UniFi OS, in `/data/unifi-core/logs/`: `notifications.log`, `cloud.notifications.log`,
+  `uos-agent.log` (Global Alarm Manager: which alarms each event matched and what their
+  actions did). `uos-agent.log` is rotated by logrotate to `uos-agent.log.1.gz`, which the
+  collector does not follow, so a rotation loses up to one run's lines and is noted in
+  `gaps.txt`.
 
 How the offsets work:
 - Each writer rotates `X.log` to `X1.log` and then `X2.log`.
