@@ -130,6 +130,9 @@ echo 'ONVIF_RECORDER_FLAGS="--verbose"' \
 systemctl restart onvif-recorder
 ```
 
+Each line reaches the journal with its severity, so
+`journalctl -u onvif-recorder -p warning` lists only the warnings and errors.
+
 ### Example: route detections from a wildlife camera as `animal`
 
 ```

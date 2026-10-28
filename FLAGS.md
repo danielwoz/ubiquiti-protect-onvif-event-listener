@@ -269,7 +269,7 @@ ExecStart=/usr/bin/onvif-recorder \
 | `--max_events_per_hour` | `10` | Maximum new events per camera per hour. `0` for unlimited. |
 | `--coalesce_history` | `true` | On startup, merge consecutive historical detections within `--coalesce_window_sec`. |
 | `--coalesce_history_days` | `30` | Days to look back for history coalescing. |
-| `--verbose` | `false` | Enable INFO-level logging (lifecycle, events, renewals). Without it only errors are logged, plus event-sharing warnings (lines starting `[event_proxy]`). |
+| `--verbose` | `false` | Enable INFO-level logging (lifecycle, events, renewals). Without it only errors are logged, plus event-sharing warnings (lines starting `[event_proxy]`). Each line reaches the journal with its severity, so `journalctl -u onvif-recorder -p warning` lists only warnings and errors. |
 | `--event_log` | _(disabled)_ | Path for parsed-event JSON Lines log. |
 | `--raw_log` | _(disabled)_ | Path for raw SOAP exchange JSON Lines log (large). |
 | `--admin_port` | `7891` | Port for the local admin HTTP server (loopback only). |

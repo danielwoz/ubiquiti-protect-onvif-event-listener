@@ -577,6 +577,15 @@ cc_test(
 )
 
 cc_test(
+    name = "test_journal_sink",
+    srcs = ["test_journal_sink.cpp"],
+    deps = [
+        "//:journal_sink",
+        "@com_google_absl//absl/log:log",
+    ],
+)
+
+cc_test(
     name = "test_pullpoint_hub",
     srcs = ["test_pullpoint_hub.cpp"],
     env = {"TSAN_OPTIONS": "suppressions=$(location //test:tsan_suppressions)"},

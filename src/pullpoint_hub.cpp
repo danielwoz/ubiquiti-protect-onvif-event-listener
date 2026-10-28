@@ -50,6 +50,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "journal_sink.hpp"
 #include "notification_fragments.hpp"
 #include "pullpoint_hub_internal.hpp"
 #include "util.hpp"
@@ -615,7 +616,9 @@ void WarningSink::Send(const absl::LogEntry& entry) {
   if (entry.log_severity() != absl::LogSeverity::kWarning) return;
   if (entry.log_severity() >= absl::StderrThreshold()) return;   // printed already
   if (!absl::StartsWith(entry.text_message(), "[event_proxy]")) return;
-  const absl::string_view line = entry.text_message_with_prefix_and_newline();
+  const absl::string_view text = entry.text_message_with_prefix_and_newline();
+  const std::string line =
+      priority_prefix_ ? with_sd_priority(text, entry.log_severity()) : std::string(text);
   std::fwrite(line.data(), 1, line.size(), out_);
   std::fflush(out_);
 }

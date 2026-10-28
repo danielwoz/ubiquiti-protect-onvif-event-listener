@@ -218,6 +218,20 @@ cc_library(
 )
 
 cc_library(
+    name = "journal_sink",
+    srcs = ["src/journal_sink.cpp"],
+    hdrs = ["src/journal_sink.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        "@com_google_absl//absl/base:log_severity",
+        "@com_google_absl//absl/log:log_entry",
+        "@com_google_absl//absl/log:log_sink",
+        "@com_google_absl//absl/strings:strings",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "log_server",
     srcs = ["src/log_server.cpp"],
     hdrs = ["src/log_server.hpp"],
@@ -276,6 +290,7 @@ cc_library(
     ],
     strip_include_prefix = "src",
     deps = [
+        ":journal_sink",
         ":notification_fragments",
         ":upstream_event",
         ":util",
@@ -625,6 +640,7 @@ cc_binary(
         ":event_proxy_mode",
         ":event_recorder",
         ":event_recovery",
+        ":journal_sink",
         ":log_ring",
         ":log_server",
         ":motion_poller",

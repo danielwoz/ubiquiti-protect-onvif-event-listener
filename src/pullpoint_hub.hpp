@@ -71,14 +71,18 @@ size_t max_pull_points_total_for(size_t shared_cameras);
 // Without --verbose only errors reach stderr, and so the journal.  This
 // sink copies event-sharing warnings ("[event_proxy] ..." lines) to
 // @p out as well, unless the stderr threshold already lets them through.
+// With @p priority_prefix each line starts with the sd-daemon "<4>"
+// prefix, for a stderr that is the journal (see JournalStderrSink).
 // Register it with absl::AddLogSink().
 class WarningSink : public absl::LogSink {
  public:
-  explicit WarningSink(std::FILE* out = stderr) : out_(out) {}
+  explicit WarningSink(std::FILE* out = stderr, bool priority_prefix = false)
+      : out_(out), priority_prefix_(priority_prefix) {}
   void Send(const absl::LogEntry& entry) override;
 
  private:
   std::FILE* const out_;
+  const bool priority_prefix_;
 };
 
 struct HubCamera {

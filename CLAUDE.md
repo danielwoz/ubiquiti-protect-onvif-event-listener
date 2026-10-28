@@ -651,7 +651,7 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--ubv_dir` | _(auto-detected)_ | Directory for per-camera UBV thumbnail files. Auto-detected on Dream Routers (`/srv/unifi-protect/video`). |
 | `--pre_buffer_sec` | `2` | Seconds to buffer before the first detection event |
 | `--post_buffer_sec` | `2` | Seconds to buffer after the last detection event |
-| `--verbose` | `false` | Set absl log level to INFO (lifecycle, events, renewals). Default: ERROR only, plus `[event_proxy]` warnings (`pullpoint::WarningSink`) |
+| `--verbose` | `false` | Set absl log level to INFO (lifecycle, events, renewals). Default: ERROR only, plus `[event_proxy]` warnings (`pullpoint::WarningSink`). When stderr is the journal (`$JOURNAL_STREAM`), each line carries its sd-daemon priority prefix (`JournalStderrSink`), so `journalctl -p warning` finds warnings and errors |
 | `--event_log` | _(disabled)_ | Path for parsed-event JSON Lines log; one line per ONVIF event |
 | `--raw_log` | _(disabled)_ | Path for raw SOAP exchange JSON Lines log; one line per HTTP request/response |
 | `--model_dir` | `/usr/share/onvif-recorder/models` | Directory containing `nanodet_m.param` and `nanodet_m.bin`. Shipped inside the .deb; models are downloaded at runtime if not present. |

@@ -59,6 +59,7 @@
 #include "camera_change_log.hpp"
 #include "detection_recorder.hpp"
 #include "event_recorder.hpp"
+#include "journal_sink.hpp"
 #include "log_ring.hpp"
 #include "admin_server.hpp"
 #include "log_server.hpp"
@@ -620,14 +621,25 @@ int main(int argc, char* argv[]) {
   // after LoadFromFile so the flag override is in effect.
   onvif::CpuProfiler::instance().start(absl::GetFlag(FLAGS_cpu_profile_hz));
 
+  // stderr, and so the journal, gets every line with --verbose and only
+  // errors without it.  Under systemd each line carries its sd-daemon
+  // priority prefix, which journald stores as the entry's PRIORITY; absl's
+  // own stderr output has no prefix, so it is replaced by JournalStderrSink.
   const bool verbose = absl::GetFlag(FLAGS_verbose);
-  if (verbose) {
-    absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
+  const absl::LogSeverityAtLeast stderr_level =
+      verbose ? absl::LogSeverityAtLeast::kInfo : absl::LogSeverityAtLeast::kError;
+  const bool stderr_journal = onvif::stderr_is_journal();
+  if (stderr_journal) {
+    absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfinity);
+    static onvif::JournalStderrSink journal_sink(stderr_level);
+    absl::AddLogSink(&journal_sink);
   } else {
-    absl::SetStderrThreshold(absl::LogSeverityAtLeast::kError);
+    absl::SetStderrThreshold(stderr_level);
+  }
+  if (!verbose) {
     // Event-sharing warnings (hand-backs, Protect moving between the
     // recorder and the camera, declines) reach the journal regardless.
-    static onvif::pullpoint::WarningSink event_proxy_warnings;
+    static onvif::pullpoint::WarningSink event_proxy_warnings(stderr, stderr_journal);
     absl::AddLogSink(&event_proxy_warnings);
   }
 

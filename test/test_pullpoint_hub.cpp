@@ -1644,6 +1644,24 @@ void test_warning_sink() {
   check(out.find("stderr already") == std::string::npos, "sink: errors are not copied twice");
   check(out.find("--verbose") == std::string::npos,
         "sink: nothing copied when the threshold lets warnings through");
+
+  // Written to the journal, the line starts with journald's warning prefix.
+  buf = nullptr;
+  len = 0;
+  mem = open_memstream(&buf, &len);
+  {
+    onvif::pullpoint::WarningSink sink(mem, /*priority_prefix=*/true);
+    absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfinity);
+    LOG(WARNING).ToSinkOnly(&sink) << "[event_proxy] cam handing back";
+  }
+  absl::SetStderrThreshold(saved);
+  std::fclose(mem);
+  const std::string journal(buf, len);
+  std::free(buf);
+  const std::string tail = "] [event_proxy] cam handing back\n";
+  check(journal.rfind("<4>W", 0) == 0 && journal.size() > tail.size() &&
+            journal.compare(journal.size() - tail.size(), tail.size(), tail) == 0,
+        "sink: a journal line starts with <4>");
 }
 
 void test_hourly_summary() {
