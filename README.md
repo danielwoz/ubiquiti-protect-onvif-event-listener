@@ -160,9 +160,27 @@ Admin UI -> Detection -> camera_object_types
   -> 192.168.1.108=animal -> Save & restart
 ```
 
-## Notification Thumbnails
-By default, object detection notifications will arrive with no thumbnail attached. In order to receive thumbnails as well, you'll need  to enable the global alarm manager.
-Details on how to do this and the associated limitations are in [`THUMBNAILS.md`](THUMBNAILS.md)
+## Alarms and notifications
+
+onvif-recorder triggers Protect's alarms (**Protect → Alarms**) for the detections it records,
+so an alarm with a Person, Vehicle, Animal or Package trigger fires for your ONVIF cameras too.
+It follows Protect's Alarm Manager setting and logs which one it uses at start-up:
+
+- **Global Alarm Manager** (alarms kept by UniFi OS): each detection is handed to UniFi OS,
+  which applies the alarm's cameras, schedule, cooldown and recipients and runs all of its
+  actions (notifications, webhooks, sirens, lights), just as for Protect's own cameras. The
+  alarm history appears in the Alarm Manager. To see which alarms a detection matched, look in
+  `/data/unifi-core/logs/uos-agent.log` on the console (`Processed alarm events ... matched=N`
+  and `Alarm executed successfully alarm_id=...`). An alarm whose trigger also needs another
+  trigger within a time window, or a count of detections, is not triggered by onvif-recorder;
+  it is named once in a warning in the journal.
+- **Local Alarm Manager** (alarms kept by Protect): onvif-recorder checks each alarm's cameras,
+  schedule, cooldown and recipients itself and sends its notifications. Notifications on this
+  path usually arrive without a thumbnail; switching Protect to the Global Alarm Manager adds
+  them. See [`THUMBNAILS.md`](THUMBNAILS.md).
+
+Turn `trigger_automations` off to record detections without triggering any alarm. See
+[Security alarms](FLAGS.md#security-alarms) for the details.
 
 ## Sharing a camera's events with Protect
 

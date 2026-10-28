@@ -106,20 +106,34 @@ unlock door, light, PTZ preset) configured in **Protect → Alarms**.
 
 1. At startup the recorder live-patches the Protect UI so third-party cameras
    appear in the alarm creation scope picker.
-2. The recorder refreshes the list of configured automations from the Protect API
-   every five minutes.
-3. When a detection event is recorded, the recorder triggers matching automations
-   via the local Protect API (port 7080), records history in `automationsHistory`
-   so hits appear in the Protect UI, and respects the "ignore repeated" cooldown
-   setting on each automation.
-4. With Global Alarm Manager on, notifications go to the alarm's recipients on
-   the channels (push, email) and schedules set in the alarm, as they do for
-   Protect's own detections. "When away" schedules are left to Protect, which
-   checks them when it sends. An alarm with no notification action, or whose
-   recipients all have notifications off or are outside their schedule, sends
-   nothing but still records the hit in its history. Outside the alarm's own
-   schedule the alarm does not fire at all: no history entry, and its
-   "ignore repeated" cooldown does not start.
+2. The recorder follows Protect's Alarm Manager setting
+   (`nvrs.featureFlags.useExternalAlarmManager` in the Protect database). It
+   logs the mode it uses at start-up and whenever it changes, for example after
+   a console moves from Local to Global.
+3. **Global Alarm Manager** (alarms kept by UniFi OS): the recorder reads the
+   alarm list from UniFi OS about once a minute. For each new detection it sends
+   UniFi OS one event per alarm with a matching Person, Vehicle, Animal or
+   Package trigger, as Protect does for its own cameras. UniFi OS then applies
+   the alarm's cameras, schedule, cooldown, pause and recipients, runs all of its
+   actions (notifications, webhooks, sirens, lights), and records the alarm's
+   history. Which alarms matched, and how their actions went, is logged only in
+   `/data/unifi-core/logs/uos-agent.log` on the console (`Processed alarm
+   events ... matched=N`, `Alarm executed successfully alarm_id=...`). Alarms
+   whose object trigger also needs another trigger within a time window, or a
+   count of detections, are not triggered by the recorder; each is named once in
+   a warning.
+4. **Local Alarm Manager** (alarms kept by Protect): the recorder refreshes the
+   automations from the Protect API every five minutes, triggers matching
+   automations via the local Protect API (port 7080), records history in
+   `automationsHistory` so hits appear in the Protect UI, and respects each
+   automation's cameras (included or excluded), schedule and "ignore repeated"
+   cooldown. Notifications go to the alarm's recipients on the channels (push,
+   email) and schedules set in the alarm. "When away" schedules are left to
+   Protect, which checks them when it sends. An alarm with no notification
+   action, or whose recipients all have notifications off or are outside their
+   schedule, sends nothing but still records the hit in its history. Outside
+   the alarm's own schedule the alarm does not fire at all: no history entry,
+   and its "ignore repeated" cooldown does not start.
 
 **Setup:**
 
@@ -260,7 +274,8 @@ ExecStart=/usr/bin/onvif-recorder \
 | `--pre_buffer_sec` | `2` | Seconds before the first detection to mark as clip start. |
 | `--post_buffer_sec` | `2` | Seconds after the last detection to mark as clip end. |
 | `--coalesce_window_sec` | `30` | Merge consecutive detections within this window into one event. `0` to disable. |
-| `--trigger_automations` | `true` | Trigger Protect automations (push notifications, chimes, sirens) for detections onvif-recorder records. Set to `false` to keep recording events without notifying. Automations for Protect's own detections (e.g. a UniFi doorbell) are unaffected. |
+| `--trigger_automations` | `true` | Trigger Protect alarms for detections onvif-recorder records. With Protect's Global Alarm Manager each detection is handed to UniFi OS, which applies the alarm's cameras, schedule, cooldown and recipients and runs all of its actions (notifications, webhooks, sirens, lights); `/data/unifi-core/logs/uos-agent.log` shows which alarms matched. With the Local Alarm Manager onvif-recorder evaluates Protect's automations itself, as before. Set to `false` to keep recording events without triggering alarms. Alarms for Protect's own detections (e.g. a UniFi doorbell) are unaffected. See [Security alarms](#security-alarms). |
+| `--notify_via_uos` | `true` | Deprecated, no effect. Kept so existing configurations load; the alarm path follows Protect's Alarm Manager setting. |
 | `--drop_unclassified_motion` | `false` | Drop generic motion events (CellMotionDetector / MotionAlarm) that carry no ONVIF object class and that NanoDet-M cannot classify, instead of recording them as `--default_object_type`. Real camera AI events (Person / Vehicle / Pet), `--camera_object_types` overrides and momentary topics such as line crossing are unaffected. Cuts false-positive clutter from AI cameras (e.g. Reolink) that also emit noisy basic-motion events. Recommended on Protect 7.1+, which creates basic motion events for third-party cameras itself; with it off, unclassified motion appears twice (Protect's motion event plus a `person` smart detection). `--default_object_type=motion` does the same. |
 | `--patch_onvif_addressing` | `true` | Make Protect's own ONVIF client (Protect 7.1+) send the WS-Addressing `To` and `Action` headers with its PullMessages, Renew and Unsubscribe requests, as onvif-recorder does. Cameras that require them, such as Reolink, otherwise reject Protect's event requests, so Protect gets no native motion events from them (on 7.2+ it shows their motion detection as misconfigured). `false` removes the change again. Needs `--patch_alarm_picker`. Protect reads service.js only when it starts, so whenever onvif-recorder changes service.js while Protect is running (on install, after a Protect or UniFi OS update, or when this setting changes) Protect is restarted about five minutes later. With `--auto_heal_protect=false`, restart it yourself. |
 | `--local_patches` | `/data/onvif-recorder/local-patches.json` | JSON file with your own find/replace patches to Protect's `service.js`: an array of `{"name", "file": "service.js", "original", "replacement"}` objects (at most 100, 1 MiB). onvif-recorder applies them after its own patches each time it patches Protect, so they survive Protect and UniFi OS updates. An entry is applied only where its `original` text occurs exactly once, and removing an entry undoes it. A missing file holds no patches; a file that is not valid applies none of them. Read at start-up, so restart onvif-recorder after editing it. Outcomes are logged (`[ui_patch] local patch`) and shown on the admin page's Status card and in `/api/status`. Needs `--patch_alarm_picker`. Empty disables. See [Keeping your own Protect patches](README.md#keeping-your-own-protect-patches). |
