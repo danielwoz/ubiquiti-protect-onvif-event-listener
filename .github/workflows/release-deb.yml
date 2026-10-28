@@ -158,9 +158,10 @@ jobs:
           ref: gh-pages
           path: apt
 
-      # The generator and channels.meta.json come from main, not from the
-      # tag, so re-running an old tag does not bring back old labels.
-      - name: Checkout channel manifest generator
+      # The generator, channels.meta.json and install.sh come from main, not
+      # from the tag, so re-running an old tag does not bring back old labels
+      # or an old installer.
+      - name: Checkout channel manifest generator and installer
         if: env.GPG_KEYID != ''
         uses: actions/checkout@v5
         with:
@@ -169,11 +170,14 @@ jobs:
           sparse-checkout: |
             scripts/gen_channels_json.py
             gh-pages/channels.meta.json
+            gh-pages/install.sh
           sparse-checkout-cone-mode: false
 
       # channels.json is regenerated in the same gh-pages commit as the
       # reprepro change, so the published channel versions always match the
-      # apt suites.
+      # apt suites.  main's install.sh goes into the same commit; one that
+      # fails `sh -n` is left out with an error annotation, keeping the
+      # published copy, and does not hold up the apt publish.
       - name: Publish to gh-pages apt repo (early-access)
         if: env.GPG_KEYID != ''
         env:
@@ -181,6 +185,7 @@ jobs:
         run: |
           git -C apt config user.name "onvif-recorder-release-bot"
           git -C apt config user.email "noreply@github.com"
+          MAIN_SHA=$(git -C src rev-parse --short HEAD)
           cd apt
           if [ ! -f conf/distributions ]; then
             echo "ERROR: gh-pages/conf/distributions missing — bootstrap the repo first." >&2
@@ -190,6 +195,16 @@ jobs:
             "$GITHUB_WORKSPACE/dist/onvif-recorder_${VERSION}_arm64.deb"
           python3 ../src/scripts/gen_channels_json.py --apt-root . \
             --meta ../src/gh-pages/channels.meta.json --out channels.json
+          if sh -n ../src/gh-pages/install.sh; then
+            install -m 0755 ../src/gh-pages/install.sh install.sh
+          else
+            echo "::error::gh-pages/install.sh on main ($MAIN_SHA) fails sh -n; the published install.sh is unchanged"
+          fi
           git add -A
-          git commit -m "Publish onvif-recorder ${VERSION} to early-access"
+          if git diff --cached --quiet -- install.sh; then
+            git commit -m "Publish onvif-recorder ${VERSION} to early-access"
+          else
+            git commit -m "Publish onvif-recorder ${VERSION} to early-access" \
+              -m "Also publishes install.sh from main ${MAIN_SHA}."
+          fi
           git push origin gh-pages

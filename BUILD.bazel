@@ -74,6 +74,7 @@ exports_files(
 exports_files(
     [
         "gh-pages/channels.meta.json",
+        "gh-pages/install.sh",
         "scripts/gen_channels_json.py",
     ],
     visibility = ["//test:__pkg__"],

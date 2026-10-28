@@ -1,16 +1,20 @@
 name: Channel manifest
 
 # Regenerates channels.json on gh-pages from the apt suites and main's
-# gh-pages/channels.meta.json, and commits it only when it changed.
-# release-deb and promote regenerate it with every apt change; this
-# workflow publishes label, description or default changes without a
-# release, and creates the first channels.json.
+# gh-pages/channels.meta.json, copies main's gh-pages/install.sh to
+# install.sh (the curl | sh installer), and commits both in one commit made
+# only when either changed.  release-deb and promote do the same with every
+# apt change; this workflow publishes installer, label, description or
+# default changes without a release, and creates the first channels.json.
+# Both files always come from main, never from a tag, so re-running an old
+# release does not bring back an old installer or old labels.
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
       - 'gh-pages/channels.meta.json'
+      - 'gh-pages/install.sh'
       - 'scripts/gen_channels_json.py'
       - '.github/workflows/channels-manifest.yml'
 
@@ -35,7 +39,7 @@ jobs:
           ref: gh-pages
           path: apt
 
-      - name: Checkout channel manifest generator
+      - name: Checkout channel manifest generator and installer
         uses: actions/checkout@v5
         with:
           ref: main
@@ -43,19 +47,42 @@ jobs:
           sparse-checkout: |
             scripts/gen_channels_json.py
             gh-pages/channels.meta.json
+            gh-pages/install.sh
           sparse-checkout-cone-mode: false
 
-      - name: Regenerate channels.json
+      # An install.sh that fails `sh -n` is not published: the copy already
+      # on gh-pages stays, channels.json is still committed, and the run
+      # fails so the error is seen.
+      - name: Regenerate channels.json and publish install.sh
         run: |
           git -C apt config user.name "onvif-recorder-release-bot"
           git -C apt config user.email "noreply@github.com"
+          MAIN_SHA=$(git -C src rev-parse --short HEAD)
           cd apt
           python3 ../src/scripts/gen_channels_json.py --apt-root . \
             --meta ../src/gh-pages/channels.meta.json --out channels.json
-          git add channels.json
-          if git diff --cached --quiet; then
-            echo "channels.json is unchanged"
-            exit 0
+          installer_ok=true
+          if sh -n ../src/gh-pages/install.sh; then
+            install -m 0755 ../src/gh-pages/install.sh install.sh
+          else
+            installer_ok=false
+            echo "::error::gh-pages/install.sh on main ($MAIN_SHA) fails sh -n; the published install.sh is unchanged"
           fi
-          git commit -m "Regenerate channels.json"
-          git push origin gh-pages
+          git add channels.json install.sh
+          json=false
+          installer=false
+          git diff --cached --quiet -- channels.json || json=true
+          git diff --cached --quiet -- install.sh || installer=true
+          case "$json,$installer" in
+            true,true)  msg="Regenerate channels.json, publish install.sh from main $MAIN_SHA" ;;
+            true,false) msg="Regenerate channels.json" ;;
+            false,true) msg="Publish install.sh from main $MAIN_SHA" ;;
+            *)          msg= ;;
+          esac
+          if [ -n "$msg" ]; then
+            git commit -m "$msg"
+            git push origin gh-pages
+          else
+            echo "channels.json and install.sh are unchanged"
+          fi
+          [ "$installer_ok" = true ]

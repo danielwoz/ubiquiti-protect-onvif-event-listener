@@ -1,6 +1,8 @@
 #!/bin/sh
 # Checks for the Debian maintainer scripts:
-#   1. prerm, postinst, postrm and preinst pass `sh -n`.
+#   1. prerm, postinst, postrm and preinst pass `sh -n`, and so does
+#      gh-pages/install.sh, which the package ships for the recovery layer
+#      and the gh-pages workflows publish as the curl | sh installer.
 #   2. prerm's upgrade) branch does not stop onvif-recorder.service, so the
 #      running recorder keeps serving while dpkg unpacks the new files.
 #   3. prerm's remove|deconfigure) branch still stops the service, and on
@@ -21,6 +23,7 @@ PRERM="$DEB/prerm"
 POSTINST="$DEB/postinst"
 POSTRM="$DEB/postrm"
 PREINST="$DEB/preinst"
+INSTALLER="${TEST_SRCDIR}/_main/gh-pages/install.sh"
 TMP="${TEST_TMPDIR:-/tmp}/debian_scripts_$$"
 mkdir -p "$TMP/bin"
 
@@ -65,7 +68,7 @@ line_of() {
 }
 
 # ----- 1. Syntax -----
-for f in "$PRERM" "$POSTINST" "$POSTRM" "$PREINST"; do
+for f in "$PRERM" "$POSTINST" "$POSTRM" "$PREINST" "$INSTALLER"; do
     name=$(basename "$f")
     if [ ! -f "$f" ]; then
         bad "$name is missing from runfiles"

@@ -724,5 +724,6 @@ sh_test(
         "//:debian/postrm",
         "//:debian/preinst",
         "//:debian/prerm",
+        "//:gh-pages/install.sh",
     ],
 )

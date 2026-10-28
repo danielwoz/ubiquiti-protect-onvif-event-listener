@@ -41,7 +41,7 @@ root directory.
     early-access/   {…}
   pool/main/o/onvif-recorder/onvif-recorder_*_arm64.deb
   onvif-recorder.gpg                    public key (ASCII-armoured)
-  install.sh                            one-line installer
+  install.sh                            one-line installer (see below)
   channels.json                         release channel manifest (see below)
 ```
 
@@ -59,10 +59,11 @@ it to fill its channel drop-down.
 - **Publishing.** `release-deb.yml` and `promote.yml` regenerate it in the
   same gh-pages commit as their reprepro change, always with the generator
   and metadata from `main`. `channels-manifest.yml` regenerates it on a push
-  to `main` that touches the metadata or the generator, or when run by hand,
-  and commits only when it changed. All three (release-deb only in its
-  short `publish-apt` job) share the `gh-pages-publish` concurrency group.
-  Never edit `channels.json` on gh-pages by hand.
+  to `main` that touches the metadata, the generator or `install.sh`, or
+  when run by hand, and commits only when it or `install.sh` changed. All
+  three (release-deb only in its short `publish-apt` job) share the
+  `gh-pages-publish` concurrency group. Never edit `channels.json` on
+  gh-pages by hand.
 - **Latest = early-access.** "Latest (alpha)" is the label of the
   `early-access` suite, with `latest` as an alias. The suite, the channel
   file on the router and the admin page keep the id `early-access`.
@@ -115,6 +116,34 @@ curl -s https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener/channe
 
 GitHub Pages serves it with `cache-control: max-age=600`, so a new version
 can take about ten minutes plus the Pages build to show up.
+
+## Installer (`install.sh`)
+
+`install.sh` at the root of gh-pages is the installer behind
+`curl -fsSL …/install.sh | sh`. Its source is `install.sh` in this directory
+on `main`; the package also ships that file as
+`/usr/share/onvif-recorder/install.sh` for the recovery layer.
+
+- **Publishing.** Every gh-pages commit made by a workflow copies `main`'s
+  `gh-pages/install.sh` to `install.sh` with mode 0755: `release-deb.yml`
+  and `promote.yml` in their reprepro commit, and `channels-manifest.yml`
+  on a push to `main` that touches it, or when run by hand, in one commit
+  with `channels.json` made only when either changed. It always comes from
+  `main`, never from a tag, so re-running an old release does not bring
+  back an old installer.
+- **Syntax gate.** A copy that fails `sh -n` is not published: the copy
+  already on gh-pages stays and the run shows an error annotation
+  (`channels-manifest.yml` also fails the run). `//test:test_debian_scripts`
+  runs the same check in CI.
+- Never edit `install.sh` on gh-pages by hand; change it here and push.
+
+Check the published copy against `main` with:
+
+```bash
+git fetch origin main
+curl -fsS https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener/install.sh \
+  | diff - <(git show origin/main:gh-pages/install.sh) && echo "install.sh matches main"
+```
 
 ## Secrets
 

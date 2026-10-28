@@ -140,7 +140,7 @@ test/
   test_pullpoint_server.cpp       — PullPoint SOAP service tests (libcurl client)
   test_pullpoint_e2e.cpp          — Emulated camera → listener → hub → PullPoint service
   test_event_proxy_mode.cpp       — Event-sharing mode table and state-file tests
-  test_debian_scripts.sh          — prerm / postinst upgrade-path checks
+  test_debian_scripts.sh          — prerm / postinst upgrade-path checks, `sh -n` of install.sh
   test_gen_channels_json.sh       — channels.json generator checks (fixtures in testdata/apt/)
   bench_onvif_listener.cpp        — ONVIF parsing throughput benchmark
   bench_jpeg_crop.cpp             — JPEG crop throughput benchmark
@@ -594,11 +594,19 @@ workflow (Actions → Promote apt suite → Run workflow):
 Both `release-deb.yml` and `promote.yml` regenerate `channels.json` (the
 channel list with each suite's current version, read by the Windows
 installer) in the same gh-pages commit, using `scripts/gen_channels_json.py`
-and `gh-pages/channels.meta.json` from `main`. After a promotion, re-run the
+and `gh-pages/channels.meta.json` from `main`. The same commit copies
+`main`'s `gh-pages/install.sh` to `install.sh` (the `curl … | sh` installer)
+unless it fails `sh -n`, which leaves the published copy and an error
+annotation on the run. After a promotion, re-run the
 step 6 check below for the destination suite. "Latest (alpha)" is only the
 installer's label for `early-access`; there is no `latest` suite. Labels,
 descriptions and the default channel live in `gh-pages/channels.meta.json`;
-pushing a change to it on `main` publishes it via `channels-manifest.yml`.
+pushing a change to it or to `gh-pages/install.sh` on `main` publishes it via
+`channels-manifest.yml`, in one commit made only when `channels.json` or
+`install.sh` changed. All three take `channels.meta.json` and `install.sh`
+from `main`, never from a tag, so re-running an old release does not bring
+back old labels or an old installer. `install.sh` on gh-pages is never
+edited by hand.
 
 ### Required release notes
 
@@ -646,13 +654,18 @@ gh release view v<X.Y.Z> --json name,body,assets --jq \
 #   -> body_chars must be > 0
 #   -> assets must include both "onvif_recorder_arm64" and "onvif-recorder.service"
 
-# 6. CHANNEL MANIFEST CHECK (after release-deb.yml has published to early-access;
-#    GitHub Pages caches for 10 min, so allow ~10 min plus the Pages build)
+# 6. CHANNEL MANIFEST + INSTALLER CHECK (after release-deb.yml has published to
+#    early-access; GitHub Pages caches for 10 min, so allow ~10 min plus the
+#    Pages build)
 curl -s https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener/channels.json \
   | python3 -m json.tool
 #   -> must parse, "schema": 1
 #   -> the "early-access" channel's "version" must be <X.Y.Z>
 #   -> rc / stable versions must match `promote.yml` runs so far
+git fetch origin main
+curl -fsS https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener/install.sh \
+  | diff - <(git show origin/main:gh-pages/install.sh) && echo "install.sh matches main"
+#   -> no diff output, then "install.sh matches main"
 ```
 
 If step 5 shows empty notes or missing assets, repair immediately with
@@ -662,8 +675,11 @@ If step 5 shows empty notes or missing assets, repair immediately with
 If step 6 shows an old version or a 404, check the release-deb run's
 `publish-apt` job (re-run it if it shows as cancelled), then run
 **Actions → Channel manifest → Run workflow** (`channels-manifest.yml`),
-which regenerates `channels.json` from the apt suites and commits it only
-if it changed. Never edit `channels.json` on gh-pages by hand.
+which regenerates `channels.json` from the apt suites, copies `main`'s
+`gh-pages/install.sh`, and commits only what changed. If the published
+`install.sh` still differs from `main`'s, look for a `fails sh -n` error on
+that run and fix `gh-pages/install.sh` on `main`; the push re-runs the
+workflow. Never edit `channels.json` or `install.sh` on gh-pages by hand.
 
 ## Command-line flags (runtime)
 
