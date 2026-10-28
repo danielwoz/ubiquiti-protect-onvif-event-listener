@@ -12,7 +12,7 @@ from . import __version__
 from .config import KNOB_DEFAULTS, Settings
 from .events import KINDS
 from .media import MediaSupervisor
-from .onvif import SNAPSHOT_PATH, Camera, Response
+from .onvif import SNAPSHOT_PATH, Camera, Response, check_object_opts
 from .soap import iso
 
 log = logging.getLogger("mockcam")
@@ -172,8 +172,12 @@ class ControlHandler(_Base):
         elif u.path == "/mock/config":
             self._json(200, cam.knobs.snapshot())
         elif u.path == "/mock/requests":
-            self._json(200, cam.requests.query(int(q.get("since", 0)), q.get("op", ""),
-                                               int(q.get("limit", 200))))
+            try:
+                since, limit = int(q.get("since", 0)), int(q.get("limit", 200))
+            except ValueError:
+                self._json(400, {"error": "since and limit must be integers"})
+                return
+            self._json(200, cam.requests.query(since, q.get("op", ""), limit))
         elif u.path == "/mock/subscriptions":
             self._json(200, cam.bus.info())
         elif u.path == "/mock/events":
@@ -247,8 +251,14 @@ def post_event(cam: Camera, body: dict) -> dict:
         raise ValueError(f"kind must be one of {', '.join(sorted(KINDS))}")
     stateful = KINDS[kind].state_item is not None
     explicit = "state" in body
-    state = bool(body.get("state", True))
+    state = body.get("state", True)
+    if not isinstance(state, bool):
+        raise ValueError("state must be true or false")
     duration = body.get("duration_s")
+    if duration is not None and (isinstance(duration, bool)
+                                 or not isinstance(duration, (int, float))
+                                 or not 0 <= duration <= 86400):
+        raise ValueError("duration_s must be a number of seconds, 0..86400")
     if stateful and not explicit and duration is None:
         duration = 5
     opts = {k: body[k] for k in ("rule", "object_id", "bbox", "token", "source", "data",
@@ -266,14 +276,33 @@ def post_event(cam: Camera, body: dict) -> dict:
     return out
 
 
+def _scenario_opts(sc: dict, kind: str) -> dict:
+    """emit() options for event @p kind of scenario @p sc."""
+    if KINDS[kind].object_items:
+        return {"cls": sc["class"], "bbox": sc["bbox"]}
+    return {}
+
+
+def _end_scenario_locked(cam: Camera) -> None:
+    """Cancels the running scenario; events it has set to true go back to false at once.
+
+    Called with cam.scenario_lock held, so the scenario's own thread cannot emit in between.
+    """
+    sc = cam.scenario
+    cam.scenario_gen += 1
+    cam.scenario = None
+    if sc and sc["phase"] == "active":
+        for e in sc["events"]:
+            cam.emit(e, False, **_scenario_opts(sc, e))
+
+
 def start_scenario(cam: Camera, body: dict) -> dict:
     """POST /mock/scenario: show a subject, then emit its events for the given seconds."""
     kind = body.get("kind")
     if kind == "none":
         with cam.scenario_lock:
-            cam.scenario_gen += 1
-            cam.scenario = None
-        cam.set_subject("none")
+            _end_scenario_locked(cam)
+            cam.set_subject("none")
         return {"cleared": True}
     if kind not in SCENARIOS:
         raise ValueError(f"kind must be one of {', '.join(SCENARIOS)} or none")
@@ -290,42 +319,39 @@ def start_scenario(cam: Camera, body: dict) -> dict:
         if e not in KINDS or KINDS[e].state_item is None:
             raise ValueError(f"scenario events must be stateful kinds, not {e!r}")
     bbox = body.get("bbox", [-0.4, -0.8, 0.4, 0.9])
+    check_object_opts(cls, bbox)
 
     with cam.scenario_lock:
-        cam.scenario_gen += 1
+        _end_scenario_locked(cam)
         gen = cam.scenario_gen
-        cam.scenario = {"kind": kind, "events": events, "seconds": seconds,
-                        "started": iso(time.time()), "phase": "lead"}
-    cam.set_subject(subject)
-
-    def opts_for(e: str) -> dict:
-        if KINDS[e].object_items:
-            return {"cls": cls or "", "bbox": bbox}
-        return {}
-
-    def current() -> bool:
-        with cam.scenario_lock:
-            return cam.scenario_gen == gen
+        sc = {"kind": kind, "events": events, "seconds": seconds, "class": cls or "",
+              "bbox": bbox, "started": iso(time.time()), "phase": "lead"}
+        cam.scenario = sc
+        cam.set_subject(subject)
 
     def run():
+        # Each phase change happens under the lock and only while this scenario is current;
+        # a scenario that was cancelled has already had its events set back to false.
         time.sleep(lead)
-        if not current():
-            return
-        cam.scenario["phase"] = "active"
-        for e in events:
-            cam.emit(e, True, **opts_for(e))
+        with cam.scenario_lock:
+            if cam.scenario_gen != gen:
+                return
+            sc["phase"] = "active"
+            for e in events:
+                cam.emit(e, True, **_scenario_opts(sc, e))
         time.sleep(seconds)
-        for e in events:
-            cam.emit(e, False, **opts_for(e))
-        if not current():
-            return
-        cam.scenario["phase"] = "tail"
+        with cam.scenario_lock:
+            if cam.scenario_gen != gen:
+                return
+            sc["phase"] = "tail"
+            for e in events:
+                cam.emit(e, False, **_scenario_opts(sc, e))
         time.sleep(tail)
         with cam.scenario_lock:
             if cam.scenario_gen != gen:
                 return
             cam.scenario = None
-        cam.set_subject("none")
+            cam.set_subject("none")
 
     threading.Thread(target=run, daemon=True).start()
     return {"started": True, "kind": kind, "subject": subject, "events": events,

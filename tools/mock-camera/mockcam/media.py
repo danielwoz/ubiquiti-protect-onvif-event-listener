@@ -20,9 +20,11 @@ FONT = "/usr/share/fonts/dejavu/DejaVuSansMono-Bold.ttf"
 MEDIAMTX_API = "http://127.0.0.1:9997"
 
 
-def _atomic_write(path: str, data: bytes) -> None:
+def _atomic_write(path: str, data: bytes, mode: int = 0o644) -> None:
+    """Replaces @p path with @p data; the file has @p mode from the moment it exists."""
     tmp = f"{path}.tmp{os.getpid()}"
-    with open(tmp, "wb") as f:
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode), "wb") as f:
+        os.fchmod(f.fileno(), mode)
         f.write(data)
     os.replace(tmp, path)
 
@@ -74,9 +76,9 @@ class MediaSupervisor:
             "rtmp": False, "hls": False, "webrtc": False, "srt": False, "moq": False,
             "paths": {"stream1": {"source": "publisher"}, "stream2": {"source": "publisher"}},
         }
-        path = os.path.join(self.run_dir, "mediamtx.yml")
-        _atomic_write(path, json.dumps(conf, indent=1).encode())
-        os.chmod(path, 0o600)
+        # Holds the RTSP password: never readable by anyone else, not even briefly.
+        _atomic_write(os.path.join(self.run_dir, "mediamtx.yml"),
+                      json.dumps(conf, indent=1).encode(), 0o600)
         _atomic_write(self.clock_path, (
             f"{s.manufacturer} {s.model}   %{{gmtime:%Y-%m-%d %H\\:%M\\:%S}} UTC   "
             "frame %{frame_num}").encode())

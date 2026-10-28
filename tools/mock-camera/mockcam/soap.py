@@ -272,7 +272,7 @@ def check_username_token(tok: UsernameToken, username: str, password: str,
             return False, "bad nonce"
         expect = base64.b64encode(hashlib.sha1(
             nonce + tok.created.encode("utf-8") + password.encode("utf-8")).digest()).decode()
-        if not hmac.compare_digest(expect, tok.password):
+        if not hmac.compare_digest(expect.encode(), tok.password.encode("utf-8")):
             return False, "digest mismatch"
     elif not hmac.compare_digest(tok.password.encode("utf-8"), password.encode("utf-8")):
         return False, "password mismatch"
@@ -347,7 +347,7 @@ class DigestAuth:
             ts = int(nonce[:-24], 16)
         except ValueError:
             return False, False
-        if not hmac.compare_digest(self._nonce(ts), nonce):
+        if not hmac.compare_digest(self._nonce(ts).encode(), nonce.encode("utf-8")):
             return False, False
         if p.get("username") != self.username or p.get("realm") != self.realm:
             return False, False
@@ -358,7 +358,7 @@ class DigestAuth:
             expect = _md5(f"{ha1}:{nonce}:{p.get('nc', '')}:{p.get('cnonce', '')}:{qop}:{ha2}")
         else:
             expect = _md5(f"{ha1}:{nonce}:{ha2}")
-        if not hmac.compare_digest(expect, p.get("response", "")):
+        if not hmac.compare_digest(expect.encode(), p.get("response", "").encode("utf-8")):
             return False, False
         if time.time() - ts > self.nonce_ttl_s:
             return False, True

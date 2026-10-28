@@ -30,7 +30,7 @@ The camera provides:
 | Identity | Manufacturer `MockCam`, Model `ONVIF-SIM-1` (Protect names it "MockCam ONVIF-SIM-1"), serial `MOCKCAM0001`, HwAddress `02:4D:4F:43:4B:01` |
 | Image | `127.0.0.1:30500/onvif-mockcam:<gitrev>` (and `:dev`), built by `build.sh` |
 | Homelab deployment | `/mnt/cephfs/ssd/homelab/k8s/onvif-mockcam.yaml`: namespace `onvif-test`, MetalLB `192.168.3.216` on VLAN 3 |
-| Credentials | Kubernetes Secret `onvif-test/mockcam-credentials` (`username`, `password`), copied from `/mnt/cephfs/ssd/homelab/.credentials/onvif-mockcam` (`user=`, `password=`) |
+| Credentials | Kubernetes Secret `onvif-test/mockcam-credentials` (`user`, `password`), copied from `/mnt/cephfs/ssd/homelab/.credentials/onvif-mockcam` (`user=`, `password=`) |
 
 ## Endpoints
 
@@ -240,7 +240,8 @@ Other options:
 - `"ai_kind"` chooses a different AI topic.
 - `"events"` replaces the list.
 
-A new scenario cancels the one running; `"kind": "none"` clears the subject.
+A new scenario cancels the one running, and `"kind": "none"` cancels it and clears the
+subject. Events the cancelled scenario had set to true go back to false at once.
 
 The subjects are the public-domain `test/testdata/security_cam_person.jpg` and
 `security_cam_vehicle.jpg`, a CC0 photo of a dog, and a drawn parcel. `subjects/SOURCES.md`

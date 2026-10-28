@@ -186,6 +186,20 @@ def test_wsse_only_mode_has_no_challenge(cam):
     assert status == 400 and "www-authenticate" not in hdrs
 
 
+def test_non_ascii_credentials_are_refused_not_errors(cam):
+    tok = soap.make_username_token(USER, PASSWORD, "2026-01-01T00:00:00Z").replace(
+        "</wsse:Password>", "é</wsse:Password>")
+    status, _, root = cam.soap("/onvif/device_service", "GetDeviceInformation", DEV, auth=None,
+                               extra_header=tok)
+    assert status == 400 and "ter:NotAuthorized" in fault_subcodes(root)
+    status, hdrs, _ = cam.http("GET", "/snapshot.jpg")
+    authz = soap.digest_response_header(USER, PASSWORD, "GET", "/snapshot.jpg",
+                                        hdrs["www-authenticate"])
+    authz = authz.replace('response="', 'response="é')
+    status, _, _ = cam.http("GET", "/snapshot.jpg", headers={"Authorization": authz})
+    assert status == 401
+
+
 # --------------------------------------------------------------------------- device and media
 
 def test_get_services_default_and_knobs(cam):
@@ -302,6 +316,33 @@ def test_encoder_options_and_set(cam):
     assert cam.soap("/onvif/media_service", "SetVideoEncoderConfiguration", MEDIA, conf)[0] == 400
 
 
+def _set_encoder(cam, name="Sub", profile="Main"):
+    tt = 'xmlns="http://www.onvif.org/ver10/schema"'
+    conf = (f'<Configuration token="VEC_2"><Name {tt}>{name}</Name><Encoding {tt}>H264'
+            f"</Encoding><H264 {tt}><GovLength>20</GovLength><H264Profile>{profile}"
+            "</H264Profile></H264></Configuration>")
+    return cam.soap("/onvif/media_service", "SetVideoEncoderConfiguration", MEDIA, conf)
+
+
+def test_encoder_name_is_escaped_and_profile_checked(cam):
+    assert _set_encoder(cam, name="Sub &amp; &lt;b&gt;", profile="high")[0] == 200
+    e = cam.cam._encoders()["stream2"]
+    assert (e["name"], e["profile"]) == ("Sub & <b>", "High")
+    status, _, root = cam.soap("/onvif/media_service", "GetProfiles", MEDIA)
+    assert status == 200
+    assert root is not None and body_of(root).find(
+        "trt:Profiles[@token='stream2']/tt:VideoEncoderConfiguration/tt:Name", NS).text == \
+        "Sub & <b>"
+    cam.cam.knobs.update({"media2": True})
+    status, _, root = cam.soap("/onvif/media2_service", "GetProfiles", soap.NS["tr2"],
+                               "<Type>All</Type>")
+    assert status == 200 and root is not None
+    # x264 only knows the offered profiles; anything else is refused, not stored.
+    status, _, root = _set_encoder(cam, profile="Bogus")
+    assert status == 400 and "ter:ConfigModify" in fault_subcodes(root)
+    assert cam.cam._encoders()["stream2"]["profile"] == "High"
+
+
 def test_unknown_operation_is_action_not_supported(cam):
     status, _, root = cam.soap("/onvif/device_service", "GetDot11Status", DEV)
     assert status == 400
@@ -336,6 +377,15 @@ def test_imaging(cam):
     assert status == 200
     opts = body_of(root).find("timg:ImagingOptions", NS)
     assert opts.findtext("tt:Brightness/tt:Max", namespaces=NS) == "100"
+    status, _, _ = cam.soap("/onvif/imaging_service", "SetImagingSettings", soap.NS["timg"],
+                            "<VideoSourceToken>VideoSource_1</VideoSourceToken><ImagingSettings>"
+                            "<IrCutFilter xmlns=\"http://www.onvif.org/ver10/schema\">A&lt;B"
+                            "</IrCutFilter></ImagingSettings>")
+    assert status == 200
+    status, _, root = cam.soap("/onvif/imaging_service", "GetImagingSettings", soap.NS["timg"],
+                               "<VideoSourceToken>VideoSource_1</VideoSourceToken>")
+    assert status == 200 and root is not None
+    assert body_of(root).findtext("timg:ImagingSettings/tt:IrCutFilter", namespaces=NS) == "A<B"
     status, _, root = cam.soap("/onvif/media_service", "GetVideoSources", MEDIA)
     assert body_of(root).find("trt:VideoSources", NS).get("token") == "VideoSource_1"
 
@@ -442,6 +492,10 @@ def test_pull_holds_until_timeout_then_wakes_on_event(cam):
     assert msgs[0]["topic"] == "tns1:RuleEngine/CellMotionDetector/Motion"
     assert msgs[0]["data"] == {"IsMotion": "true"}
     assert msgs[0]["source"]["Rule"] == "MyMotionDetectorRule"
+    # Timeout PT0S asks for an immediate answer.
+    t0 = time.monotonic()
+    assert _pull(cam, root, timeout="PT0S") == []
+    assert time.monotonic() - t0 < 1
 
 
 @pytest.mark.parametrize("kind", sorted(KINDS))
@@ -591,6 +645,14 @@ def test_control_api_validation(cam):
     assert cam.control("POST", "/mock/config", {"auth_mode": "basic"})[0] == 400
     assert cam.control("POST", "/mock/event", {"kind": "bogus"})[0] == 400
     assert cam.control("POST", "/mock/event", {"kind": "field", "bbox": [0, 0, 2, 2]})[0] == 400
+    # Rejected before anything is emitted, so no state is left stuck on.
+    assert cam.control("POST", "/mock/event", {"kind": "cell_motion", "state": "false"})[0] == 400
+    assert cam.control("POST", "/mock/event", {"kind": "cell_motion", "duration_s": -1})[0] == 400
+    assert cam.control("POST", "/mock/event", {"kind": "cell_motion", "duration_s": "x"})[0] == 400
+    assert all(s["data"].get("IsMotion") != "true" for s in cam.cam.bus.states())
+    assert cam.control("POST", "/mock/scenario", {"kind": "person", "ai": True,
+                                                  "bbox": [0, 0, 2, 2]})[0] == 400
+    assert cam.control("GET", "/mock/requests?since=abc")[0] == 400
     status, data = cam.control("POST", "/mock/config", {"slots": 2, "wsa_strict": True})
     assert status == 200 and sorted(data["changed"]) == ["slots", "wsa_strict"]
     status, data = cam.control("GET", "/mock/requests")
@@ -623,3 +685,31 @@ def test_scenario_emits_motion_and_restores(cam):
     assert ("Motion", ["false"]) in topics
     time.sleep(0.2)
     assert cam.cam.knobs["subject"] == "none"
+
+
+def _motion_state(cam):
+    return {s["topic"]: s["data"] for s in cam.cam.bus.states()}[
+        KINDS["cell_motion"].topic]["IsMotion"]
+
+
+def test_new_scenario_cancels_the_running_one(cam):
+    cam.control("POST", "/mock/scenario", {"kind": "person", "seconds": 0.6, "lead_s": 0,
+                                           "tail_s": 0})
+    time.sleep(0.3)
+    cam.control("POST", "/mock/scenario", {"kind": "vehicle", "seconds": 1.5, "lead_s": 0,
+                                           "tail_s": 0})
+    # Past the end of the first scenario: its stop must not end the second one's motion.
+    time.sleep(0.6)
+    assert _motion_state(cam) == "true"
+    assert cam.cam.knobs["subject"] == "vehicle"
+    assert cam.cam.scenario["kind"] == "vehicle"
+
+
+def test_none_cancels_the_scenario_and_its_events(cam):
+    cam.control("POST", "/mock/scenario", {"kind": "person", "seconds": 5, "lead_s": 0,
+                                           "tail_s": 0})
+    time.sleep(0.3)
+    assert _motion_state(cam) == "true"
+    assert cam.control("POST", "/mock/scenario", {"kind": "none"})[0] == 200
+    assert _motion_state(cam) == "false"
+    assert cam.cam.knobs["subject"] == "none" and cam.cam.scenario is None

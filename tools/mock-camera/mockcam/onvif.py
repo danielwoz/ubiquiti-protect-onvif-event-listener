@@ -41,6 +41,8 @@ OPTIONAL_SERVICES = ("media2", "events", "deviceio", "ptz", "imaging", "analytic
 # is what Protect sends first, without credentials, to learn the camera's clock).
 PRE_AUTH = {("device", "GetSystemDateAndTime")}
 
+H264_PROFILES = ("Baseline", "Main", "High")
+
 SUBSCRIPTION_OPS = {"PullMessages", "Renew", "Unsubscribe", "SetSynchronizationPoint"}
 WSA_OPS = {"PullMessages", "Renew", "Unsubscribe"}
 
@@ -93,6 +95,15 @@ class RequestLog:
     def clear(self) -> None:
         with self._lock:
             self._items.clear()
+
+
+def check_object_opts(cls, bbox) -> None:
+    """Raises ValueError unless @p cls and @p bbox are valid ClassTypes and BoundingBox values."""
+    if cls not in (None, "") and cls not in CLASS_TYPES:
+        raise ValueError(f"class must be one of {', '.join(CLASS_TYPES)} or empty")
+    if bbox is not None and (not isinstance(bbox, (list, tuple)) or len(bbox) != 4
+                             or not all(-1 <= float(v) <= 1 for v in bbox)):
+        raise ValueError("bbox must be [left, top, right, bottom] in ONVIF -1..1 coordinates")
 
 
 def _bool(text: Optional[str]) -> Optional[bool]:
@@ -331,7 +342,7 @@ class Camera:
                  f"<tt:Second>{t.tm_sec}</tt:Second></tt:Time><tt:Date><tt:Year>{t.tm_year}"
                  f"</tt:Year><tt:Month>{t.tm_mon}</tt:Month><tt:Day>{t.tm_mday}</tt:Day></tt:Date>")
         return ("<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime>"
-                f"<tt:DateTimeType>{self.datetime_type}</tt:DateTimeType>"
+                f"<tt:DateTimeType>{esc(self.datetime_type)}</tt:DateTimeType>"
                 "<tt:DaylightSavings>false</tt:DaylightSavings>"
                 f"<tt:TimeZone><tt:TZ>{esc(self.timezone)}</tt:TZ></tt:TimeZone>"
                 f"<tt:UTCDateTime>{stamp}</tt:UTCDateTime>"
@@ -558,16 +569,17 @@ class Camera:
 
     @staticmethod
     def _vec1(e: dict, tag: str = "tt:VideoEncoderConfiguration") -> str:
-        return (f"<{tag} token=\"{e['token']}\"><tt:Name>{e['name']}</tt:Name>"
+        return (f"<{tag} token=\"{e['token']}\"><tt:Name>{esc(e['name'])}</tt:Name>"
                 "<tt:UseCount>1</tt:UseCount><tt:Encoding>H264</tt:Encoding>"
                 f"<tt:Resolution><tt:Width>{e['width']}</tt:Width><tt:Height>{e['height']}"
                 f"</tt:Height></tt:Resolution><tt:Quality>{e['quality']}</tt:Quality>"
                 f"<tt:RateControl><tt:FrameRateLimit>{e['fps']}</tt:FrameRateLimit>"
                 "<tt:EncodingInterval>1</tt:EncodingInterval>"
                 f"<tt:BitrateLimit>{e['bitrate']}</tt:BitrateLimit></tt:RateControl>"
-                f"<tt:H264><tt:GovLength>{e['gov']}</tt:GovLength><tt:H264Profile>{e['profile']}"
-                "</tt:H264Profile></tt:H264><tt:Multicast><tt:Address><tt:Type>IPv4</tt:Type>"
-                "<tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address><tt:Port>0</tt:Port>"
+                f"<tt:H264><tt:GovLength>{e['gov']}</tt:GovLength><tt:H264Profile>"
+                f"{esc(e['profile'])}</tt:H264Profile></tt:H264><tt:Multicast><tt:Address>"
+                "<tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>"
+                "<tt:Port>0</tt:Port>"
                 "<tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart></tt:Multicast>"
                 f"<tt:SessionTimeout>PT60S</tt:SessionTimeout></{tag}>")
 
@@ -602,7 +614,7 @@ class Camera:
 
     def _profile1(self, name: str, e: dict) -> str:
         k = self.knobs.snapshot()
-        parts = [f"<tt:Name>{e['name']}</tt:Name>", self._vsc()]
+        parts = [f"<tt:Name>{esc(e['name'])}</tt:Name>", self._vsc()]
         if k["audio"]:
             parts.append("<tt:AudioSourceConfiguration token=\"ASC_1\"><tt:Name>AudioSource"
                          "</tt:Name><tt:UseCount>2</tt:UseCount><tt:SourceToken>AudioSource_1"
@@ -711,6 +723,11 @@ class Camera:
                     and BITRATE_RANGE[0] <= rate <= BITRATE_RANGE[1]):
                 raise invalid_arg("frame rate, GOV length or bitrate out of range",
                                   "ter:ConfigModify")
+            # The profile goes to x264 as -profile:v, so only the offered ones are accepted.
+            canonical = {p.lower(): p for p in H264_PROFILES}.get(prof.strip().lower())
+            if canonical is None:
+                raise invalid_arg(f"H.264 profile {prof!r} not offered", "ter:ConfigModify")
+            prof = canonical
             e.update(width=w, height=h, fps=fps, bitrate=rate, gov=gov,
                      quality=int(q) if q == int(q) else q, profile=prof,
                      name=find_text(conf, "Name") or e["name"])
@@ -770,7 +787,8 @@ class Camera:
     @staticmethod
     def _vec2(e: dict, tag: str) -> str:
         return (f"<{tag} token=\"{e['token']}\" GovLength=\"{e['gov']}\" "
-                f"Profile=\"{e['profile']}\"><tt:Name>{e['name']}</tt:Name><tt:UseCount>1"
+                f"Profile=\"{esc(e['profile'])}\"><tt:Name>{esc(e['name'])}</tt:Name>"
+                "<tt:UseCount>1"
                 "</tt:UseCount><tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>"
                 f"{e['width']}</tt:Width><tt:Height>{e['height']}</tt:Height></tt:Resolution>"
                 f"<tt:RateControl ConstantBitRate=\"false\"><tt:FrameRateLimit>{e['fps']}"
@@ -798,7 +816,7 @@ class Camera:
             if k["ptz"] and (allt or "PTZ" in types):
                 conf.append(self._ptzc("tr2:PTZ"))
             confs = f"<tr2:Configurations>{''.join(conf)}</tr2:Configurations>" if conf else ""
-            out.append(f"<tr2:Profiles token=\"{name}\" fixed=\"true\"><tr2:Name>{e['name']}"
+            out.append(f"<tr2:Profiles token=\"{name}\" fixed=\"true\"><tr2:Name>{esc(e['name'])}"
                        f"</tr2:Name>{confs}</tr2:Profiles>")
         return f"<tr2:GetProfilesResponse>{''.join(out)}</tr2:GetProfilesResponse>"
 
@@ -962,7 +980,9 @@ class Camera:
 
     def op_events_PullMessages(self, req, ctx):
         sub = self._subscription(req, ctx)
-        timeout = parse_duration(find_text(req.op_el, "Timeout") or "") or 10.0
+        timeout = parse_duration(find_text(req.op_el, "Timeout") or "")
+        if timeout is None:
+            timeout = 10.0
         limit = int(_num(find_text(req.op_el, "MessageLimit"), 100))
         msgs = self.bus.pull(sub, min(timeout, 120.0), limit, self.knobs["pull_hold"])
         if msgs is None:
@@ -1179,7 +1199,7 @@ class Camera:
 
     def op_imaging_GetImagingSettings(self, req, ctx):
         self._check_source(req)
-        i = dict(self.imaging)
+        i = {k: esc(v) if isinstance(v, str) else v for k, v in self.imaging.items()}
         return ("<timg:GetImagingSettingsResponse><timg:ImagingSettings>"
                 f"<tt:BacklightCompensation><tt:Mode>{i['BacklightCompensation']}</tt:Mode>"
                 f"</tt:BacklightCompensation><tt:Brightness>{i['Brightness']:g}</tt:Brightness>"
@@ -1262,12 +1282,7 @@ class Camera:
         """Publishes one event of @p kind; stateful kinds also update the current state."""
         if kind not in KINDS:
             raise ValueError(f"unknown kind {kind!r}; known: {', '.join(sorted(KINDS))}")
-        cls = opts.get("cls")
-        if cls not in (None, "") and cls not in CLASS_TYPES:
-            raise ValueError(f"class must be one of {', '.join(CLASS_TYPES)} or empty")
-        bbox = opts.get("bbox")
-        if bbox is not None and (len(bbox) != 4 or not all(-1 <= float(v) <= 1 for v in bbox)):
-            raise ValueError("bbox must be [left, top, right, bottom] in ONVIF -1..1 coordinates")
+        check_object_opts(opts.get("cls"), opts.get("bbox"))
         n = self.bus.build(kind, state, **opts)
         if KINDS[kind].state_item:
             self.bus.remember(n)

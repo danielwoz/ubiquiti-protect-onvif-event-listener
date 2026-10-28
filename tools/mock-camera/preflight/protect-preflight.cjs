@@ -309,8 +309,11 @@ async function main() {
         err = e.message;
       }
       if (sc === 'wsa') {
-        check('wsa_strict: pull from this bundle', true,
-          err ? `rejected: ${err} (bundle sends no WS-Addressing)` : 'accepted (bundle sends wsa:To/Action)');
+        // Either outcome is valid (it depends on whether the bundle is patched), but a
+        // rejection must be the camera's WS-Addressing fault, not some other failure.
+        check('wsa_strict: pull from this bundle', !err || /WS-Addressing/.test(err),
+          err ? `rejected: ${err} (bundle sends no WS-Addressing)` :
+            'accepted (bundle sends wsa:To/Action)');
       } else {
         check('ref_params_required: Protect echoes ReferenceParameters', !err &&
           s2.referenceParameters, { err, ref: s2.referenceParameters });
