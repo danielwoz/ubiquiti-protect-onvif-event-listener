@@ -18,7 +18,9 @@ PUSH=1
 
 GITREV=$(git -C "$REPO" rev-parse --short HEAD)
 DIRTY=""
-git -C "$REPO" diff --quiet HEAD -- tools/mock-camera test/testdata || DIRTY="-dirty"
+# Untracked files count too: everything under mockcam/ and subjects/ goes into the image.
+[ -z "$(git -C "$REPO" status --porcelain -- tools/mock-camera test/testdata)" ] \
+  || DIRTY="-dirty"
 REV="${GITREV}${DIRTY}"
 
 CTX=$(mktemp -d)
