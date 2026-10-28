@@ -1,0 +1,61 @@
+name: Channel manifest
+
+# Regenerates channels.json on gh-pages from the apt suites and main's
+# gh-pages/channels.meta.json, and commits it only when it changed.
+# release-deb and promote regenerate it with every apt change; this
+# workflow publishes label, description or default changes without a
+# release, and creates the first channels.json.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'gh-pages/channels.meta.json'
+      - 'scripts/gen_channels_json.py'
+      - '.github/workflows/channels-manifest.yml'
+
+permissions:
+  contents: write
+
+# Shared with release-deb and promote, which also commit to gh-pages, so
+# their pushes never race.  GitHub keeps one pending run per group: a run
+# queued while another is already pending replaces it, so re-run any that
+# shows as cancelled.
+concurrency:
+  group: gh-pages-publish
+  cancel-in-progress: false
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout gh-pages
+        uses: actions/checkout@v5
+        with:
+          ref: gh-pages
+          path: apt
+
+      - name: Checkout channel manifest generator
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          path: src
+          sparse-checkout: |
+            scripts/gen_channels_json.py
+            gh-pages/channels.meta.json
+          sparse-checkout-cone-mode: false
+
+      - name: Regenerate channels.json
+        run: |
+          git -C apt config user.name "onvif-recorder-release-bot"
+          git -C apt config user.email "noreply@github.com"
+          cd apt
+          python3 ../src/scripts/gen_channels_json.py --apt-root . \
+            --meta ../src/gh-pages/channels.meta.json --out channels.json
+          git add channels.json
+          if git diff --cached --quiet; then
+            echo "channels.json is unchanged"
+            exit 0
+          fi
+          git commit -m "Regenerate channels.json"
+          git push origin gh-pages

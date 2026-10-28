@@ -13,6 +13,14 @@ on:
 permissions:
   contents: write
 
+# Every workflow that commits to gh-pages (release-deb, promote,
+# channels-manifest) shares this group so their pushes never race.
+# GitHub keeps one pending run per group: a run queued while another
+# is already pending replaces it, so re-run any that shows as cancelled.
+concurrency:
+  group: gh-pages-publish
+  cancel-in-progress: false
+
 jobs:
   build-deb:
     runs-on: ubuntu-24.04
@@ -113,6 +121,10 @@ jobs:
           KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/ {print $5; exit}')
           echo "GPG_KEYID=$KEYID" >> "$GITHUB_ENV"
 
+      # channels.json is regenerated in the same gh-pages commit as the
+      # reprepro change, so the published channel versions always match the
+      # apt suites.  The generator and channels.meta.json come from main, not
+      # from the tag, so re-running an old tag does not bring back old labels.
       - name: Publish to gh-pages apt repo (early-access)
         if: env.GPG_KEYID != ''
         env:
@@ -120,6 +132,11 @@ jobs:
         run: |
           git config user.name "onvif-recorder-release-bot"
           git config user.email "noreply@github.com"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git show origin/main:scripts/gen_channels_json.py \
+            > "$RUNNER_TEMP/gen_channels_json.py"
+          git show origin/main:gh-pages/channels.meta.json \
+            > "$RUNNER_TEMP/channels.meta.json"
           git worktree add /tmp/gh-pages gh-pages || \
             (git fetch origin gh-pages && git worktree add /tmp/gh-pages gh-pages)
           cd /tmp/gh-pages
@@ -130,6 +147,8 @@ jobs:
           fi
           reprepro --basedir . --outdir . includedeb early-access \
             "$GITHUB_WORKSPACE/dist/onvif-recorder_${{ steps.ver.outputs.version }}_arm64.deb"
+          python3 "$RUNNER_TEMP/gen_channels_json.py" --apt-root . \
+            --meta "$RUNNER_TEMP/channels.meta.json" --out channels.json
           git add -A
           git commit -m "Publish onvif-recorder ${{ steps.ver.outputs.version }} to early-access"
           git push origin gh-pages

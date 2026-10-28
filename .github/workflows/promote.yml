@@ -22,6 +22,14 @@ on:
 permissions:
   contents: write
 
+# Shared with release-deb and channels-manifest, which also commit to
+# gh-pages, so their pushes never race.  GitHub keeps one pending run per
+# group: a run queued while another is already pending replaces it, so
+# re-run any that shows as cancelled.
+concurrency:
+  group: gh-pages-publish
+  cancel-in-progress: false
+
 jobs:
   promote:
     runs-on: ubuntu-24.04
@@ -43,6 +51,20 @@ jobs:
           ref: gh-pages
           path: apt
 
+      # The channel manifest generator and its metadata, always from main.
+      - name: Checkout channel manifest generator
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          path: src
+          sparse-checkout: |
+            scripts/gen_channels_json.py
+            gh-pages/channels.meta.json
+          sparse-checkout-cone-mode: false
+
+      # channels.json is regenerated in the same gh-pages commit as the
+      # reprepro change; its versions are read from the resulting Packages
+      # files, not from the version input.
       - name: Promote
         run: |
           git -C apt config user.name "onvif-recorder-release-bot"
@@ -50,6 +72,8 @@ jobs:
           cd apt
           reprepro --basedir . --outdir . copy "${{ inputs.to }}" "${{ inputs.from }}" \
             onvif-recorder "${{ inputs.version }}"
+          python3 ../src/scripts/gen_channels_json.py --apt-root . \
+            --meta ../src/gh-pages/channels.meta.json --out channels.json
           git add -A
           git commit -m "Promote onvif-recorder ${{ inputs.version }}: ${{ inputs.from }} -> ${{ inputs.to }}"
           git push origin gh-pages
