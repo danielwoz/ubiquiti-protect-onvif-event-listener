@@ -108,6 +108,11 @@ struct OnvifEvent {
     std::string alarm_url;
 };
 
+// True for an empty NotificationMessage -- no Topic and no Source or Data
+// items -- which some cameras send alongside their real notifications.
+// It carries nothing to record or to log one by one.
+bool is_empty_notification(const OnvifEvent& ev);
+
 // ---------------------------------------------------------------
 // Camera credentials / address
 // ---------------------------------------------------------------

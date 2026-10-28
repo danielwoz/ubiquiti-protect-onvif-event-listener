@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -1516,6 +1517,14 @@ class LogCapture : public absl::LogSink {
     }
     return n;
   }
+  // Every line holding @p needle.
+  std::vector<std::string> lines(const std::string& needle) {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<std::string> out;
+    for (const auto& l : lines_)
+      if (l.second.find(needle) != std::string::npos) out.push_back(l.second);
+    return out;
+  }
 
  private:
   std::mutex mu_;
@@ -1577,6 +1586,54 @@ static void test_pull_errors_logged(const std::string& jsonl) {
         "only the first failed pull within the hour is a warning");
   CHECK(emu.creates_total() >= faults,
         "each failed pull is followed by a new subscription");
+}
+
+// The Dahua capture holds empty NotificationMessages (empty Topic and
+// Message).  They still reach the callback, but are only counted in the
+// "alive:" line: no per-message "topic=" line, and no "received N
+// event(s)" for them.
+static void test_empty_notifications_counted(const std::string& jsonl) {
+  DahuaSD4A425DBEmulator emu(jsonl);
+  emu.start();
+  LogCapture logs;
+  absl::AddLogSink(&logs);
+
+  onvif::CameraConfig cfg;
+  cfg.ip                     = emu.local_address();
+  cfg.user                   = "danielwoz";
+  cfg.password               = "eW6iO01l";
+  cfg.retry_interval_sec     = 1;
+  cfg.heartbeat_interval_sec = 1;
+
+  auto empties = [](const std::vector<onvif::OnvifEvent>& evs) {
+    return static_cast<size_t>(
+        std::count_if(evs.begin(), evs.end(), onvif::is_empty_notification));
+  };
+  auto r = collect_until(
+      {cfg},
+      [&](const std::vector<onvif::OnvifEvent>& evs) {
+        const size_t empty = empties(evs);
+        return empty >= 2 && evs.size() >= empty + 2 && logs.count(" empty=") >= 1;
+      },
+      std::chrono::seconds(60));
+  absl::RemoveLogSink(&logs);
+
+  CHECK(!r.timed_out, "timed out waiting for empty and non-empty notifications");
+  CHECK(empties(r.events) >= 2, "empty notifications still reach the callback");
+  CHECK(logs.count("topic= op=") == 0, "no per-message line for an empty notification");
+  const std::vector<std::string> topic_lines = logs.lines("]   topic=");
+  CHECK(!topic_lines.empty(), "other notifications are still logged one by one");
+  int received = 0;
+  for (const std::string& l : logs.lines("] received ")) {
+    const size_t at = l.find("] received ") + 11;
+    received += std::atoi(l.c_str() + at);
+  }
+  CHECK(received == static_cast<int>(topic_lines.size()),
+        "\"received N event(s)\" counts only non-empty notifications: " +
+            std::to_string(received) + " vs " + std::to_string(topic_lines.size()) +
+            " topic lines");
+  CHECK(logs.count("alive: events_recv=") >= 1 && logs.count(" empty=") >= 1,
+        "the alive line counts empty notifications");
 }
 
 // A per-test scratch directory under TEST_TMPDIR (or /tmp).
@@ -1729,6 +1786,8 @@ int main(int argc, char* argv[]) {
            [&] { test_dahua_retries(dahua_jsonl); });
   run_test("dahua_topics",
            [&] { test_dahua_topics(dahua_jsonl); });
+  run_test("empty_notifications_counted",
+           [&] { test_empty_notifications_counted(dahua_jsonl); });
   run_test("cell_motion_basic",
            [&] { test_cell_motion_basic(cell_motion_jsonl); });
   run_test("cell_motion_events",

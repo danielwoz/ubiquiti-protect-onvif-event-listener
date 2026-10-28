@@ -80,6 +80,10 @@ int next_backoff_sec(int current_sec, int base_sec, int max_sec) {
   return doubled >= max_sec ? max_sec : static_cast<int>(doubled);
 }
 
+bool is_empty_notification(const OnvifEvent& ev) {
+  return ev.topic.empty() && ev.source.empty() && ev.data.empty();
+}
+
 // ============================================================
 // Library lifecycle
 // ============================================================
@@ -1139,8 +1143,10 @@ class CameraWorker {
           const uint64_t now = util::now_ms();
           const uint64_t le  = last_event_ms_.load();
           const uint64_t lr  = last_renew_ms_.load();
+          const uint64_t empty = empty_received_total_.load();
           LOG(INFO) << '[' << cfg_.ip << "] alive: events_recv="
                     << events_received_total_.load()
+                    << (empty ? " empty=" + std::to_string(empty) : std::string())
                     << " renew_age=" << (lr ? (now - lr) / 1000 : 0) << "s"
                     << " last_event="
                     << (le ? std::to_string((now - le) / 1000) + "s"
@@ -1266,6 +1272,7 @@ class CameraWorker {
 
   std::atomic<bool>     finished_{false};
   std::atomic<uint64_t> events_received_total_{0};
+  std::atomic<uint64_t> empty_received_total_{0};  // of events_received_total_
   std::atomic<uint64_t> last_event_ms_{0};
   std::atomic<uint64_t> last_renew_ms_{0};
   std::atomic<uint64_t> subscribed_at_ms_{0};
@@ -1773,20 +1780,32 @@ class CameraWorker {
 
     if (cfg_.event_proxy && hooks_.raw_tap) hooks_.raw_tap(cfg_, resp.body);
 
-    auto events = parse_notifications(resp.body);
-    if (!events.empty()) {
-      LOG(INFO) << '[' << cfg_.ip << "] received " << events.size() << " event(s)";
-      events_received_total_.fetch_add(events.size());
-      last_event_ms_.store(util::now_ms());
+    std::vector<OnvifEvent> events;
+    for (auto& n : parse_notifications(resp.body)) {
+      events.push_back(OnvifEvent{
+        cfg_.ip, cfg_.user,
+        std::move(n.topic), std::move(n.event_time), std::move(n.property_op),
+        std::move(n.source), std::move(n.data), n.bbox, alarm_url});
+    }
+    if (events.empty()) return absl::OkStatus();
+    events_received_total_.fetch_add(events.size());
+    last_event_ms_.store(util::now_ms());
+
+    // Empty notifications are delivered like any other but only counted
+    // in the "alive:" line, not logged one by one.
+    const size_t empty = static_cast<size_t>(
+        std::count_if(events.begin(), events.end(), is_empty_notification));
+    empty_received_total_.fetch_add(empty);
+    if (events.size() > empty) {
+      LOG(INFO) << '[' << cfg_.ip << "] received " << events.size() - empty
+                << " event(s)";
     }
 
-    for (auto& n : events) {
-      LOG(INFO) << '[' << cfg_.ip << "]   topic=" << n.topic
-                << " op=" << n.property_op << " t=" << n.event_time;
-      OnvifEvent ev{
-        cfg_.ip, cfg_.user,
-        n.topic, n.event_time, n.property_op,
-        n.source, n.data, n.bbox, alarm_url};
+    for (auto& ev : events) {
+      if (!is_empty_notification(ev)) {
+        LOG(INFO) << '[' << cfg_.ip << "]   topic=" << ev.topic
+                  << " op=" << ev.property_op << " t=" << ev.event_time;
+      }
       if (async_)
         async_->push(std::move(ev));
       else
