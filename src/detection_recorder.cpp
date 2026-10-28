@@ -2317,8 +2317,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       }
     }  // lock released
 
-    // 5. Trigger Protect automations (HTTP I/O, must be outside lock).
-    // AlarmNotifier calls POST /api/automations/{id}/run on the local Protect API.
+    // 5. Trigger Protect alarms (HTTP I/O, must be outside lock).  The event
+    // row and any thumbnail written above already exist, so the alarm's
+    // notification can resolve both.  AlarmNotifier hands the detection to
+    // UniFi OS (Global Alarm Manager) or runs Protect's automations (Local).
     // Only notify for new events, not for detections coalesced into an existing one.
     if (coalesced_event_id.empty() && alarm_notif && !cam_mac.empty()) {
       alarm_notif->notify(obj_type, cam_mac, event_id, ts_ms);

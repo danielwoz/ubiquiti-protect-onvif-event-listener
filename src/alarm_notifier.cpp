@@ -19,6 +19,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -27,8 +28,10 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -284,11 +287,6 @@ bool AlarmNotifier::uos_unavailable(long code) {  // NOLINT(runtime/int)
   // the no-thumbnail path after one transient blip, and tell the user to
   // go change a Protect setting that was never the problem.
   return code == 404;
-}
-
-void AlarmNotifier::set_notify_via_uos(bool enabled) {
-  absl::MutexLock lk(&mu_);
-  notify_via_uos_ = enabled;
 }
 
 std::vector<AlarmNotifier::AutomationEntry> AlarmNotifier::parse_automations(
@@ -991,34 +989,410 @@ void AlarmNotifier::record_history(const AutomationEntry& automation,
 }
 
 // ============================================================
+// Global Alarm Manager (alarms kept by UniFi OS)
+// ============================================================
+
+namespace {
+
+constexpr char kObjectTriggerPrefix[] = "protect:objects.";
+constexpr size_t kObjectTriggerPrefixLen = sizeof(kObjectTriggerPrefix) - 1;
+
+// Non-negative integer at j[pos], quoted ("10") or not (10); -1 if neither.
+static int64_t number_at(const std::string& j, size_t pos) {
+  if (pos == std::string::npos || pos >= j.size()) return -1;
+  if (j[pos] == '"') ++pos;
+  if (pos >= j.size() || j[pos] < '0' || j[pos] > '9') return -1;
+  return static_cast<int64_t>(std::strtoll(j.c_str() + pos, nullptr, 10));
+}
+
+// At most @p max bytes of @p body on one line, for a log message.
+static std::string log_excerpt(const std::string& body, size_t max = 300) {
+  std::string out = body.substr(0, max);
+  for (char& c : out) {
+    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+  }
+  if (body.size() > max) out += "...";
+  return out;
+}
+
+}  // namespace
+
+AlarmNotifier::Mode AlarmNotifier::decide_mode(std::optional<bool> flag,
+                                               Mode previous,
+                                               bool uos_has_object_alarms) {
+  if (flag.has_value()) return *flag ? Mode::kGlobal : Mode::kLocal;
+  if (previous != Mode::kUnknown) return previous;
+  return uos_has_object_alarms ? Mode::kGlobal : Mode::kLocal;
+}
+
+const char* AlarmNotifier::mode_name(Mode mode) {
+  switch (mode) {
+    case Mode::kGlobal:
+      return "Global Alarm Manager (alarms kept by UniFi OS)";
+    case Mode::kLocal:
+      return "Local Alarm Manager (Protect automations)";
+    case Mode::kUnknown:
+      break;
+  }
+  return "unknown";
+}
+
+std::string AlarmNotifier::normalize_mac(const std::string& mac) {
+  std::string out;
+  out.reserve(mac.size());
+  for (const char c : mac) {
+    const unsigned char u = static_cast<unsigned char>(c);
+    if (std::isxdigit(u)) out += static_cast<char>(std::toupper(u));
+  }
+  return out;
+}
+
+const char* AlarmNotifier::default_scope_key(const std::string& obj_type) {
+  return obj_type == "package" ? "scope_all_smart_cameras_with_package"
+                               : "scope_all_smart_cameras_with_zones";
+}
+
+bool AlarmNotifier::parse_uos_alarms(const std::string& json,
+                                     std::vector<UosAlarm>* out) {
+  out->clear();
+  const size_t top = skip_ws(json, 0);
+  if (top >= json.size() || json[top] != '[' ||
+      balanced_end(json, top) == std::string::npos) {
+    return false;
+  }
+  for_each_element(json, top, [&](size_t ap) {
+    if (json[ap] != '{') return;
+    UosAlarm a;
+    a.id = string_at(json, member(json, ap, "id"));
+    a.title = string_at(json, member(json, ap, "title"));
+    const size_t paused = member(json, ap, "is_paused");
+    a.paused = paused != std::string::npos && json[paused] == 't';
+
+    // triggers_data is an array of arrays of triggers.  Protect reads it
+    // (externalTriggerToConditions) as: every trigger without a
+    // precondition_config is a main trigger, and any one main trigger
+    // fires the alarm; a trigger with a precondition_config must also have
+    // happened within its interval, AND-ed with the main one.  A main
+    // trigger's data.count ({"items":{"primaryInput":"10",
+    // "secondarySelector":"1 hour"}}) fires only once that many matching
+    // detections were seen within the window.
+    std::map<std::string, bool> single;  // object type -> fires on one
+    std::map<std::string, std::string> count_reason;
+    std::string preconditions;
+    for_each_element(json, member(json, ap, "triggers_data"), [&](size_t gp) {
+      for_each_element(json, gp, [&](size_t tp) {
+        if (json[tp] != '{') return;
+        const std::string id = string_at(json, member(json, tp, "id"));
+        const bool object = id.size() > kObjectTriggerPrefixLen &&
+                            id.compare(0, kObjectTriggerPrefixLen,
+                                       kObjectTriggerPrefix) == 0;
+        if (object) a.has_object_trigger = true;
+        const size_t pc = member(json, tp, "precondition_config");
+        if (pc != std::string::npos && json[pc] == '{') {
+          if (!preconditions.empty()) preconditions += ", ";
+          preconditions += id;
+          return;
+        }
+        if (!object) return;
+        const std::string type = id.substr(kObjectTriggerPrefixLen);
+        const size_t items =
+            member(json, member(json, member(json, tp, "data"), "count"),
+                   "items");
+        const int64_t n =
+            number_at(json, member(json, items, "primaryInput"));
+        std::string window =
+            string_at(json, member(json, items, "secondarySelector"));
+        if (window == "custom") {
+          const int64_t d =
+              number_at(json, member(json, items, "customDuration"));
+          const std::string unit =
+              string_at(json, member(json, items, "customTimeframe"));
+          window = unit.empty() ? std::string()
+                                : (d >= 0 ? std::to_string(d) + " " : "") + unit;
+        }
+        if (n > 1 && !window.empty()) {
+          count_reason[type] = "its " + type + " trigger needs " +
+                               std::to_string(n) + " detections within " +
+                               window;
+          single.emplace(type, false);
+        } else {
+          single[type] = true;
+        }
+      });
+    });
+    for (const auto& [type, fires] : single) {
+      if (!preconditions.empty()) {
+        a.skipped[type] = "its " + type + " trigger fires only together "
+                          "with " + preconditions + " within a time window";
+      } else if (fires) {
+        a.fire_types.insert(type);
+      } else {
+        a.skipped[type] = count_reason[type];
+      }
+    }
+
+    // "scope":{"mode":"include"|"exclude","data":{"<key>":[MAC|"ALL_ITEMS"]}}
+    for_each_member(
+        json, member(json, member(json, ap, "scope"), "data"),
+        [&](const std::string& key, size_t /*value*/) {
+          if (key != "site_id") a.scope_keys.push_back(key);
+        });
+    if (!a.id.empty()) out->push_back(std::move(a));
+  });
+  return true;
+}
+
+// static
+std::string AlarmNotifier::build_uos_events(
+    const std::vector<UosAlarm>& alarms, const std::string& obj_type,
+    const std::string& mac, const std::string& camera_id,
+    const std::string& event_id, uint64_t ts_ms) {
+  using onvif::util::json_str;
+  char ts_buf[24];
+  std::snprintf(ts_buf, sizeof(ts_buf), "%" PRIu64, ts_ms);
+  // Each event names one alarm and is matched against only that alarm:
+  //   {"id":"person","alarm_id":"<uos id>",
+  //    "scope":{"<scope key>":"<MAC>",...,"site_id":"protect"},
+  //    "metadata":{"event":{"key":"person","device":"<MAC>",
+  //      "eventId":"<events.id>","timestamp":<ms>,
+  //      "sourceEvent":{"type":"smartDetectZone","camera":"<cameras.id>",
+  //        "start":<ms>,"smartDetectTypes":["person"]}}}}
+  // The scope carries the camera under every key of the alarm's own scope
+  // (plus the detection type's usual key), the way Protect files one
+  // device under all of its scope names in one scope object; UniFi OS
+  // checks it against the alarm's include / exclude list.  With
+  // sourceEvent.camera Protect builds the notification and its thumbnail
+  // from the event row; without it Protect looks the event id up.
+  std::string p = "[";
+  for (size_t i = 0; i < alarms.size(); ++i) {
+    const UosAlarm& a = alarms[i];
+    std::vector<std::string> keys = a.scope_keys;
+    const std::string fallback = default_scope_key(obj_type);
+    if (std::find(keys.begin(), keys.end(), fallback) == keys.end())
+      keys.push_back(fallback);
+    if (i > 0) p += ',';
+    p += "{\"id\":";             p += json_str(obj_type);
+    p += ",\"alarm_id\":";       p += json_str(a.id);
+    p += ",\"scope\":{";
+    for (const std::string& k : keys) {
+      p += json_str(k);
+      p += ':';
+      p += json_str(mac);
+      p += ',';
+    }
+    p += "\"site_id\":\"protect\"}";
+    p += ",\"metadata\":{\"event\":{\"key\":"; p += json_str(obj_type);
+    p += ",\"device\":";         p += json_str(mac);
+    p += ",\"eventId\":";        p += json_str(event_id);
+    p += ",\"timestamp\":";      p += ts_buf;
+    p += ",\"sourceEvent\":{\"type\":\"smartDetectZone\"";
+    if (!camera_id.empty()) {
+      p += ",\"camera\":";       p += json_str(camera_id);
+    }
+    p += ",\"start\":";          p += ts_buf;
+    p += ",\"smartDetectTypes\":["; p += json_str(obj_type); p += "]}}}}";
+  }
+  p += ']';
+  return p;
+}
+
+long AlarmNotifier::uos_request(const std::string& url,  // NOLINT(runtime/int)
+                                const std::string& body,
+                                std::string* response, int* curl_code) {
+  response->clear();
+  *curl_code = CURLE_OK;
+  CURL* curl = curl_easy_init();
+  if (!curl) {
+    *curl_code = CURLE_FAILED_INIT;
+    return 0;
+  }
+  struct curl_slist* headers = nullptr;
+  headers = curl_slist_append(headers, "Accept: application/json");
+  headers = curl_slist_append(headers, "X-Source: protect");
+  if (!body.empty())
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+  auto collect = +[](char* d, size_t s, size_t n, void* out) -> size_t {
+    constexpr size_t kMaxBody = 8u << 20;
+    auto* str = static_cast<std::string*>(out);
+    if (str->size() < kMaxBody)
+      str->append(d, std::min(s * n, kMaxBody - str->size()));
+    return s * n;
+  };
+  curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT,        5L);  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL,       1L);  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     headers);
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  collect);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA,      response);
+  if (!body.empty()) {
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS,   body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
+                     static_cast<long>(body.size()));  // NOLINT(runtime/int)
+  }
+  const CURLcode rc = curl_easy_perform(curl);
+  long http_code = 0;  // NOLINT(runtime/int)
+  if (rc != CURLE_OK) {
+    *curl_code = rc;
+  } else {
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+  }
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  return http_code;
+}
+
+bool AlarmNotifier::fetch_uos_alarms(std::vector<UosAlarm>* out) {
+  const std::string url = uos_url_ + "/api/v1/alarms";
+  std::string body;
+  int cc = 0;
+  const long code = uos_request(url, "", &body, &cc);  // NOLINT(runtime/int)
+  if (code != 200) {
+    if (code == 0) {
+      LOG(WARNING) << "[alarm] GET " << url << " failed: "
+                   << curl_easy_strerror(static_cast<CURLcode>(cc));
+    } else {
+      LOG(WARNING) << "[alarm] GET " << url << " HTTP " << code << ": "
+                   << log_excerpt(body);
+    }
+    return false;
+  }
+  if (!parse_uos_alarms(body, out)) {
+    LOG(WARNING) << "[alarm] GET " << url << " did not return a JSON "
+                 << "array: " << log_excerpt(body);
+    return false;
+  }
+  return true;
+}
+
+void AlarmNotifier::store_uos_alarms(std::vector<UosAlarm> alarms) {
+  // One summary line when the usable alarms change, not on every refresh.
+  std::string summary;
+  size_t usable = 0;
+  for (const UosAlarm& a : alarms) {
+    if (a.fire_types.empty()) continue;
+    if (!summary.empty()) summary += ", ";
+    summary += "\"" + a.title + "\" (";
+    std::string types;
+    for (const std::string& t : a.fire_types) {
+      if (!types.empty()) types += '/';
+      types += t;
+    }
+    summary += types + (a.paused ? ", paused)" : ")");
+    if (!a.paused) ++usable;
+  }
+  std::vector<std::pair<std::string, std::string>> skipped;
+  for (const UosAlarm& a : alarms) {
+    for (const auto& [type, reason] : a.skipped)
+      skipped.emplace_back(a.id + ":" + type, "\"" + a.title + "\": " + reason);
+  }
+  bool changed = false;
+  {
+    absl::MutexLock lk(&mu_);
+    changed = !uos_loaded_ || summary != uos_summary_;
+    uos_summary_ = summary;
+    uos_alarms_ = std::move(alarms);
+    uos_loaded_ = true;
+  }
+  if (changed) {
+    LOG(INFO) << "[alarm] " << usable << " UniFi OS alarm(s) with an object "
+              << "trigger will be sent detections"
+              << (summary.empty() ? std::string() : ": " + summary);
+  }
+  for (const auto& [key, text] : skipped) {
+    if (first_warning("uos-skip:" + key)) {
+      LOG(WARNING) << "[alarm] UniFi OS alarm " << text << ", which only "
+                   << "Protect's own detection matching evaluates; "
+                   << "onvif-recorder does not trigger it";
+    }
+  }
+}
+
+// ============================================================
 // AlarmNotifier public API
 // ============================================================
 
 AlarmNotifier::AlarmNotifier(std::string protect_url,
                              ProtectUserIdProvider* user_id_provider,
-                             std::string db_connstr)
+                             std::string db_connstr, std::string uos_url)
     : protect_url_(std::move(protect_url)),
       user_id_provider_(user_id_provider),
-      db_connstr_(std::move(db_connstr)) {
+      db_connstr_(std::move(db_connstr)),
+      uos_url_(std::move(uos_url)) {
   ContentionProfiler::instance().register_mutex(&mu_, "alarm_notifier");
 }
 
+std::unique_ptr<AlarmNotifier> AlarmNotifier::create(
+    bool trigger_automations, std::string protect_url,
+    ProtectUserIdProvider* user_id_provider, std::string db_connstr) {
+  if (!trigger_automations) {
+    LOG(WARNING) << "[alarm] --trigger_automations=false: detections are "
+                    "recorded but no alarms are triggered";
+    return nullptr;
+  }
+  if (user_id_provider == nullptr || user_id_provider->empty()) {
+    // WARNING (not INFO) because the failure mode is silent to the user
+    // on a Local Alarm Manager console: detections still record, but no
+    // automations fire (issue #41).  Global Alarm Manager alarms are
+    // handed to UniFi OS, which needs no user id.
+    LOG(WARNING) << "[alarm] user ID not found; Local Alarm Manager "
+                    "automation triggers disabled (pass "
+                    "--protect_user_id=<UUID> to override; see issue #41). "
+                    "Global Alarm Manager alarms do not need it.";
+  }
+  return std::make_unique<AlarmNotifier>(std::move(protect_url),
+                                         user_id_provider,
+                                         std::move(db_connstr));
+}
+
+void AlarmNotifier::set_mode_probe(ModeProbe probe) {
+  absl::MutexLock lk(&mu_);
+  mode_probe_ = std::move(probe);
+}
+
+AlarmNotifier::Mode AlarmNotifier::mode() {
+  absl::MutexLock lk(&mu_);
+  return mode_;
+}
+
 void AlarmNotifier::refresh_alarms() {
+  absl::MutexLock refresh(&refresh_mu_);
+  refresh_locked();
+}
+
+void AlarmNotifier::maybe_refresh() {
+  absl::MutexLock refresh(&refresh_mu_);
+  bool stale = true;
+  {
+    absl::MutexLock lk(&mu_);
+    const auto age = std::chrono::steady_clock::now() - last_refresh_;
+    if (mode_ == Mode::kGlobal) {
+      stale = !uos_loaded_ || age > std::chrono::seconds(60);
+    } else if (mode_ == Mode::kLocal) {
+      stale = automations_.empty() || age > std::chrono::minutes(5);
+    }
+  }
+  if (stale) refresh_locked();
+}
+
+void AlarmNotifier::refresh_locked() {
   // Re-arm the UOS path on every refresh (every ~5 min).  If Global Alarm
   // Manager really is off we will get another 404 on the next notify and
   // latch again, at the cost of one failed request per refresh; but if the
   // 404 was situational -- Protect mid-restart, a partially-initialised
   // automation manager -- thumbnails come back on their own instead of
   // staying off until someone restarts the recorder.
+  std::string url;
+  ModeProbe probe;
+  Mode previous = Mode::kUnknown;
   {
     absl::MutexLock lk(&mu_);
     uos_unavailable_ = false;
-  }
-  std::string url;
-  {
-    absl::MutexLock lk(&mu_);
     url = protect_url_;
+    probe = mode_probe_;
+    previous = mode_;
   }
+  std::optional<bool> db_flag;
 
   // ---- Step 1: build MAC → camera DB UUID map --------------------------------
   // Protect's buildEventFromSource looks up cameras by DB UUID (PK), not MAC.
@@ -1050,6 +1424,20 @@ void AlarmNotifier::refresh_alarms() {
                    << PQresultErrorMessage(cam_res);
       }
       PQclear(cam_res);
+      // Protect's Global Alarm Manager switch.  A missing key is Local,
+      // as in Protect.
+      PGresult* ff_res = onvif::pg::ExecParamsWithTimeout(
+          cam_conn, /*timeout_ms=*/-1,
+          "SELECT \"featureFlags\"->>'useExternalAlarmManager' FROM nvrs "
+          "LIMIT 1",
+          0, nullptr, nullptr, nullptr, nullptr, 0);
+      if (PQresultStatus(ff_res) == PGRES_TUPLES_OK && PQntuples(ff_res) > 0) {
+        db_flag = std::string(PQgetvalue(ff_res, 0, 0)) == "true";
+      } else if (PQresultStatus(ff_res) != PGRES_TUPLES_OK) {
+        LOG(WARNING) << "[alarm] nvrs featureFlags query failed: "
+                     << PQresultErrorMessage(ff_res);
+      }
+      PQclear(ff_res);
       PQfinish(cam_conn);
     } else {
       LOG(ERROR) << "[alarm] camera DB connect failed: "
@@ -1061,7 +1449,60 @@ void AlarmNotifier::refresh_alarms() {
                  << "unavailable; push notifications will fire without thumbnails";
   }
 
-  // ---- Step 2: load automations ----------------------------------------------
+  // ---- Step 2: Local or Global ----------------------------------------------
+  const std::optional<bool> flag = probe ? probe() : db_flag;
+  // The UniFi OS list is read whenever the console may be Global: the
+  // flag says so, or it is unreadable and the last decision was not Local.
+  const bool may_be_global =
+      flag.has_value() ? *flag : previous != Mode::kLocal;
+  std::vector<UosAlarm> uos;
+  const bool uos_ok = may_be_global && fetch_uos_alarms(&uos);
+  const bool uos_objects =
+      uos_ok && std::any_of(uos.begin(), uos.end(), [](const UosAlarm& a) {
+        return a.has_object_trigger;
+      });
+  const Mode mode = decide_mode(flag, previous, uos_objects);
+  {
+    absl::MutexLock lk(&mu_);
+    mode_ = mode;
+  }
+  if (mode != previous) {
+    const std::string why =
+        flag.has_value()
+            ? std::string(" (nvrs.featureFlags.useExternalAlarmManager=") +
+                  (*flag ? "true)" : "false)")
+            : uos_objects ? " (Protect DB unreadable; UniFi OS lists object "
+                            "alarms)"
+                          : " (Protect DB unreadable; no UniFi OS object "
+                            "alarms found)";
+    if (previous == Mode::kUnknown) {
+      LOG(INFO) << "[alarm] alarm mode: " << mode_name(mode) << why;
+    } else {
+      LOG(WARNING) << "[alarm] alarm mode changed from " << mode_name(previous)
+                   << " to " << mode_name(mode) << why;
+    }
+  }
+  if (mode == Mode::kGlobal) {
+    // Global: UniFi OS applies each alarm's cameras, schedule, cooldown,
+    // pause and recipients and runs its actions, so only the alarm list is
+    // kept.  An unreadable list keeps the last good one.
+    if (uos_ok) store_uos_alarms(std::move(uos));
+    absl::MutexLock lk(&mu_);
+    last_refresh_ = std::chrono::steady_clock::now();
+    return;
+  }
+  refresh_local(url);
+}
+
+void AlarmNotifier::refresh_local(const std::string& url) {
+  if (user_id_provider_ == nullptr || user_id_provider_->empty()) {
+    absl::MutexLock lk(&mu_);
+    automations_.clear();
+    last_refresh_ = std::chrono::steady_clock::now();
+    return;
+  }
+
+  // ---- Step 3: load automations ----------------------------------------------
   const std::string response = http_get(url + "/api/automations");
   if (response.empty()) return;
 
@@ -1107,7 +1548,7 @@ void AlarmNotifier::refresh_alarms() {
               << " schedules=" << a.schedules.size();
   }
 
-  // ---- Step 3: register each enabled automation with the UOS store ----------
+  // ---- Step 4: register each enabled automation with the UOS store ----------
   // The in-memory UOS automation manager (automationManager) requires a
   // /change "created" call before /actions/notify will succeed.  This
   // registration is lost on every Protect restart; we redo it here.
@@ -1148,18 +1589,104 @@ void AlarmNotifier::notify(const std::string& obj_type,
                            const std::string& camera_mac,
                            const std::string& event_id,
                            uint64_t ts_ms) {
-  // Refresh automation list if empty or older than 5 minutes.
-  bool need_refresh;
-  std::string url;
+  // The alarm list is re-read when missing or older than 60 s (Global)
+  // or 5 min (Local); the mode is decided again on each read.
+  maybe_refresh();
+  if (mode() == Mode::kGlobal) {
+    notify_global(obj_type, normalize_mac(camera_mac), event_id, ts_ms);
+  } else {
+    notify_local(obj_type, camera_mac, event_id, ts_ms);
+  }
+}
+
+void AlarmNotifier::notify_global(const std::string& obj_type,
+                                  const std::string& mac,
+                                  const std::string& event_id,
+                                  uint64_t ts_ms) {
+  std::vector<UosAlarm> selected;
+  std::string camera_id;
+  bool loaded = false;
   {
     absl::MutexLock lk(&mu_);
-    auto now = std::chrono::steady_clock::now();
-    need_refresh = automations_.empty() ||
-        (now - last_refresh_) > std::chrono::minutes(5);
-    url = protect_url_;
+    loaded = uos_loaded_;
+    for (const UosAlarm& a : uos_alarms_) {
+      if (!a.paused && a.fire_types.count(obj_type)) selected.push_back(a);
+    }
+    const auto it = mac_to_camera_id_.find(mac);
+    if (it != mac_to_camera_id_.end()) camera_id = it->second;
   }
-  if (need_refresh) refresh_alarms();
+  const std::string what =
+      obj_type + " on " + mac + " (event " + event_id + ")";
+  if (!loaded) {
+    LOG(ERROR) << "[alarm] " << what << " not sent: the UniFi OS alarm "
+               << "list could not be read";
+    return;
+  }
+  if (selected.empty()) {
+    LOG(INFO) << "[alarm] " << what << ": no UniFi OS alarm fires on a "
+              << "single " << obj_type << " detection, nothing sent";
+    return;
+  }
+  if (camera_id.empty() && first_warning("camera-id:" + mac)) {
+    LOG(WARNING) << "[alarm] no Protect camera id for MAC " << mac
+                 << "; alarms are sent without it, so Protect looks the "
+                 << "event up by id for the notification thumbnail";
+  }
+  std::string titles;
+  for (const UosAlarm& a : selected) {
+    if (!titles.empty()) titles += ", ";
+    titles += "\"" + a.title + "\"";
+  }
+  const std::string payload =
+      build_uos_events(selected, obj_type, mac, camera_id, event_id, ts_ms);
+  const std::string url = uos_url_ + "/api/v1/alarms/events";
 
+  // UniFi OS answers 202 before it runs the alarms and does not drop a
+  // repeated event, so the request is repeated only when the connection
+  // was never made; a timeout or a 5xx may already have run them.
+  std::string resp;
+  int cc = 0;
+  long code = uos_request(url, payload, &resp, &cc);  // NOLINT(runtime/int)
+  if (code == 0 && cc == CURLE_COULDNT_CONNECT) {
+    LOG(WARNING) << "[alarm] " << what << ": could not connect to " << url
+                 << "; retrying once in " << retry_delay_ms_ << " ms";
+    std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms_));
+    code = uos_request(url, payload, &resp, &cc);
+  }
+  if (code == 0) {
+    LOG(ERROR) << "[alarm] " << what << " not handed to UniFi OS for "
+               << titles << ": "
+               << curl_easy_strerror(static_cast<CURLcode>(cc))
+               << (cc == CURLE_COULDNT_CONNECT
+                       ? " (after one retry); dropped"
+                       : "; not retried, as UniFi OS may have run them");
+  } else if (code >= 200 && code < 300) {
+    LOG(INFO) << "[alarm] " << what << " handed to UniFi OS for " << titles
+              << " (HTTP " << code << "); which alarms matched is logged "
+              << "in /data/unifi-core/logs/uos-agent.log";
+  } else if (code >= 500) {
+    LOG(ERROR) << "[alarm] " << what << ": UniFi OS answered HTTP " << code
+               << " for " << titles << "; not retried, as it may have run "
+               << "them: " << log_excerpt(resp);
+  } else {
+    LOG(ERROR) << "[alarm] " << what << ": UniFi OS rejected the alarm "
+               << "events for " << titles << " with HTTP " << code << ": "
+               << log_excerpt(resp);
+  }
+}
+
+void AlarmNotifier::notify_local(const std::string& obj_type,
+                                 const std::string& camera_mac,
+                                 const std::string& event_id,
+                                 uint64_t ts_ms) {
+  if (user_id_provider_ == nullptr || user_id_provider_->empty()) {
+    if (first_warning("no-user-id")) {
+      LOG(WARNING) << "[alarm] Local Alarm Manager automations are not "
+                      "triggered: no Protect user id (see issue #41)";
+    }
+    return;
+  }
+  std::string url;
   std::vector<AutomationEntry> automations_copy;
   std::string camera_db_id;
   {
@@ -1203,7 +1730,7 @@ void AlarmNotifier::notify(const std::string& obj_type,
     bool use_uos;
     {
       absl::MutexLock lk(&mu_);
-      use_uos = notify_via_uos_ && !uos_unavailable_;
+      use_uos = !uos_unavailable_;
     }
     const ScheduleClock clock = local_clock(std::time(nullptr));
 

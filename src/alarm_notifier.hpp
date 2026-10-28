@@ -17,8 +17,10 @@
 #include <chrono>
 #include <cstdint>
 #include <ctime>
+#include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -31,29 +33,45 @@ namespace onvif {
 /**
  * AlarmNotifier
  *
- * Triggers UniFi Protect automations (e.g. "Make Sound for detection") when a
- * smart detection event is recorded.  Uses the local Protect API on port 7080
- * with X-UserId auth bypass from localhost.
+ * Hands each smart detection the recorder records to UniFi Protect's
+ * alarms.  Protect keeps its alarms in one of two places, and the notifier
+ * follows whichever the console uses (refresh_alarms() decides it again on
+ * every refresh, so a console moved from Local to Global is followed):
  *
- * Records automation history in the Protect DB so hits appear in the Protect UI
- * and respects the "ignore repeated" cooldown setting.
+ * Global Alarm Manager (nvrs.featureFlags.useExternalAlarmManager)
+ * ----------------------------------------------------------------
+ * The alarms live in UniFi OS (uos-agent, 127.0.0.1:11010).  The notifier
+ * reads them from GET /api/v1/alarms and, for each detection, sends one
+ * POST /api/v1/alarms/events naming every alarm with a matching
+ * protect:objects.<type> trigger -- the same request Protect sends for its
+ * own cameras.  UniFi OS then applies each alarm's cameras, schedule,
+ * cooldown, pause and recipients, runs all of its actions (notifications,
+ * webhooks, sirens, lights) and records the alarm history.  Which alarms
+ * matched is visible only in /data/unifi-core/logs/uos-agent.log.  Alarms
+ * whose object trigger needs another trigger within a time window, or a
+ * count of detections, are not sent (Protect's own matcher evaluates
+ * those); each is named once in a warning.
  *
- * Thumbnail strategy
- * ------------------
- * Protect's push path resolves thumbnails via buildEventFromSource, which looks
- * up the camera by its DB UUID (not MAC).  On startup refresh_alarms() fetches
- * GET /api/cameras to build a MAC → DB-UUID map and registers each automation
- * with the in-memory UOS store via
+ * Local Alarm Manager
+ * -------------------
+ * The alarms live in Protect (GET /api/automations, port 7080, X-UserId
+ * auth bypass from localhost).  The notifier registers them via
  *   POST /internal/automationManager/external/change
- * so that subsequent calls to
+ * and notifies via
  *   POST /internal/automationManager/external/actions/notify
- * succeed and produce push notifications with thumbnails.
+ * (which can carry a thumbnail), falling back to
+ * /api/automations/<id>/run when those routes are absent.  It evaluates
+ * each alarm's cameras (include or exclude), cooldown, schedule and
+ * recipients itself and records history in Protect's DB.
  *
- * The in-memory registration is lost when Protect restarts.  notify() detects
- * HTTP 500 ("Alarm not found") and re-registers before retrying once.
+ * Thumbnails: Protect builds the notification from the event row and the
+ * camera's DB UUID, so refresh_alarms() keeps a MAC -> cameras.id map.
+ * The in-memory registration is lost when Protect restarts; notify()
+ * detects HTTP 500 ("Alarm not found") and re-registers before retrying
+ * once.
  *
- * Recipients
- * ----------
+ * Recipients (Local)
+ * ------------------
  * The /actions/notify route delivers to exactly the receivers the request
  * names, so notify() builds them from the alarm's SEND_NOTIFICATION action:
  * each recipient with push or email on, on those channels, when the alarm's
@@ -70,36 +88,55 @@ namespace onvif {
  * Usage
  * -----
  *   ProtectUserIdProvider provider(user_id, cache_path);
- *   AlarmNotifier notifier("http://localhost:7080", &provider, db_connstr);
- *   notifier.refresh_alarms();
+ *   auto notifier = AlarmNotifier::create(trigger_automations,
+ *                                         "http://localhost:7080",
+ *                                         &provider, db_connstr);
+ *   if (notifier) notifier->refresh_alarms();
  *
- *   // On each detection event:
- *   notifier.notify("person", "FC5F49CA68D4", event_id, ts_ms);
+ *   // On each detection event, after the event row is written:
+ *   notifier->notify("person", "024D4F434B01", event_id, ts_ms);
  *
  * Thread-safe: notify() may be called concurrently from multiple camera threads.
  *
- * 401 self-heal: if a Protect API call returns 401, we ask the shared
- * ProtectUserIdProvider to re-query unifi-core for a fresh user_id and retry
- * the request once.  Refresh is rate-limited inside the provider.
+ * 401 self-heal (Local): if a Protect API call returns 401, we ask the
+ * shared ProtectUserIdProvider to re-query unifi-core for a fresh user_id
+ * and retry the request once.  Refresh is rate-limited inside the provider.
  */
 class AlarmNotifier {
  public:
+  /// Where Protect's Global Alarm Manager keeps its alarms (uos-agent).
+  static constexpr char kDefaultUosUrl[] = "http://127.0.0.1:11010";
+
+  /// Which alarm store the console uses.
+  enum class Mode { kUnknown, kLocal, kGlobal };
+
+  /// Reads nvrs.featureFlags.useExternalAlarmManager; nullopt when it
+  /// cannot be read.  The default reads it from the Protect DB.
+  using ModeProbe = std::function<std::optional<bool>()>;
+
   AlarmNotifier(std::string protect_url,
                 ProtectUserIdProvider* user_id_provider,
-                std::string db_connstr = "");
+                std::string db_connstr = "",
+                std::string uos_url = kDefaultUosUrl);
 
-  /// Fetch the current automation list from Protect API and cache it.
-  /// Also fetches the camera list to populate the MAC → DB-UUID map and
-  /// registers each enabled automation with the UOS in-memory store.
+  /// The notifier main.cpp runs, or nullptr when @p trigger_automations
+  /// is false (nothing is read or sent then).  A missing user id only
+  /// disables the Local Alarm Manager path; Global needs none.
+  static std::unique_ptr<AlarmNotifier> create(
+      bool trigger_automations, std::string protect_url,
+      ProtectUserIdProvider* user_id_provider, std::string db_connstr);
+
+  /// Replace how useExternalAlarmManager is read (the DB by default).
+  void set_mode_probe(ModeProbe probe);
+
+  /// Decide Local vs Global, then load that store's alarms.  Global: the
+  /// UniFi OS alarm list (the last good list is kept if it cannot be
+  /// read).  Local: Protect's automation list, the MAC -> camera map, and
+  /// each enabled automation registered with the UOS in-memory store.
   void refresh_alarms();
 
-  /// Route notifications through Protect's UOS external automation
-  /// manager (default true).  That path is the only one that can attach a
-  /// thumbnail, but it requires Protect's Global Alarm Manager to be
-  /// enabled.  When it is not -- or when this is false -- notifications
-  /// fall back to the legacy /api/automations/<id>/run endpoint, which
-  /// fires the automation but cannot carry a thumbnail.
-  void set_notify_via_uos(bool enabled);
+  /// The mode the last refresh decided.
+  Mode mode();
 
   /// One-shot authenticated GET against Protect's local API, returning the
   /// response body ("" on any failure).  Shares the notifier's curl setup
@@ -109,10 +146,12 @@ class AlarmNotifier {
   static std::string protect_api_get(const std::string& url,
                                      const std::string& user_id);
 
-  /// Trigger matching Protect automations for a detection event.
+  /// Trigger matching Protect alarms for a detection event.  Call it
+  /// after the event row (and any thumbnail written inline) exists.
   ///   obj_type   -- "person", "vehicle", "animal", or "package"
-  ///   camera_mac -- uppercase no-colon MAC, e.g. "FC5F49CA68D4"
-  ///   event_id   -- UUID of the inserted events row
+  ///   camera_mac -- camera MAC, e.g. "024D4F434B01" (case and ':' / '-'
+  ///                 separators are normalised)
+  ///   event_id   -- id of the inserted events row
   ///   ts_ms      -- event start timestamp (ms since Unix epoch)
   void notify(const std::string& obj_type,
               const std::string& camera_mac,
@@ -194,6 +233,19 @@ class AlarmNotifier {
     std::vector<Schedule> schedules;  // the alarm's own; empty = always
   };
 
+  // One alarm of the Global Alarm Manager (GET /api/v1/alarms).
+  struct UosAlarm {
+    std::string id;     // UniFi OS alarm id
+    std::string title;
+    bool paused = false;
+    bool has_object_trigger = false;  // any protect:objects.* trigger
+    std::vector<std::string> scope_keys;  // keys of scope.data, in order
+    // Object types ("person", ...) a single detection fires it for.
+    std::set<std::string> fire_types;
+    // Object types it has a trigger for but that are not sent, and why.
+    std::map<std::string, std::string> skipped;
+  };
+
   // Grant the white-box test access to the private static parsers, the
   // recipient planning and the AutomationEntry layout. Defined in
   // test/test_alarm_notifier.cpp.
@@ -202,7 +254,16 @@ class AlarmNotifier {
   std::string protect_url_;
   ProtectUserIdProvider* user_id_provider_;
   std::string db_connstr_;
-  bool notify_via_uos_{true};
+  std::string uos_url_;
+  ModeProbe mode_probe_;  // empty = read the DB; protected by mu_
+  int retry_delay_ms_ = 1500;  // before the one reconnect attempt
+  // Held for a whole refresh (HTTP and DB included) so concurrent
+  // detections run one refresh, not one each.  Never taken under mu_.
+  absl::Mutex refresh_mu_;
+  Mode mode_ = Mode::kUnknown;           // protected by mu_
+  std::vector<UosAlarm> uos_alarms_;     // protected by mu_
+  bool uos_loaded_ = false;              // a list was read; protected by mu_
+  std::string uos_summary_;              // last logged list; protected by mu_
   // Set once the UOS endpoint reports it isn't there, so we stop
   // attempting it on every single detection and just use the legacy path.
   bool uos_unavailable_{false};
@@ -212,6 +273,49 @@ class AlarmNotifier {
   std::map<std::string, std::string> mac_to_camera_id_;  // MAC → camera DB UUID, protected by mu_
   std::chrono::steady_clock::time_point last_refresh_{};
   std::set<std::string> warned_;  // first_warning() keys, protected by mu_
+
+  // Global or Local from useExternalAlarmManager (@p flag).  When it
+  // could not be read the previous decision stands; with none yet, a
+  // UniFi OS alarm list holding a protect:objects.* trigger means Global.
+  static Mode decide_mode(std::optional<bool> flag, Mode previous,
+                          bool uos_has_object_alarms);
+  static const char* mode_name(Mode mode);
+
+  // GET /api/v1/alarms body -> alarms; false if it is not a JSON array.
+  static bool parse_uos_alarms(const std::string& json,
+                               std::vector<UosAlarm>* out);
+  // Upper-case hex digits only: "02:4d:4f:43:4b:01" -> "024D4F434B01".
+  static std::string normalize_mac(const std::string& mac);
+  // The scope key Protect files a camera's @p obj_type detections under.
+  static const char* default_scope_key(const std::string& obj_type);
+  // POST /api/v1/alarms/events body: one event per alarm in @p alarms.
+  // An empty @p camera_id leaves sourceEvent.camera out.
+  static std::string build_uos_events(const std::vector<UosAlarm>& alarms,
+                                      const std::string& obj_type,
+                                      const std::string& mac,
+                                      const std::string& camera_id,
+                                      const std::string& event_id,
+                                      uint64_t ts_ms);
+  // Request to uos-agent with X-Source: protect.  Returns the HTTP status
+  // (0 when curl failed; *curl_code says why).  @p body empty = GET.
+  static long uos_request(const std::string& url,  // NOLINT(runtime/int)
+                          const std::string& body, std::string* response,
+                          int* curl_code);
+
+  // refresh_alarms() with refresh_mu_ held.
+  void refresh_locked();
+  // Global part of a refresh: read the alarm list; false if unreadable.
+  bool fetch_uos_alarms(std::vector<UosAlarm>* out);
+  void store_uos_alarms(std::vector<UosAlarm> alarms);
+  // Local part of a refresh (Protect's automation list).
+  void refresh_local(const std::string& protect_url);
+  // Refresh if the current mode's list is missing or stale.
+  void maybe_refresh();
+  void notify_global(const std::string& obj_type, const std::string& mac,
+                     const std::string& event_id, uint64_t ts_ms);
+  void notify_local(const std::string& obj_type,
+                    const std::string& camera_mac,
+                    const std::string& event_id, uint64_t ts_ms);
 
   // Does this HTTP status from /actions/notify mean the UOS automation
   // manager has lost our registration?  Its store is in-memory only, so a

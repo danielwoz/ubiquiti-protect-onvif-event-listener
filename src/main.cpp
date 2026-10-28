@@ -395,22 +395,21 @@ ABSL_FLAG(bool, auto_heal_protect, true,
     "surfaced on the admin page's Recent errors card. Set to false to "
     "disable and rely on the user to restart Protect manually.");
 ABSL_FLAG(bool, trigger_automations, true,
-    "Trigger Protect automations (push notifications, chimes, sirens) for "
-    "detections from third-party cameras and for first-party motion "
-    "classified by onvif-recorder.  Set to false to record events "
-    "without notifying; automations for Protect's own detections are "
+    "Trigger Protect alarms for detections from third-party cameras and "
+    "for first-party motion classified by onvif-recorder.  With Protect's "
+    "Global Alarm Manager each detection is handed to UniFi OS, which "
+    "applies the alarm's cameras, schedule, cooldown and recipients and "
+    "runs all of its actions (notifications, webhooks, sirens, lights); "
+    "/data/unifi-core/logs/uos-agent.log shows which alarms matched.  With "
+    "the Local Alarm Manager onvif-recorder evaluates Protect's automations "
+    "itself and sends their notifications (or runs them through "
+    "/api/automations/<id>/run).  Set to false to record events without "
+    "triggering alarms; alarms for Protect's own detections are "
     "unaffected.");
 ABSL_FLAG(bool, notify_via_uos, true,
-    "Send Protect automation notifications through the UOS external "
-    "automation manager instead of the legacy /api/automations/<id>/run "
-    "endpoint. Only this path can attach a thumbnail to the push "
-    "notification, because the legacy endpoint hardcodes "
-    "eventId=\"expectedNoEventId\" internally so Protect can never "
-    "resolve the event. Requires Protect's Global Alarm Manager "
-    "(Settings -> Alarm Manager -> Local to Global); when it is off the "
-    "endpoint returns 404 and we fall back to the legacy path "
-    "automatically, logging once at ERROR. Set false to always use the "
-    "legacy path.");
+    "Deprecated, no effect.  Kept so existing configurations load; the "
+    "alarm path now follows Protect's Alarm Manager setting (see "
+    "--trigger_automations).");
 ABSL_FLAG(bool, drop_unclassified_motion, false,
     "Drop generic motion events (CellMotionDetector, VideoSource/MotionAlarm) "
     "that carry no ONVIF object class and that NanoDet-M cannot classify, "
@@ -1547,29 +1546,21 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // AlarmNotifier: triggers Protect automations (e.g. chime play) on
-  // detections.  user-id was discovered earlier (above admin_server.start).
-  std::unique_ptr<onvif::AlarmNotifier> alarm_notifier;
-  if (!absl::GetFlag(FLAGS_trigger_automations)) {
-    LOG(WARNING) << "[alarm] --trigger_automations=false: detections are "
-                    "recorded but no Protect automations are triggered";
-  } else if (!protect_user_id_provider.empty()) {
-    alarm_notifier = std::make_unique<onvif::AlarmNotifier>(
-        absl::GetFlag(FLAGS_protect_url), &protect_user_id_provider, db_conn);
-    alarm_notifier->set_notify_via_uos(absl::GetFlag(FLAGS_notify_via_uos));
+  // AlarmNotifier: hands detections to Protect's alarms -- UniFi OS's
+  // Global Alarm Manager or Protect's Local automations, whichever the
+  // console uses.  user-id was discovered earlier (above
+  // admin_server.start); only the Local path needs it.
+  if (!absl::GetFlag(FLAGS_notify_via_uos)) {
+    LOG(WARNING) << "[alarm] --notify_via_uos is deprecated and has no "
+                    "effect";
+  }
+  std::unique_ptr<onvif::AlarmNotifier> alarm_notifier =
+      onvif::AlarmNotifier::create(absl::GetFlag(FLAGS_trigger_automations),
+                                   absl::GetFlag(FLAGS_protect_url),
+                                   &protect_user_id_provider, db_conn);
+  if (alarm_notifier) {
     alarm_notifier->refresh_alarms();
     det_rec.set_alarm_notifier(alarm_notifier.get());
-  } else {
-    // WARNING (not INFO) because the failure mode is silent to the
-    // user: third-party detection events still record fine, but no
-    // automations / push notifications fire, and there's no other
-    // visible symptom.  Bumping the level makes it grep-able in
-    // journalctl without --verbose (issue #41).  Pair it with the
-    // reporter's manual override for setups where auto-discovery
-    // can't work.
-    LOG(WARNING) << "[alarm] user ID not found; automation triggers "
-                    "disabled (pass --protect_user_id=<UUID> to override; "
-                    "see issue #41)";
   }
   if (motion_poller && alarm_notifier)
     motion_poller->set_alarm_notifier(alarm_notifier.get());

@@ -52,18 +52,18 @@ const std::vector<Entry>& Schema() {
      "clips cut off before the subject has left frame.",
      "Detection"},
     {"trigger_automations", Type::Bool,
-     "Trigger Protect automations (push notifications, chimes, sirens) for "
-     "detections onvif-recorder records.  Turn off to keep recording "
-     "events without notifying.  Automations for Protect's own "
+     "Trigger Protect alarms for detections onvif-recorder records.  With "
+     "Protect's Global Alarm Manager each detection is handed to UniFi OS, "
+     "which applies the alarm's cameras, schedule, cooldown and recipients "
+     "and runs all of its actions (notifications, webhooks, sirens, "
+     "lights).  With the Local Alarm Manager onvif-recorder evaluates "
+     "Protect's automations itself, as before.  Turn off to keep recording "
+     "events without triggering alarms.  Alarms for Protect's own "
      "detections (e.g. a UniFi doorbell) are unaffected.  Default on.",
      "Detection"},
     {"notify_via_uos", Type::Bool,
-     "Send push notifications via Protect's UOS external automation "
-     "manager so a thumbnail can be attached.  Requires Protect's Global "
-     "Alarm Manager (Settings -> Alarm Manager -> switch Local to "
-     "Global).  When that is off we fall back to the legacy notification "
-     "path automatically -- notifications still fire, just without a "
-     "thumbnail.  Default on.",
+     "Deprecated, no effect.  Kept so existing settings load; the alarm "
+     "path now follows Protect's Alarm Manager setting.",
      "Detection"},
     {"drop_unclassified_motion", Type::Bool,
      "Drop generic motion events with no ONVIF class that NanoDet-M cannot "
