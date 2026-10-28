@@ -65,8 +65,8 @@ start-up and recorded as `person`; the admin page refuses to save one.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--default_object_type` | `person` | Object type written for generic motion events that carry no object class. Valid values: `person`, `vehicle`, `animal`, `package`, `motion` (no smart detection for motion NanoDet-M cannot classify; see above). |
-| `--camera_object_types` | _(disabled)_ | Comma-separated `ip=type` overrides applied to all events from each named camera, e.g. `192.168.1.108=animal,192.168.1.109=package`. Valid types: `person`, `vehicle`, `animal`, `package`. |
+| `--default_object_type` | `person` | Object type written for generic motion events that carry no object class. Valid values: `person` (or `human`), `vehicle`, `animal`, `package`, `motion` (no smart detection for motion NanoDet-M cannot classify; see above). |
+| `--camera_object_types` | _(disabled)_ | Comma-separated `ip=type` overrides applied to all events from each named camera, e.g. `192.168.1.108=animal,192.168.1.109=package`. Valid types: `person` (or `human`), `vehicle`, `animal`, `package`. |
 
 **Example — wildlife camera on `.108` and package camera on `.109`:**
 ```bash

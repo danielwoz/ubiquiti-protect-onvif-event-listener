@@ -52,12 +52,12 @@ absl::Status WriteToFile(const std::string& path,
                          const std::map<std::string, std::string>& values);
 
 // @p type lower-cased and without surrounding spaces, the form object
-// types are compared in.
+// types are compared in.  human, the ONVIF name, becomes person.
 std::string NormalizeObjectType(const std::string& type);
 
-// Checks one object type: person, vehicle, animal or package, plus motion
-// when @p allow_motion (default_object_type only).  Case and surrounding
-// spaces are ignored.  The error message names the valid values.
+// Checks one object type: person (or human), vehicle, animal or package,
+// plus motion when @p allow_motion (default_object_type only).  Case and
+// surrounding spaces are ignored.  The error message names the valid values.
 absl::Status ValidateObjectType(const std::string& type, bool allow_motion);
 
 // Checks @p value against the values setting @p name accepts beyond what

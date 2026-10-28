@@ -91,23 +91,23 @@ const std::vector<Entry>& Schema() {
      "Detection"},
     {"default_object_type", Type::String,
      "Object type recorded for events that arrive without a class, such as "
-     "generic motion that NanoDet-M cannot classify: person (default), "
-     "vehicle, animal, package or motion.  motion records no smart "
-     "detection for unclassified generic motion and leaves it to "
-     "Protect's own motion events, as drop_unclassified_motion does.  "
-     "Protect creates those only while motion detection is on for the "
-     "camera in Protect, and creates none for third-party cameras before "
-     "7.1; otherwise motion leaves that motion unrecorded.",
+     "generic motion that NanoDet-M cannot classify: person (default; "
+     "human also works), vehicle, animal, package or motion.  motion "
+     "records no smart detection for unclassified generic motion and "
+     "leaves it to Protect's own motion events, as drop_unclassified_motion "
+     "does.  Protect creates those only while motion detection is on for "
+     "the camera in Protect, and creates none for third-party cameras "
+     "before 7.1; otherwise motion leaves that motion unrecorded.",
      "Detection"},
     {"camera_object_types", Type::String,
      "Per-camera type overrides as comma-separated ip=type pairs, e.g. "
      "192.168.1.108=person,192.168.1.109=vehicle.  Applies to every event "
-     "from that camera, camera AI events included.  Types: person, "
-     "vehicle, animal, package.",
+     "from that camera, camera AI events included.  Types: person (or "
+     "human), vehicle, animal, package.",
      "Detection"},
     {"disabled_object_types", Type::String,
      "Object types never recorded for third-party cameras, comma-separated "
-     "(person, vehicle, animal, package), e.g. package.",
+     "(person or human, vehicle, animal, package), e.g. package.",
      "Detection"},
     {"camera_disabled_object_types", Type::String,
      "Per-camera disabled types as comma-separated ip=types pairs, types "
@@ -395,7 +395,7 @@ std::string NormalizeObjectType(const std::string& type) {
   std::string t = trim(type);
   for (char& c : t)
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  return t;
+  return t == "human" ? "person" : t;
 }
 
 absl::Status ValidateObjectType(const std::string& type, bool allow_motion) {

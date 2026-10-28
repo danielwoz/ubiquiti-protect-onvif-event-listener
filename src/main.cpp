@@ -201,8 +201,8 @@ ABSL_FLAG(std::string, protect_user_id, "",
 ABSL_FLAG(std::string, default_object_type, "person",
     "Object type reported for generic motion events (CellMotionDetector, "
     "VideoSource/MotionAlarm) when the camera does not identify a type "
-    "and NanoDet-M cannot classify it. Valid values: person, vehicle, "
-    "animal, package, motion. 'motion' records no smart detection for "
+    "and NanoDet-M cannot classify it. Valid values: person (or human), "
+    "vehicle, animal, package, motion. 'motion' records no smart detection for "
     "such events and leaves them to Protect's own motion events, as "
     "--drop_unclassified_motion does; Protect creates those only while "
     "motion detection is on for the camera in Protect, and none for "
@@ -212,13 +212,13 @@ ABSL_FLAG(std::string, camera_object_types, "",
     "Per-camera object type overrides as comma-separated ip=type pairs, "
     "e.g. '192.168.1.108=animal,192.168.1.109=package'. "
     "Overrides the detection type for all events from that camera. "
-    "Valid types: person, vehicle, animal, package; unknown types are "
-    "recorded as person.");
+    "Valid types: person (or human), vehicle, animal, package; unknown "
+    "types are recorded as person.");
 ABSL_FLAG(std::string, disabled_object_types, "",
     "Comma-separated object types never recorded for third-party cameras, "
     "e.g. 'package' or 'package,animal'.  Applies after camera and "
-    "NanoDet-M classification.  Valid types: person, vehicle, animal, "
-    "package.");
+    "NanoDet-M classification.  Valid types: person (or human), vehicle, "
+    "animal, package.");
 ABSL_FLAG(std::string, camera_disabled_object_types, "",
     "Per-camera disabled object types as comma-separated ip=types pairs, "
     "types separated by '|', e.g. '192.168.1.108=package|animal'.  "

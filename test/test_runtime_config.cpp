@@ -236,7 +236,15 @@ static void test_validate_object_type() {
         "the error names the valid values: " + std::string(dog.message()));
   check(!ValidateObjectType("", /*allow_motion=*/true).ok(),
         "an empty type is not an object type");
-  check(!ValidateObjectType("human", /*allow_motion=*/true).ok(),
+  check(ValidateObjectType("human", /*allow_motion=*/false).ok(),
+        "human is accepted as person");
+  check(ValidateObjectType(" Human ", /*allow_motion=*/true).ok(),
+        "human is accepted with any case and spaces");
+  check(runtime_config::NormalizeObjectType(" HUMAN ") == "person",
+        "human normalises to person");
+  check(runtime_config::NormalizeObjectType("humans") == "humans",
+        "only the exact alias is mapped");
+  check(!ValidateObjectType("people", /*allow_motion=*/true).ok(),
         "only the documented names are accepted");
 }
 
