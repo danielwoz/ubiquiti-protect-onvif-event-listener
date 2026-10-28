@@ -200,7 +200,7 @@ public partial class ChannelPage : Page {
     private static string ProtectChannelName(string channel) => channel switch {
         "stable" => "Release",
         "rc" => "Release Candidate",
-        "early-access" => "Early Access, Alpha, Internal or QA",
+        "early-access" => "Early Access or Alpha",
         _ => channel,
     };
 
