@@ -659,10 +659,10 @@ If step 5 shows empty notes or missing assets, repair immediately with
 `gh release upload v<X.Y.Z> <path>#<asset_name>` before doing anything else.
 
 If step 6 shows an old version or a 404, check the release-deb run's
-"Publish to gh-pages apt repo" step, then run **Actions → Channel manifest →
-Run workflow** (`channels-manifest.yml`), which regenerates `channels.json`
-from the apt suites and commits it only if it changed. Never edit
-`channels.json` on gh-pages by hand.
+`publish-apt` job (re-run it if it shows as cancelled), then run
+**Actions → Channel manifest → Run workflow** (`channels-manifest.yml`),
+which regenerates `channels.json` from the apt suites and commits it only
+if it changed. Never edit `channels.json` on gh-pages by hand.
 
 ## Command-line flags (runtime)
 

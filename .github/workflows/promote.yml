@@ -22,10 +22,10 @@ on:
 permissions:
   contents: write
 
-# Shared with release-deb and channels-manifest, which also commit to
-# gh-pages, so their pushes never race.  GitHub keeps one pending run per
-# group: a run queued while another is already pending replaces it, so
-# re-run any that shows as cancelled.
+# Shared with release-deb's publish-apt job and channels-manifest, which
+# also commit to gh-pages, so their pushes never race.  GitHub keeps one
+# pending run per group: a run queued while another is already pending
+# replaces it, so re-run any that shows as cancelled.
 concurrency:
   group: gh-pages-publish
   cancel-in-progress: false

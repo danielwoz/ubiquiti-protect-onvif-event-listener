@@ -60,8 +60,9 @@ it to fill its channel drop-down.
   same gh-pages commit as their reprepro change, always with the generator
   and metadata from `main`. `channels-manifest.yml` regenerates it on a push
   to `main` that touches the metadata or the generator, or when run by hand,
-  and commits only when it changed. All three share the `gh-pages-publish`
-  concurrency group. Never edit `channels.json` on gh-pages by hand.
+  and commits only when it changed. All three (release-deb only in its
+  short `publish-apt` job) share the `gh-pages-publish` concurrency group.
+  Never edit `channels.json` on gh-pages by hand.
 - **Latest = early-access.** "Latest (alpha)" is the label of the
   `early-access` suite, with `latest` as an alias. The suite, the channel
   file on the router and the admin page keep the id `early-access`.
