@@ -71,8 +71,9 @@ What to expect afterwards:
 - **Protect** logs `Connected to ONVIF camera at 192.168.3.216:80 (media2=false, profiles=2)`
   in `onvif.log` and `Started ONVIF event subscription` in `onvif.events.log`.
 - **onvif-recorder** picks the camera up within 60 s (`[rescan]`).
-- **Recording:** Protect records it continuously (`mode=always`). At these bitrates that is
-  roughly 3-10 GB a day; set it to detections-only recording if that matters.
+- **Recording:** Protect records it continuously (`mode=always`). That is a few GB a day:
+  the static pattern encodes at about 200 kbps per stream, against caps of 800 and
+  250 kbps. Set it to detections-only recording if that matters.
 - **Removal:** `DELETE /api/cameras/<id>`, or "Forget" in the UI.
 
 Before adopting, check the camera from this machine with Protect's own code (see
