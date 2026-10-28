@@ -225,6 +225,14 @@ class Camera:
             req = parse_request(body)
         except SoapParseError as e:
             entry["op"] = "?"
+            # Clients that do HTTP Digest by sending an empty first request (curl --digest)
+            # expect the challenge, not a complaint about the empty body.
+            authz = headers.get("authorization")
+            if (self.knobs["auth_mode"] in ("wsse", "digest")
+                    and not (authz and self.digest.check(authz, "POST")[0])):
+                entry["auth"] = "missing"
+                raise SoapFault(401, "Sender", "ter:NotAuthorized", "Sender not Authorized",
+                                headers={"WWW-Authenticate": self.digest.challenge()}) from e
             raise SoapFault(400, "Sender", "ter:WellFormed", str(e)) from e
         entry.update(op=req.op, ns=req.op_ns, wsa_to=req.wsa_to, wsa_action=req.wsa_action,
                      ref_params=req.subscription_ref, headers=req.header_names)

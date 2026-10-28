@@ -169,6 +169,17 @@ def test_http_digest_fallback(cam):
     assert status == 401
 
 
+def test_empty_first_digest_request_gets_challenge(cam):
+    # curl --digest sends the first POST without its body.
+    h = {"Content-Type": "application/soap+xml; charset=utf-8"}
+    status, hdrs, _ = cam.http("POST", "/onvif/device_service", b"", h)
+    assert status == 401 and hdrs["www-authenticate"].startswith("Digest ")
+    authz = soap.digest_response_header(USER, PASSWORD, "POST", "/onvif/device_service",
+                                        hdrs["www-authenticate"])
+    status, _, _ = cam.http("POST", "/onvif/device_service", b"", dict(h, Authorization=authz))
+    assert status == 400
+
+
 def test_wsse_only_mode_has_no_challenge(cam):
     cam.cam.knobs.update({"auth_mode": "wsse_only"})
     status, hdrs, _ = cam.soap("/onvif/device_service", "GetDeviceInformation", DEV, auth=None)
