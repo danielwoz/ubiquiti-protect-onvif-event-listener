@@ -14,7 +14,8 @@ public partial class DashboardPage : Page {
         InitializeComponent();
         _main = main;
         HostText.Text = $"{main.Connection.Username}@{main.Connection.Host}";
-        ChannelText.Text = $"Channel: {main.Connection.Channel}";
+        ChannelText.Text =
+            $"Channel: {main.Catalog.Current.LabelFor(main.Connection.Channel)}";
         VersionText.Text = string.IsNullOrEmpty(main.Connection.LastInstalledVersion)
             ? "Version: (querying…)"
             : $"Version: {main.Connection.LastInstalledVersion}";

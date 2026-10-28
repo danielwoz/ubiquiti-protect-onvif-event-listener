@@ -16,12 +16,11 @@
 
         <StackPanel Grid.Row="1">
             <TextBlock Style="{StaticResource Body}">
-                onvif-recorder ships in three channels that mirror UniFi
-                Protect's own release channels. The installer reads Protect's
-                channel and selects the matching one; onvif-recorder then
-                moves with Protect whenever you change Protect's channel.
-                Pick a different channel to keep onvif-recorder on it
-                regardless of Protect.
+                Each channel gets onvif-recorder releases at a different
+                stage of testing. If you pick the channel that matches UniFi
+                Protect's release channel, onvif-recorder moves with Protect
+                whenever Protect's channel changes. Any other choice stays
+                put until you change it on the admin page.
             </TextBlock>
 
             <TextBlock x:Name="DetectedText" Style="{StaticResource Body}"
@@ -30,36 +29,30 @@
             <TextBlock x:Name="PinnedText" Style="{StaticResource Body}"
                        Foreground="#555" Visibility="Collapsed"/>
 
-            <StackPanel x:Name="ChoicesPanel" Margin="0,8,0,0"
-                        IsEnabled="False">
-                <RadioButton x:Name="StableRadio"
-                             GroupName="Channel" Margin="0,4"
-                             Checked="Channel_Checked">
-                    <StackPanel>
-                        <TextBlock Text="Stable" FontWeight="SemiBold"/>
-                        <TextBlock Text="Production releases. Recommended for most users."
-                                   Foreground="#555"/>
-                    </StackPanel>
-                </RadioButton>
-                <RadioButton x:Name="RcRadio"
-                             GroupName="Channel" Margin="0,4"
-                             Checked="Channel_Checked">
-                    <StackPanel>
-                        <TextBlock Text="Release Candidate" FontWeight="SemiBold"/>
-                        <TextBlock Text="Upcoming releases promoted from early-access."
-                                   Foreground="#555"/>
-                    </StackPanel>
-                </RadioButton>
-                <RadioButton x:Name="EaRadio"
-                             GroupName="Channel" Margin="0,4"
-                             Checked="Channel_Checked">
-                    <StackPanel>
-                        <TextBlock Text="Early Access" FontWeight="SemiBold"/>
-                        <TextBlock Text="Bleeding-edge builds on every tag. Match UniFi Protect's Early Access channel."
-                                   Foreground="#555"/>
-                    </StackPanel>
-                </RadioButton>
-            </StackPanel>
+            <ComboBox x:Name="ChannelCombo" Margin="0,8,0,0" MinWidth="360"
+                      HorizontalAlignment="Left" IsEnabled="False"
+                      SelectionChanged="ChannelCombo_SelectionChanged">
+                <ComboBox.ItemContainerStyle>
+                    <Style TargetType="ComboBoxItem">
+                        <Setter Property="IsEnabled"
+                                Value="{Binding Selectable, Mode=OneWay}"/>
+                    </Style>
+                </ComboBox.ItemContainerStyle>
+                <ComboBox.ItemTemplate>
+                    <DataTemplate>
+                        <TextBlock><Run Text="{Binding Label, Mode=OneWay}" FontWeight="SemiBold"/><Run Text="{Binding VersionText, Mode=OneWay}" Foreground="#555"/></TextBlock>
+                    </DataTemplate>
+                </ComboBox.ItemTemplate>
+            </ComboBox>
+
+            <TextBlock x:Name="ChannelDescriptionText" Style="{StaticResource Body}"
+                       Foreground="#555" Margin="0,6,0,8"/>
+
+            <TextBlock x:Name="CatalogSourceText" Style="{StaticResource Body}"
+                       Foreground="#555" Visibility="Collapsed"/>
+
+            <TextBlock x:Name="UpdateText" Style="{StaticResource Body}"
+                       Foreground="#92400E" Visibility="Collapsed"/>
 
             <TextBlock x:Name="PinHintText" Style="{StaticResource Body}"
                        Margin="0,8,0,0"/>

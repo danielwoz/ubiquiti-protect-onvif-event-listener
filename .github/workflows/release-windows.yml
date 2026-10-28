@@ -37,6 +37,17 @@ jobs:
       - name: Test
         run: dotnet test windows-installer/OnvifRecorderInstaller.Tests/OnvifRecorderInstaller.Tests.csproj -c Release --no-build --verbosity normal
 
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # -p:Version gives the exe its release version, which it compares
+      # with installer.min_version in channels.json (builds without it
+      # report 1.0.0 and skip that check).
       - name: Publish self-contained single-file exe
         run: >
           dotnet publish windows-installer/OnvifRecorderInstaller/OnvifRecorderInstaller.csproj
@@ -46,15 +57,8 @@ jobs:
           -p:PublishSingleFile=true
           -p:IncludeNativeLibrariesForSelfExtract=true
           -p:PublishTrimmed=false
+          -p:Version=${{ steps.ver.outputs.version }}
           -o publish-out
-
-      - name: Compute version
-        id: ver
-        shell: bash
-        run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          VERSION="${TAG#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Rename asset
         shell: bash

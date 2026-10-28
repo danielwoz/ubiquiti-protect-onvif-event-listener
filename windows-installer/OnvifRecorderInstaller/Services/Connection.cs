@@ -20,7 +20,7 @@ public sealed class Connection {
     public string? PrivateKeyPath { get; set; }
     public string? PrivateKeyPassphrase { get; set; }
     public string? HostFingerprint { get; set; }
-    public string Channel { get; set; } = "stable";
+    public string Channel { get; set; } = InstallScripts.DefaultChannelId;
     // Whether the next install pins Channel on the device. Set by the
     // channel page before every install; not persisted.
     public bool PinChannel { get; set; }

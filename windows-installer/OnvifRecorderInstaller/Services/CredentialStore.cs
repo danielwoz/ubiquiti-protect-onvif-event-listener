@@ -7,7 +7,8 @@ using Microsoft.Win32;
 namespace OnvifRecorderInstaller.Services;
 
 // Reads and writes the installer's connection + channel state under
-// HKCU\Software\OnvifRecorderInstaller. Secrets are DPAPI-encrypted with a
+// HKCU\Software\OnvifRecorderInstaller (RegistryChannelCache keeps the last
+// channel list in the same key). Secrets are DPAPI-encrypted with a
 // fixed entropy constant so a raw registry dump is not sufficient to recover
 // them; they can only be decrypted by the same Windows user.
 [SupportedOSPlatform("windows")]
@@ -39,7 +40,7 @@ public sealed class CredentialStore {
                     key.GetValue("AuthMethod") as string, out var m)
                 ? m : AuthMethod.Password,
             HostFingerprint = key.GetValue("HostFingerprint") as string,
-            Channel = (key.GetValue("Channel") as string) ?? "stable",
+            Channel = (key.GetValue("Channel") as string) ?? InstallScripts.DefaultChannelId,
             LastInstalledVersion = key.GetValue("LastInstalledVer") as string,
         };
 

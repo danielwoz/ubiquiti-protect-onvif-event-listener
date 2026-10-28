@@ -1,11 +1,17 @@
 using System;
-using System.Collections.Generic;
+using System.Text.RegularExpressions;
 
 namespace OnvifRecorderInstaller.Services;
 
 public static class InstallScripts {
     public const string RepoUrl =
         "https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener";
+    // The release channel list (schema 1), regenerated with every apt
+    // suite change; see ChannelCatalog.
+    public const string ChannelsUrl = RepoUrl + "/channels.json";
+    // The channel picked when nothing else chooses one: the early-access
+    // suite, shown as "Latest (alpha)".
+    public const string DefaultChannelId = "early-access";
     public const string Keyring =
         "/usr/share/keyrings/onvif-recorder-archive-keyring.gpg";
     public const string SourcesFile =
@@ -14,8 +20,15 @@ public static class InstallScripts {
     public const string PinnedChannelFile = "/etc/onvif-recorder/channel.pinned";
     public const string RunnablesYaml = "/data/unifi-core/config/runnables.yaml";
 
-    public static readonly IReadOnlyList<string> ValidChannels =
-        new[] { "stable", "rc", "early-access" };
+    // Channel ids are written into a root shell script and the apt source
+    // line, so only lowercase letters, digits and '-' are accepted: 2 to 32
+    // characters, starting with a letter and not ending with '-'. \z, not $,
+    // so a trailing newline does not match.
+    private static readonly Regex SafeChannelIdPattern = new(
+        @"^[a-z][a-z0-9-]{0,30}[a-z0-9]\z", RegexOptions.CultureInvariant);
+
+    public static bool IsSafeChannelId(string? id) =>
+        id != null && SafeChannelIdPattern.IsMatch(id);
 
     // pinChannel writes channel.pinned with the same content as the admin
     // page's channel Apply, so detect-channel.sh (run by postinst and the
@@ -122,25 +135,62 @@ public static class InstallScripts {
         return $"cat {PinnedChannelFile} 2>/dev/null | tr -d '[:space:]'";
     }
 
+    // Prints "installed" or "not-installed" for the onvif-recorder package,
+    // then the device's current channel (the channel file's content, which
+    // can outlive a removed package).
+    public static string BuildReadDeviceChannelScript() {
+        return $$"""
+            if dpkg-query -W -f='${Status}' onvif-recorder 2>/dev/null | grep -q ' installed$'; then
+                echo installed
+            else
+                echo not-installed
+            fi
+            cat {{ChannelFile}} 2>/dev/null | tr -d '[:space:]'
+            echo
+            """;
+    }
+
+    // Prints channels.json as the router fetches it, cut off after one byte
+    // more than ChannelManifest.MaxBytes so an oversize reply is rejected,
+    // or nothing when curl fails.
+    public static string BuildFetchManifestScript() {
+        return $"curl -fsS -m 6 --max-filesize {ChannelManifest.MaxBytes} " +
+               $"'{ChannelsUrl}' | head -c {ChannelManifest.MaxBytes + 1}";
+    }
+
     public static string BuildVersionScript() {
         return "dpkg-query -W -f='${Version}' onvif-recorder 2>/dev/null || echo ''";
     }
 
     // Returns the channel named in a script's output, or null when the
-    // output is empty or not one of ValidChannels.
+    // output is empty or not a safe channel id. Ids missing from the
+    // channel list are accepted, so a pin made by a newer installer or
+    // admin page is kept.
     public static string? ParseChannel(string? output) {
         var channel = (output ?? "").Trim();
-        foreach (var v in ValidChannels) {
-            if (v == channel) return v;
-        }
-        return null;
+        return IsSafeChannelId(channel) ? channel : null;
     }
 
-    // The channel the channel page selects first: the one already pinned on
-    // the device, then Protect's, then the one chosen in the last install.
+    // Reads BuildReadDeviceChannelScript's output.
+    public static (bool Installed, string? Channel) ParseDeviceChannel(string? output) {
+        var lines = (output ?? "").Replace("\r", "").Split('\n');
+        var installed = lines[0].Trim() == "installed";
+        var channel = lines.Length > 1 ? ParseChannel(lines[1]) : null;
+        return (installed, channel);
+    }
+
+    // The channel the channel page selects first: the one pinned on the
+    // device; else, when onvif-recorder is installed there, the channel it
+    // is on now, so a re-install never moves it silently; else the channel
+    // list's default; else Latest (early-access).
     public static string DefaultChannel(
-            string? pinnedChannel, string? protectChannel, string savedChannel) {
-        return pinnedChannel ?? protectChannel ?? ParseChannel(savedChannel) ?? "stable";
+            string? pinnedChannel, string? deviceChannel, bool packageInstalled,
+            string? manifestDefault) {
+        static string? Safe(string? id) => IsSafeChannelId(id) ? id : null;
+        return Safe(pinnedChannel)
+            ?? (packageInstalled ? Safe(deviceChannel) : null)
+            ?? Safe(manifestDefault)
+            ?? DefaultChannelId;
     }
 
     // An install pins the chosen channel when it differs from Protect's,
@@ -157,10 +207,8 @@ public static class InstallScripts {
     }
 
     public static void ValidateChannel(string channel) {
-        foreach (var v in ValidChannels) {
-            if (v == channel) return;
-        }
+        if (IsSafeChannelId(channel)) return;
         throw new ArgumentException(
-            $"invalid channel '{channel}' (expected stable|rc|early-access)");
+            $"invalid channel '{channel}' (expected lowercase letters, digits and '-')");
     }
 }

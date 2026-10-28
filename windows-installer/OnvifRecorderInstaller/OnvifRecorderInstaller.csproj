@@ -23,6 +23,14 @@
     <InternalsVisibleTo Include="OnvifRecorderInstaller.Tests" />
   </ItemGroup>
 
+  <!-- The channel list built into the installer: the same metadata the
+       published channels.json is generated from, without versions. -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\gh-pages\channels.meta.json"
+                      LogicalName="channels.meta.json"
+                      Link="channels.meta.json" />
+  </ItemGroup>
+
   <ItemGroup>
     <None Update="Assets\icon.ico" Condition="Exists('Assets\icon.ico')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

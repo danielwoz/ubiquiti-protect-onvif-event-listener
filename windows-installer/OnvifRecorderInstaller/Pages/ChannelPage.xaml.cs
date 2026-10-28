@@ -1,6 +1,10 @@
+using System;
+using System.Diagnostics;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
+using System.Windows.Navigation;
 using OnvifRecorderInstaller.Services;
 
 namespace OnvifRecorderInstaller.Pages;
@@ -8,21 +12,28 @@ namespace OnvifRecorderInstaller.Pages;
 public partial class ChannelPage : Page {
     private readonly MainWindow _main;
     private readonly bool _fromDashboard;
+    private ChannelManifest _manifest;
     // Read from the device before Install is enabled; null when unknown.
     private string? _protectChannel;
     private string? _pinnedChannel;
+    private string? _deviceChannel;
+    private bool _packageInstalled;
     private bool _detected;
 
     public ChannelPage(MainWindow main, bool fromDashboard = false) {
         InitializeComponent();
         _main = main;
         _fromDashboard = fromDashboard;
+        _manifest = main.Catalog.Current;
         if (fromDashboard) HeaderText.Text = "Choose a release channel";
-        Select(_main.Connection.Channel);
+        ChannelCombo.ItemsSource = _manifest.Channels;
+        if (!Select(_main.Connection.Channel)) Select(_manifest.DefaultId);
         _ = DetectAsync();
     }
 
     private async Task DetectAsync() {
+        var catalogTask = _main.Catalog.LoadAsync();
+        var deviceTask = ReadDeviceChannelAsync();
         var reachable = await DetectProtectChannelAsync();
         if (reachable && !await ReadPinnedChannelAsync()) {
             // A pin that could not be read must not be removed by choosing
@@ -32,18 +43,26 @@ public partial class ChannelPage : Page {
             DetectedText.Text =
                 "Could not read the release channel settings from the device.";
         }
-        if (_pinnedChannel != null) {
-            PinnedText.Text =
-                $"onvif-recorder is pinned to {DisplayName(_pinnedChannel)} on this " +
-                "device (chosen on its admin page or in an earlier install).";
-            PinnedText.Visibility = Visibility.Visible;
-        }
-        Select(InstallScripts.DefaultChannel(
-            _pinnedChannel, _protectChannel, _main.Connection.Channel));
+        await deviceTask;
+        var catalog = await catalogTask;
+
+        _manifest = catalog.Manifest;
+        _pinnedChannel = _manifest.Resolve(_pinnedChannel);
+        _deviceChannel = _manifest.Resolve(_deviceChannel);
+        ShowCatalogSource(catalog);
+        // A pin or current channel the list does not name is still offered,
+        // so it can be kept.
+        ChannelCombo.ItemsSource = _manifest.WithExtraChannels(
+            (_pinnedChannel, "current pin"),
+            (_packageInstalled ? _deviceChannel : null, "current channel"));
+        ShowDeviceChannel();
+
+        var preferred = InstallScripts.DefaultChannel(
+            _pinnedChannel, _deviceChannel, _packageInstalled, _manifest.DefaultId);
+        if (!Select(preferred)) Select(_manifest.DefaultId);
         _detected = true;
-        ChoicesPanel.IsEnabled = true;
-        InstallButton.IsEnabled = true;
-        UpdatePinHint();
+        ChannelCombo.IsEnabled = true;
+        UpdateSelection();
     }
 
     // Sets _protectChannel and the detection message. Returns false when the
@@ -53,7 +72,7 @@ public partial class ChannelPage : Page {
         try {
             result = await _main.Ssh.RunCaptureAsync(
                 _main.Connection, InstallScripts.BuildDetectChannelScript());
-        } catch (System.Exception ex) {
+        } catch (Exception ex) {
             DetectedText.Text =
                 "Could not read release channel from the device (" + ex.Message + ").";
             return false;
@@ -65,7 +84,7 @@ public partial class ChannelPage : Page {
         _protectChannel = InstallScripts.ParseChannel(result.Stdout);
         DetectedText.Text = _protectChannel == null
             ? "Could not determine the Protect channel."
-            : $"Detected Protect channel: {_protectChannel}";
+            : $"Detected Protect release channel: {ProtectChannelName(_protectChannel)}.";
         return true;
     }
 
@@ -76,7 +95,7 @@ public partial class ChannelPage : Page {
         try {
             result = await _main.Ssh.RunCaptureAsync(
                 _main.Connection, InstallScripts.BuildReadPinnedChannelScript());
-        } catch (System.Exception) {
+        } catch (Exception) {
             return false;
         }
         if (!result.Ok) return false;
@@ -84,49 +103,121 @@ public partial class ChannelPage : Page {
         return true;
     }
 
-    private void UpdatePinHint() {
-        if (!_detected) return;
-        var channel = Selected();
-        if (!InstallScripts.ShouldPinChannel(channel, _protectChannel, _pinnedChannel)) {
+    // Sets _packageInstalled and _deviceChannel; when the device cannot be
+    // read they stay "not installed" and unknown.
+    private async Task ReadDeviceChannelAsync() {
+        try {
+            var result = await _main.Ssh.RunCaptureAsync(
+                _main.Connection, InstallScripts.BuildReadDeviceChannelScript());
+            if (!result.Ok) return;
+            (_packageInstalled, _deviceChannel) =
+                InstallScripts.ParseDeviceChannel(result.Stdout);
+        } catch (Exception) {
+            // Treated as a device without onvif-recorder.
+        }
+    }
+
+    private void ShowDeviceChannel() {
+        string? text = null;
+        if (_pinnedChannel != null) {
+            text = $"onvif-recorder is pinned to {LabelOf(_pinnedChannel)} on this " +
+                   "device (chosen on its admin page or in an earlier install).";
+        } else if (_packageInstalled && _deviceChannel != null) {
+            text = "onvif-recorder is installed on this device and uses the " +
+                   $"{LabelOf(_deviceChannel)} channel.";
+        }
+        PinnedText.Text = text ?? "";
+        PinnedText.Visibility = text == null ? Visibility.Collapsed : Visibility.Visible;
+    }
+
+    private void ShowCatalogSource(ChannelCatalogResult catalog) {
+        var text = catalog.Source switch {
+            ChannelSource.Router => "Channel list fetched through the router.",
+            ChannelSource.Cached => catalog.FetchedUtc is { } at
+                ? "Could not fetch the channel list; showing the list as of " +
+                  $"{at.ToLocalTime():yyyy-MM-dd HH:mm}."
+                : "Could not fetch the channel list; showing the last list fetched.",
+            ChannelSource.BuiltIn =>
+                "Could not fetch current versions; showing built-in channels.",
+            _ => "",
+        };
+        CatalogSourceText.Text = text;
+        CatalogSourceText.Visibility =
+            text.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+
+        UpdateText.Inlines.Clear();
+        if (!catalog.InstallerOutdated) {
+            UpdateText.Visibility = Visibility.Collapsed;
+            return;
+        }
+        UpdateText.Inlines.Add(new Run(catalog.NewerSchemaSeen
+            ? "This installer is out of date and cannot read the current channel " +
+              "list. Download the latest installer: "
+            : "A newer version of this installer is available: "));
+        var url = catalog.Manifest.DownloadUrl;
+        var link = new Hyperlink(new Run(url)) { NavigateUri = new Uri(url) };
+        link.RequestNavigate += OpenLink;
+        UpdateText.Inlines.Add(link);
+        UpdateText.Visibility = Visibility.Visible;
+    }
+
+    private static void OpenLink(object sender, RequestNavigateEventArgs e) {
+        Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true });
+        e.Handled = true;
+    }
+
+    private void UpdateSelection() {
+        var selected = Selected();
+        ChannelDescriptionText.Text = selected?.Description ?? "";
+        InstallButton.IsEnabled = _detected && selected != null && selected.Selectable;
+        UpdatePinHint(selected);
+    }
+
+    private void UpdatePinHint(ChannelOption? selected) {
+        if (!_detected || selected == null) {
+            PinHintText.Text = "";
+            return;
+        }
+        if (!InstallScripts.ShouldPinChannel(selected.Id, _protectChannel, _pinnedChannel)) {
             PinHintText.Text =
                 "onvif-recorder will follow Protect's release channel, including " +
                 "any later change to it.";
         } else if (_protectChannel == null) {
             PinHintText.Text =
                 "Protect's channel is unknown, so onvif-recorder will stay on " +
-                $"{DisplayName(channel)} until you change it on the admin page.";
+                $"{selected.Label} until you change it on the admin page.";
         } else {
             PinHintText.Text =
-                $"onvif-recorder will stay on {DisplayName(channel)} even if " +
+                $"onvif-recorder will stay on {selected.Label} even if " +
                 "Protect's channel changes. You can change it on the admin page.";
         }
     }
 
-    private static string DisplayName(string channel) => channel switch {
+    private string LabelOf(string channel) => _manifest.LabelFor(channel);
+
+    // Protect's own names for the channels detect-channel.sh maps to suites.
+    private static string ProtectChannelName(string channel) => channel switch {
+        "stable" => "Release",
         "rc" => "Release Candidate",
         "early-access" => "Early Access",
-        _ => "Stable",
+        _ => channel,
     };
 
-    private void Select(string channel) {
-        StableRadio.IsChecked = channel == "stable";
-        RcRadio.IsChecked = channel == "rc";
-        EaRadio.IsChecked = channel == "early-access";
-        if (StableRadio.IsChecked != true
-            && RcRadio.IsChecked != true
-            && EaRadio.IsChecked != true) {
-            StableRadio.IsChecked = true;
+    // Selects the selectable entry with this id; false when there is none.
+    private bool Select(string? id) {
+        foreach (var item in ChannelCombo.Items) {
+            if (item is ChannelOption option && option.Id == id && option.Selectable) {
+                ChannelCombo.SelectedItem = option;
+                return true;
+            }
         }
+        return false;
     }
 
-    private string Selected() {
-        if (RcRadio.IsChecked == true) return "rc";
-        if (EaRadio.IsChecked == true) return "early-access";
-        return "stable";
-    }
+    private ChannelOption? Selected() => ChannelCombo.SelectedItem as ChannelOption;
 
-    private void Channel_Checked(object sender, RoutedEventArgs e) {
-        UpdatePinHint();
+    private void ChannelCombo_SelectionChanged(object sender, SelectionChangedEventArgs e) {
+        UpdateSelection();
     }
 
     private void Back_Click(object sender, RoutedEventArgs e) {
@@ -138,10 +229,11 @@ public partial class ChannelPage : Page {
     }
 
     private void Install_Click(object sender, RoutedEventArgs e) {
-        var channel = Selected();
-        _main.Connection.Channel = channel;
-        _main.Connection.PinChannel =
-            InstallScripts.ShouldPinChannel(channel, _protectChannel, _pinnedChannel);
+        var selected = Selected();
+        if (selected == null || !selected.Selectable) return;
+        _main.Connection.Channel = selected.Id;
+        _main.Connection.PinChannel = InstallScripts.ShouldPinChannel(
+            selected.Id, _protectChannel, _pinnedChannel);
         _main.Go(new InstallPage(_main, InstallPage.Mode.Install));
     }
 }

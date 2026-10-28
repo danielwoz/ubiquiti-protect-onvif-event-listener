@@ -9,10 +9,12 @@ on:
     branches: [main]
     paths:
       - 'windows-installer/**'
+      - 'gh-pages/channels.meta.json'
       - '.github/workflows/windows-ci.yml'
   pull_request:
     paths:
       - 'windows-installer/**'
+      - 'gh-pages/channels.meta.json'
       - '.github/workflows/windows-ci.yml'
 
 concurrency:
