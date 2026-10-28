@@ -71,6 +71,14 @@ exports_files(
     visibility = ["//test:__pkg__"],
 )
 
+exports_files(
+    [
+        "gh-pages/channels.meta.json",
+        "scripts/gen_channels_json.py",
+    ],
+    visibility = ["//test:__pkg__"],
+)
+
 cc_library(
     name = "util",
     srcs = ["src/util.cpp"],

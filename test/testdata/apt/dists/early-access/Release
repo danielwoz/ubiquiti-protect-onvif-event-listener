@@ -1,0 +1,11 @@
+Origin: onvif-recorder
+Label: onvif-recorder
+Suite: early-access
+Codename: early-access
+Version: 1.0
+Date: Thu, 22 Oct 2026 19:37:09 UTC
+Architectures: arm64
+Components: main
+Description: onvif-recorder early access channel
+SHA256:
+ 863890c0683095ecfc254a665314e1e765e8787887ac4502b6d3d350d98e313b 986 main/binary-arm64/Packages

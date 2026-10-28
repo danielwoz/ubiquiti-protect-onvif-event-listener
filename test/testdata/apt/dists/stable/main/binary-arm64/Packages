@@ -1,0 +1,15 @@
+Package: onvif-recorder-tools
+Version: 2.0.0
+Architecture: arm64
+Description: Another package in the same suite
+
+Package: onvif-recorder
+Version: 1.6.32
+Architecture: arm64
+Filename: pool/main/o/onvif-recorder/onvif-recorder_1.6.32_arm64.deb
+Description: ONVIF event recorder for UniFi Protect
+
+Package: onvif-recorder
+Version: 1.6.30
+Architecture: arm64
+Description: A second stanza that the generator ignores

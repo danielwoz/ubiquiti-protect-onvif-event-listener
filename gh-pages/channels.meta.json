@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "default": "early-access",
+  "channels": [
+    {
+      "id": "early-access",
+      "aliases": ["latest"],
+      "label": "Latest (alpha)",
+      "description": "Every tagged release as soon as it is published. Matches UniFi Protect's Early Access channel."
+    },
+    {
+      "id": "rc",
+      "aliases": [],
+      "label": "Release Candidate",
+      "description": "Releases promoted from Latest after testing on a live device."
+    },
+    {
+      "id": "stable",
+      "aliases": [],
+      "label": "Stable",
+      "description": "Releases promoted from Release Candidate after wider testing."
+    }
+  ],
+  "installer": {
+    "min_version": null,
+    "download_url": "https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener/releases/latest"
+  }
+}

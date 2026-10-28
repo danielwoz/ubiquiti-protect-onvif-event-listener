@@ -1,0 +1,9 @@
+Origin: onvif-recorder
+Label: onvif-recorder
+Suite: stable
+Codename: stable
+Version: 1.0
+Date: Fri, 23 Oct 2026 12:51:39 UTC
+Architectures: arm64
+Components: main
+Description: onvif-recorder stable channel

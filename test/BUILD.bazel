@@ -311,6 +311,15 @@ sh_test(
     data = ["//:debian/detect-channel.sh"],
 )
 
+sh_test(
+    name = "test_gen_channels_json",
+    srcs = ["test_gen_channels_json.sh"],
+    data = [
+        "//:gh-pages/channels.meta.json",
+        "//:scripts/gen_channels_json.py",
+    ] + glob(["testdata/apt/**"]),
+)
+
 cc_test(
     name = "test_runtime_config",
     srcs = ["test_runtime_config.cpp"],
