@@ -46,7 +46,6 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -2190,8 +2189,7 @@ void RawSink::enable_disk(const std::string& path) {
   if (!path.empty()) {
     disk_.open(path, std::ios::app);
     if (!disk_.is_open()) {
-      std::cerr << "[onvif] raw recording to disk disabled: cannot open "
-                << path << '\n';
+      LOG(ERROR) << "[onvif] raw recording to disk disabled: cannot open " << path;
     }
   }
 }
