@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -625,9 +626,10 @@ int main() {
     std::remove(path.c_str());
   }
 
-  // Case 22: one recording-stuck restart per camera until Protect is seen
-  // recording it, kept across restarts of this service, so a camera that a
-  // restart does not fix cannot use up the cap the other reasons share.
+  // Case 22: one recording-stuck restart per camera a day until Protect is
+  // seen recording it, kept across restarts of this service, so a camera
+  // that a restart does not fix cannot use up the cap the other reasons
+  // share.
   {
     using R = WedgeHealer::Reason;
     const std::string restarts = temp_path("healer_restarts_episode");
@@ -709,6 +711,39 @@ int main() {
       assert(h.check_recording_stuck_for_testing() == R::kRecordingStuck);
       assert(cmds.size() == 1);
       assert(read_episodes() == std::vector<std::string>{"cam1"});
+    }
+    {
+      // A day after its restart, a camera still not recording gets
+      // another one; a restart less than a day old still holds.
+      age_restarts();
+      {
+        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+        std::ofstream f(episodes, std::ios::trunc);
+        f << "cam1 " << (now - WedgeHealer::kRecordingStuckRetrySec - 60)
+          << "\n";
+        f << "cam2 " << (now - WedgeHealer::kRecordingStuckRetrySec + 3600)
+          << "\n";
+      }
+      WedgeHealer h;
+      std::vector<std::string> cmds;
+      attach(&h, &cmds);
+      report = {{"cam2"}, {}};
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(cmds.empty());
+      report = {{"cam1", "cam2"}, {}};
+      assert(h.check_recording_stuck_for_testing() == R::kNone);
+      assert(h.check_recording_stuck_for_testing() == R::kRecordingStuck);
+      assert(cmds.size() == 1);
+      std::ifstream f(episodes);
+      std::map<std::string, int64_t> at;
+      std::string id;
+      int64_t t = 0;
+      while (f >> id >> t) at[id] = t;
+      const int64_t now = static_cast<int64_t>(std::time(nullptr));
+      assert(at.size() == 2);
+      assert(now - at["cam1"] < 60);  // its retry is recorded
+      assert(now - at["cam2"] > 3600);  // unchanged
     }
     {
       // An unreadable file remembers nothing.

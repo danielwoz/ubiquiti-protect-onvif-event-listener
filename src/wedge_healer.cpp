@@ -451,21 +451,29 @@ WedgeHealer::Reason WedgeHealer::maybe_check_recording_stuck(bool force) {
                         stuck_prev_.end(), std::back_inserter(repeated));
   stuck_prev_ = std::move(stuck);
 
-  // A camera still not recording after the restart issued for it has a
-  // cause a restart does not fix; restarting again would only use up the
-  // daily cap the other reasons need.
+  // A camera still not recording after the restart issued for it most
+  // likely has a cause a restart does not fix, so it gets another restart
+  // only a day later; restarting sooner would use up the daily cap the
+  // other reasons need.
   std::vector<std::string> fresh;
+  const int64_t now_sec = now_epoch_sec();
   for (const auto& id : repeated) {
-    if (stuck_restarted_.count(id) == 0) {
+    const auto it = stuck_restarted_.find(id);
+    if (it == stuck_restarted_.end() ||
+        now_sec - it->second >= kRecordingStuckRetrySec) {
       fresh.push_back(id);
     } else if (stuck_warned_.insert(id).second) {
       // An error, so it reaches the journal and the admin page's Recent
-      // errors card: only the user can start this camera's recording now.
+      // errors card: only the user can start this camera's recording
+      // sooner.
       LOG(ERROR) << "[healer] Protect is still not recording camera " << id
-                 << " after the restart issued for it; not restarting "
-                    "Protect for it again until it records. Switch the "
-                    "camera's recording mode to Always and back, or "
-                    "restart unifi-protect, to start it.";
+                 << " after the restart issued for it; restarting Protect "
+                    "for it again in "
+                 << (kRecordingStuckRetrySec - (now_sec - it->second) + 3599) /
+                        3600
+                 << " h unless it records first. Switch the camera's "
+                    "recording mode to Always and back, or restart "
+                    "unifi-protect, to start it now.";
     }
   }
   if (fresh.empty()) return Reason::kNone;
@@ -481,7 +489,10 @@ WedgeHealer::Reason WedgeHealer::maybe_check_recording_stuck(bool force) {
   if (fr == FireResult::kRan) {
     stuck_prev_.clear();
     const int64_t at = now_epoch_sec();
-    for (const auto& id : fresh) stuck_restarted_[id] = at;
+    for (const auto& id : fresh) {
+      stuck_restarted_[id] = at;
+      stuck_warned_.erase(id);
+    }
     persist_stuck_state();
   } else if (fr == FireResult::kGaveUp) {
     // Pause instead of retrying every minute against a cap that lifts

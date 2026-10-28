@@ -106,6 +106,9 @@ class WedgeHealer {
   static constexpr int kRecordingStuckCheckSec = 60;
   // Pause after the daily cap stops a recording-stuck restart.
   static constexpr int kRecordingStuckBackoffSec = 60 * 60;
+  // A camera still not recording this long after the restart issued for
+  // it gets another one.
+  static constexpr int kRecordingStuckRetrySec = 24 * 60 * 60;
 
   // What the recording-stuck callback found among the cameras it checked.
   struct RecordingCheck {
@@ -160,11 +163,11 @@ class WedgeHealer {
   void set_state_path(const std::string& path);
 
   /// Keep in @p path the cameras a recording-stuck restart was issued for.
-  /// Each camera gets one such restart until Protect is seen recording it,
-  /// so a camera that a restart does not fix cannot use up the daily cap
-  /// the other reasons share, also across restarts of this service (which
-  /// restarts itself after Protect does).  Must be called before start().
-  /// Empty path keeps the list in memory only.
+  /// Each camera gets one such restart a day until Protect is seen
+  /// recording it, so a camera that a restart does not fix cannot use up
+  /// the daily cap the other reasons share, also across restarts of this
+  /// service (which restarts itself after Protect does).  Must be called
+  /// before start().  Empty path keeps the list in memory only.
   void set_recording_stuck_state_path(const std::string& path);
 
   // Arm a one-shot featureFlags drift check for @p camera_ids.  Call this
