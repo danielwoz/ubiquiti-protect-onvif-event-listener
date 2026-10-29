@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generated_at": "2026-10-28T11:38:43Z",
+  "generated_at": "2026-10-29T15:01:16Z",
   "default": "early-access",
   "channels": [
     {
@@ -10,8 +10,8 @@
       ],
       "label": "Latest (alpha)",
       "description": "Every tagged release as soon as it is published. Matches UniFi Protect's Early Access and Alpha channels.",
-      "version": "1.6.32",
-      "updated_at": "2026-10-22T19:37:09Z"
+      "version": "1.6.34",
+      "updated_at": "2026-10-29T15:01:16Z"
     },
     {
       "id": "rc",
