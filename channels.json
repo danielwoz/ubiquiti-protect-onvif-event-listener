@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generated_at": "2026-10-30T06:55:23Z",
+  "generated_at": "2026-10-30T06:55:58Z",
   "default": "early-access",
   "channels": [
     {
@@ -26,8 +26,8 @@
       "aliases": [],
       "label": "Stable",
       "description": "Releases promoted from Release Candidate after wider testing.",
-      "version": "1.6.32",
-      "updated_at": "2026-10-23T12:51:39Z"
+      "version": "1.6.34",
+      "updated_at": "2026-10-30T06:55:57Z"
     }
   ],
   "installer": {
