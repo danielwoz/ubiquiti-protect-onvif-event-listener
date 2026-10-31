@@ -3522,6 +3522,71 @@ static void test_default_object_type_motion_nanodet(
         "as person");
 }
 
+// A field rule whose name carries no class is refined by NanoDet-M, as
+// generic motion is; a class the camera sends is kept.  Under
+// default_object_type=motion a field rule NanoDet-M cannot classify is
+// still recorded, as person.
+static void test_field_rule_nanodet(const std::string& ubv_dir) {
+  auto detector = load_nanodet();
+  if (!detector) {
+    std::cout << "  (skipped: NANODET_PARAM / NANODET_BIN not set)\n";
+    return;
+  }
+  // security_cam_vehicle.jpg holds a car; snapshot_108.jpg holds nothing
+  // NanoDet-M reports.
+  SnapshotSyntheticEmulator car_cam("192.168.1.242", {},
+      load_file(source_dir() + "testdata/security_cam_vehicle.jpg"));
+  SnapshotSyntheticEmulator empty_cam("192.168.1.243", {},
+      load_file(source_dir() + "testdata/snapshot_108.jpg"));
+  car_cam.start();
+  empty_cam.start();
+
+  // Runs one field-rule trip on @p emu; returns its smartDetectTypes, or
+  // empty when nothing was recorded.
+  auto run = [&](SnapshotSyntheticEmulator& emu, const char* default_type,
+                 const char* class_types) {
+    auto backend = std::make_unique<MockBackend>();
+    MockBackend* bptr = backend.get();
+    auto rec_or =
+        onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+    CHECK(rec_or.ok(), "field_nanodet: CreateWithBackend failed");
+    onvif::DetectionRecorder& recorder = **rec_or;
+    recorder.set_ubv_dir(ubv_dir);
+    recorder.set_coalesce_window(0);
+    recorder.set_detector(detector.get());
+    recorder.set_default_object_type(default_type);
+    onvif::CameraConfig cfg;
+    cfg.ip           = emu.local_address();
+    cfg.user         = "admin";
+    cfg.password     = "password";
+    cfg.snapshot_url = emu.snapshot_url();
+    recorder.set_snapshot(cfg);
+
+    onvif::OnvifEvent ev;
+    ev.camera_ip   = emu.local_address();
+    ev.topic       = "tns1:RuleEngine/FieldDetector/ObjectsInside";
+    ev.event_time  = "2026-03-24T14:03:00Z";
+    ev.property_op = "Changed";
+    ev.source["Rule"]   = "MyFieldDetector1";
+    ev.data["IsInside"] = "true";
+    if (*class_types) ev.data["ClassTypes"] = class_types;
+    recorder.on_event(ev);
+    return bptr->events.empty() ? std::string() : bptr->events[0].sdt_json;
+  };
+
+  CHECK(run(car_cam, "person", "") == "[\"vehicle\"]",
+        "field_nanodet: a field rule with no class must take NanoDet-M's "
+        "class");
+  CHECK(run(car_cam, "person", "Human") == "[\"person\"]",
+        "field_nanodet: the camera's ClassTypes must win over NanoDet-M");
+  CHECK(run(empty_cam, "person", "") == "[\"person\"]",
+        "field_nanodet: a field rule NanoDet-M cannot classify is recorded "
+        "as person");
+  CHECK(run(empty_cam, "motion", "") == "[\"person\"]",
+        "field_nanodet: default_object_type=motion must not drop a field "
+        "rule");
+}
+
 static void test_coalesce_window() {
   auto backend = std::make_unique<MockBackend>();
   MockBackend* bptr = backend.get();
@@ -4207,6 +4272,8 @@ int main() {
            [] { test_default_object_type_motion(); });
   run_test("default_object_type_motion_nanodet",
            [&] { test_default_object_type_motion_nanodet(dir()); });
+  run_test("field_rule_nanodet",
+           [&] { test_field_rule_nanodet(dir()); });
   run_test("uos_notify_payload_and_retry",
            [] { test_uos_notify_payload_and_retry(); });
   run_test("momentary_does_not_close_stateful_event",

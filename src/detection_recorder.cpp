@@ -69,6 +69,9 @@ struct Detection {
   // than leaving a row with end IS NULL for the stale-event purge to
   // delete five minutes later.
   bool        momentary{false};
+  // True for camera analytics rules (field / line rules).  A rule trip is
+  // never dropped as unclassified motion, even when it carries no class.
+  bool        analytic_rule{false};
 };
 
 // Topics that are valid ONVIF but carry no detection we can act on --
@@ -183,15 +186,18 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     // "MyFieldDetector1") -- the camera's AcuSense classifier has
     // already filtered to human/vehicle implicitly, so fall back to the
     // default object type and let NanoDet-M refine the class on the
-    // snapshot.
+    // snapshot (from_fallback=true).
     std::string type = class_from_class_types(ev);
     if (type.empty()) {
       if      (rule_it->second == "Human")   type = "human";
       else if (rule_it->second == "Vehicle") type = "vehicle";
-      else                                   type = fallback_type;
     }
+    const bool fell_back = type.empty();
+    if (fell_back) type = fallback_type;
 
-    return Detection{type, inside_it->second == "true", ev.event_time};
+    return Detection{type, inside_it->second == "true", ev.event_time,
+                     /*from_fallback=*/fell_back, /*momentary=*/false,
+                     /*analytic_rule=*/true};
   }
 
   // --- State-shaped AI topics (see kStateTopics) ---
@@ -224,7 +230,8 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     const std::string cls = class_from_class_types(ev);
     return Detection{cls.empty() ? fallback_type : cls,
                      /*started=*/true, ev.event_time,
-                     /*from_fallback=*/cls.empty(), /*momentary=*/true};
+                     /*from_fallback=*/cls.empty(), /*momentary=*/true,
+                     /*analytic_rule=*/true};
   }
 
   // --- Generic CellMotionDetector/Motion (Amcrest, Lorex, Dahua, etc.) ---
@@ -1622,7 +1629,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // default_object_type=motion drops unclassified generic motion below,
     // as --drop_unclassified_motion does.  What it does not drop and that
     // still needs a type (a line crossing or field rule with no class) is
-    // recorded as person.
+    // recorded with NanoDet-M's class, or as person when it finds none.
     default_obj_type = default_object_type_ == kMotionObjectType
                            ? std::string("person") : default_object_type_;
     auto it = find_camera_setting(camera_object_types_, ev.camera_ip);
@@ -2016,10 +2023,10 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // chokes while RTSP is streaming are the ones flooding the timeline
     // with phantom "person" events in the first place.
     //
-    // Momentary topics stay exempt: a line crossing is a deliberate
-    // analytic trip, not pixel noise.  Coalescing merges are left alone,
-    // since those extend an event that already exists.
-    if (drop_unclassified && det->from_fallback && !det->momentary &&
+    // Analytics rules stay exempt: a line crossing or field rule trip is a
+    // deliberate analytic trip, not pixel noise.  Coalescing merges are
+    // left alone, since those extend an event that already exists.
+    if (drop_unclassified && det->from_fallback && !det->analytic_rule &&
         cam_override_type.empty() && !nanodet_classified &&
         coalesced_event_id.empty()) {
       LOG(INFO) << '[' << ev.camera_ip

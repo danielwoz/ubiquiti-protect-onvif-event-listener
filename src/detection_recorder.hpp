@@ -248,7 +248,8 @@ class DetectionRecorder {
   /// "motion".  "motion" drops such an event unless NanoDet-M classifies
   /// it, exactly as set_drop_unclassified_motion(true) does, so Protect's
   /// own motion event is its only record; other events without a class
-  /// (a line crossing, a field rule) are recorded as "person".  Case and
+  /// (a line crossing, a field rule) are recorded with NanoDet-M's class,
+  /// or as "person" when it finds none.  Case and
   /// surrounding spaces are ignored.  Unknown values are recorded as
   /// "person"; callers validate and warn first.
   void set_default_object_type(const std::string& type);
@@ -271,7 +272,8 @@ class DetectionRecorder {
   /// Person/Vehicle/Pet events this removes a stream of phantom "person"
   /// detections triggered by wind, IR and reflections.  Real camera AI
   /// events and --camera_object_types overrides are unaffected, as are
-  /// momentary topics such as line crossing.  default_object_type "motion"
+  /// camera analytics rules (line crossing, field rules), even without a
+  /// class.  default_object_type "motion"
   /// turns the same behaviour on.  Default false.
   void set_drop_unclassified_motion(bool drop);
 
