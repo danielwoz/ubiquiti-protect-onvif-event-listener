@@ -1,5 +1,5 @@
 Package: onvif-recorder
-Version: 1.6.34
+Version: 1.6.36
 Architecture: arm64
 Maintainer: Daniel Williams <danielwoz@gmail.com>
 Depends: libc6, systemd, adduser, procps
@@ -7,11 +7,11 @@ Recommends: unifi-protect
 Homepage: https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener
 Priority: optional
 Section: net
-Filename: pool/main/o/onvif-recorder/onvif-recorder_1.6.34_arm64.deb
-Size: 13762364
-SHA256: 70ebd2aed1bcd11df68978d6fd2872239a2c6bda4c80d93f9b8b604ab5db6718
-SHA1: e9c5a3b4382a6d51bac6fb3c761dcde32fadd8d4
-MD5sum: 77af2b68431570942f04fd5d0610bf31
+Filename: pool/main/o/onvif-recorder/onvif-recorder_1.6.36_arm64.deb
+Size: 13763192
+SHA256: e3a26579e7820da7c0df88487cbac1004e4ea00cd4c0f14446361e5c1b5088af
+SHA1: aecbe83e3b107a5133a47062773ff9add2c3d551
+MD5sum: 194c73874d95ff2e4100104318caeb21
 Description: ONVIF event recorder for UniFi Protect
  Subscribes to ONVIF cameras, parses their motion/smart-detect events, and
  records detection intervals into the UniFi Protect PostgreSQL database so
