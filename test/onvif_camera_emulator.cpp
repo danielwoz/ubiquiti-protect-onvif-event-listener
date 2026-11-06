@@ -14,6 +14,8 @@
 
 #include "onvif_camera_emulator.hpp"
 
+#include <openssl/evp.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -102,9 +104,105 @@ std::string OnvifCameraEmulator::request_header(const char* name) {
     return v ? v : "";
 }
 
+// ============================================================
+// HTTP Digest (RFC 7616, qop=auth)
+// ============================================================
+namespace {
+
+std::string md5_hex(const std::string& text) {
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int  len = 0;
+    EVP_MD_CTX*   ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_md5(), nullptr);
+    EVP_DigestUpdate(ctx, text.data(), text.size());
+    EVP_DigestFinal_ex(ctx, digest, &len);
+    EVP_MD_CTX_free(ctx);
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(len * 2);
+    for (unsigned int i = 0; i < len; ++i) {
+        out.push_back(kHex[digest[i] >> 4]);
+        out.push_back(kHex[digest[i] & 0x0F]);
+    }
+    return out;
+}
+
+// Value of parameter @p key in an "Authorization: Digest ..." header, or
+// empty when absent.
+std::string digest_param(const std::string& hdr, const std::string& key) {
+    std::size_t p = hdr.find(' ');
+    if (p == std::string::npos) return {};
+    p += 1;
+    while (p < hdr.size()) {
+        while (p < hdr.size() && (hdr[p] == ' ' || hdr[p] == ',')) ++p;
+        const std::size_t name_start = p;
+        while (p < hdr.size() && hdr[p] != '=' && hdr[p] != ',') ++p;
+        const std::string name = hdr.substr(name_start, p - name_start);
+        if (p >= hdr.size() || hdr[p] != '=') return {};
+        ++p;
+        std::string value;
+        if (p < hdr.size() && hdr[p] == '"') {
+            ++p;
+            const std::size_t start = p;
+            while (p < hdr.size() && hdr[p] != '"') ++p;
+            value = hdr.substr(start, p - start);
+            if (p < hdr.size()) ++p;
+        } else {
+            const std::size_t start = p;
+            while (p < hdr.size() && hdr[p] != ',') ++p;
+            value = hdr.substr(start, p - start);
+        }
+        if (name == key) return value;
+    }
+    return {};
+}
+
+}  // namespace
+
+void OnvifCameraEmulator::require_http_digest(const std::string& user,
+                                              const std::string& password) {
+    digest_required_ = true;
+    digest_user_ = user;
+    digest_password_ = password;
+    digest_nonce_ = "5f0b1e2c3d4a5968778899aabbccddee";
+}
+
+bool OnvifCameraEmulator::check_digest(struct MHD_Connection* conn,
+                                       const char* method,
+                                       const char* url) const {
+    const char* auth = MHD_lookup_connection_value(conn, MHD_HEADER_KIND,
+                                                   "Authorization");
+    if (!auth) return false;
+    const std::string hdr = auth;
+
+    const std::string user     = digest_param(hdr, "username");
+    const std::string realm    = digest_param(hdr, "realm");
+    const std::string nonce    = digest_param(hdr, "nonce");
+    const std::string uri      = digest_param(hdr, "uri");
+    const std::string qop      = digest_param(hdr, "qop");
+    const std::string nc       = digest_param(hdr, "nc");
+    const std::string cnonce   = digest_param(hdr, "cnonce");
+    const std::string response = digest_param(hdr, "response");
+    // The client's digest uri is the full request target ("/onvif/x?Idx=5")
+    // while MHD's url holds the path alone.
+    const std::size_t query = uri.find('?');
+    const std::string path = query == std::string::npos ? uri : uri.substr(0, query);
+    if (user != digest_user_ || realm != "ONVIF" || nonce != digest_nonce_ ||
+        path != url || response.empty())
+        return false;
+
+    const std::string ha1 = md5_hex(user + ":" + realm + ":" + digest_password_);
+    const std::string ha2 = md5_hex(std::string(method) + ":" + uri);
+    const std::string expected =
+        qop.empty() ? md5_hex(ha1 + ":" + nonce + ":" + ha2)
+                    : md5_hex(ha1 + ":" + nonce + ":" + nc + ":" + cnonce +
+                              ":" + qop + ":" + ha2);
+    return expected == response;
+}
+
 MHD_Result OnvifCameraEmulator::on_request(
     void* cls, struct MHD_Connection* conn,
-    const char* url, const char* /*method*/, const char* /*version*/,
+    const char* url, const char* method, const char* /*version*/,
     const char* upload_data, size_t* upload_data_size,
     void** con_cls) {
     auto* emulator = static_cast<OnvifCameraEmulator*>(cls);
@@ -148,6 +246,28 @@ MHD_Result OnvifCameraEmulator::on_request(
                     soap_action = cts.substr(p, e - p);
             }
         }
+    }
+
+    // Digest gate: refuse anything the client has not authenticated at the
+    // HTTP layer yet, as cameras with ONVIF authentication set to digest do.
+    if (emulator->digest_required_ &&
+        !emulator->check_digest(conn, method, url)) {
+        const std::string challenge =
+            "Digest realm=\"ONVIF\", qop=\"auth\", nonce=\"" +
+            emulator->digest_nonce_ + "\"";
+        const std::string body401 =
+            "<html><body><h2>Access Error: 401 -- Unauthorized</h2></body></html>";
+        struct MHD_Response* unauthorized = MHD_create_response_from_buffer(
+            body401.size(), const_cast<char*>(body401.data()),
+            MHD_RESPMEM_MUST_COPY);
+        MHD_add_response_header(unauthorized, "WWW-Authenticate",
+                                challenge.c_str());
+        MHD_add_response_header(unauthorized, MHD_HTTP_HEADER_CONTENT_TYPE,
+                                "text/html");
+        MHD_Result ret = MHD_queue_response(conn, MHD_HTTP_UNAUTHORIZED,
+                                           unauthorized);
+        MHD_destroy_response(unauthorized);
+        return ret;
     }
 
     // Dispatch

@@ -380,6 +380,16 @@ onvif-recorder reports it on the admin page's Recent errors card and tries anoth
 for it a day later, unless Protect has started recording it by then. To fix it by hand, once Protect shows the camera's motion detection as
 available, switch the camera's recording mode to Always and back, or restart Protect.
 
+**"failed to get subscription URL", or the camera rejects event requests with a 401?**
+onvif-recorder logs in with a WS-Security username token inside each request. A camera
+whose ONVIF authentication is set to HTTP Digest answers with `401 Unauthorized` instead,
+so onvif-recorder also answers a Digest (or Basic) challenge with the same login; both
+settings now work. If it still fails, check the camera's ONVIF settings: on most Hikvision
+firmware event subscription needs an ONVIF user with the Administrator level, separate from
+the web-UI login. Create one under Configuration → Network → Advanced Settings →
+Integration Protocol → ONVIF and use those credentials in Protect. A `ter:NotAuthorized`
+fault means exactly that; the admin page's Camera health card shows it too.
+
 **Duplicate motion and "person" events?** From Protect 7.1, Protect subscribes to a
 third-party camera's ONVIF motion itself and creates the basic motion events.
 onvif-recorder never writes plain motion events, but by default it records motion

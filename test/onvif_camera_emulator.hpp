@@ -65,6 +65,12 @@ class OnvifCameraEmulator {
     /// which means no alarm service entry is included in GetServices.
     void set_alarm_service_url(const std::string& url) { alarm_service_url_ = url; }
 
+    /// Require HTTP Digest authentication for every request, answering
+    /// anything without a valid Authorization header with 401 and a Digest
+    /// challenge.  Mirrors cameras whose ONVIF authentication is set to
+    /// digest, which reject a WS-Security-only request (issue #71).
+    void require_http_digest(const std::string& user, const std::string& password);
+
  protected:
     /// Called for each complete SOAP request. Return {http_status, soap_xml}.
     /// @param path        Request URL path  (e.g. "/onvif/event_service")
@@ -96,10 +102,21 @@ class OnvifCameraEmulator {
         const char* upload_data, size_t* upload_data_size,
         void** con_cls);
 
+    /// True when @p conn's Authorization header carries a valid Digest
+    /// response for @p url as @p method, matching the configured login.
+    bool check_digest(struct MHD_Connection* conn,
+                      const char* method, const char* url) const;
+
     static void on_completed(
         void* cls, struct MHD_Connection* conn,
         void** con_cls, enum MHD_RequestTerminationCode toe);
 
     struct MHD_Daemon* daemon_{nullptr};
     uint16_t           port_{0};
+
+    // HTTP Digest gate; disabled unless require_http_digest() was called.
+    bool        digest_required_{false};
+    std::string digest_user_;
+    std::string digest_password_;
+    std::string digest_nonce_;
 };

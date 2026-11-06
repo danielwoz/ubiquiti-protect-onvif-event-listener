@@ -104,6 +104,21 @@ class HikvisionPullPointNotAuthorizedEmulator : public OnvifCameraEmulator {
 };
 
 // ============================================================
+// HikvisionHttpDigestEmulator -- Hikvision-compatible camera whose ONVIF
+// authentication is set to HTTP Digest: every request without a valid
+// Authorization header gets 401 and a Digest challenge, as the camera in
+// issue #71 does, while a request that answers the challenge behaves as
+// HikvisionCompatibleEmulator.
+// ============================================================
+class HikvisionHttpDigestEmulator : public HikvisionCompatibleEmulator {
+ public:
+  explicit HikvisionHttpDigestEmulator(
+      const std::string& jsonl_path,
+      const std::string& user     = "admin",
+      const std::string& password = "eW6iO01l");
+};
+
+// ============================================================
 // CellMotionCameraEmulator -- Amcrest / Lorex / Dahua basic-motion camera
 // (subscribes immediately, emits CellMotionDetector/Motion + MotionAlarm topics)
 // ============================================================

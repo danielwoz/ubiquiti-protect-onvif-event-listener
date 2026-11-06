@@ -258,6 +258,14 @@ HikvisionCompatibleEmulator::HikvisionCompatibleEmulator(
   session_ = RecordedSession::from_jsonl(jsonl_path);
 }
 
+HikvisionHttpDigestEmulator::HikvisionHttpDigestEmulator(
+    const std::string& jsonl_path,
+    const std::string& user,
+    const std::string& password)
+  : HikvisionCompatibleEmulator(jsonl_path) {
+  require_http_digest(user, password);
+}
+
 std::pair<int, std::string> HikvisionCompatibleEmulator::handle(
   const std::string& /*path*/,
   const std::string& soap_action,

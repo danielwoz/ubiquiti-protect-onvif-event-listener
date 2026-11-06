@@ -353,6 +353,50 @@ static void test_hikvision_pullpoint_notauthorized(const std::string& jsonl) {
 }
 
 // ============================================================
+// Test: Hikvision with ONVIF authentication set to HTTP Digest (#71) --
+// the listener answers the camera's challenge and subscribes normally
+// ============================================================
+static void test_hikvision_http_digest(const std::string& jsonl) {
+  HikvisionHttpDigestEmulator emu(jsonl);
+  emu.start();
+
+  onvif::CameraConfig cfg;
+  cfg.ip                 = emu.local_address();
+  cfg.user               = "admin";
+  cfg.password           = "eW6iO01l";
+  cfg.retry_interval_sec = 1;
+
+  auto r = collect({cfg}, 5, std::chrono::seconds(30));
+
+  CHECK(!r.timed_out,
+        "timed out waiting for events through the digest challenge");
+  CHECK(r.events.size() >= 5,
+        "expected >= 5 events through HTTP Digest");
+}
+
+// ============================================================
+// Test: HTTP Digest with a wrong password -- no subscription, gives up
+// ============================================================
+static void test_hikvision_http_digest_bad_password(const std::string& jsonl) {
+  HikvisionHttpDigestEmulator emu(jsonl);
+  emu.start();
+
+  onvif::CameraConfig cfg;
+  cfg.ip                       = emu.local_address();
+  cfg.user                     = "admin";
+  cfg.password                 = "wrong-password";
+  cfg.retry_interval_sec       = 0;
+  cfg.max_consecutive_failures = 3;
+
+  auto r = collect({cfg}, 1, std::chrono::seconds(10));
+
+  CHECK(r.timed_out,
+        "expected timeout (no events) when the digest response is invalid");
+  CHECK(r.events.empty(),
+        "expected zero events when the digest login is wrong");
+}
+
+// ============================================================
 // Test: ThinginoCameraEmulator -- listener gives up after max failures
 // ============================================================
 static void test_thingino_graceful_stop(const std::string& jsonl) {
@@ -1810,6 +1854,10 @@ int main(int argc, char* argv[]) {
            [&] { test_reolink_namespace(reolink_jsonl); });
   run_test("hikvision_pullpoint_notauthorized",
            [&] { test_hikvision_pullpoint_notauthorized(hik_notauth_jsonl); });
+  run_test("hikvision_http_digest",
+           [&] { test_hikvision_http_digest(hikvision_jsonl); });
+  run_test("hikvision_http_digest_bad_password",
+           [&] { test_hikvision_http_digest_bad_password(hikvision_jsonl); });
   run_test("both_cameras",
            [&] { test_both_cameras(hikvision_jsonl, dahua_jsonl); });
   run_test("axis_ref_params",

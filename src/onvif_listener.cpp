@@ -256,15 +256,55 @@ size_t curl_write_cb(void* ptr, size_t sz, size_t nmemb, std::string* out) {
   return sz * nmemb;
 }
 
-absl::StatusOr<HttpResponse> soap_post(
-  const std::string& url,
-  const std::string& body,
-  const std::string& action,
-  int timeout_sec = 30) {
+// Login replayed in an Authorization header when a camera answers the
+// WS-Security envelope with an HTTP authentication challenge.  Cameras whose
+// ONVIF authentication is set to digest (some Hikvision firmware, #71) accept
+// the device service this way but reject event requests that carry only the
+// WS-Security token.
+struct HttpCredentials {
+  std::string username;
+  std::string password;
+};
+
+size_t curl_header_cb(char* ptr, size_t sz, size_t nmemb, std::string* out) {
+  out->append(static_cast<char*>(ptr), sz * nmemb);
+  return sz * nmemb;
+}
+
+// True when the response header block has a WWW-Authenticate line offering
+// @p scheme (case-insensitive).
+bool has_auth_challenge(const std::string& headers, const char* scheme) {
+  std::string needle(scheme);
+  std::transform(needle.begin(), needle.end(), needle.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::size_t pos = 0;
+  while (pos < headers.size()) {
+    std::size_t eol = headers.find('\n', pos);
+    if (eol == std::string::npos) eol = headers.size();
+    std::string line = headers.substr(pos, eol - pos);
+    pos = eol + 1;
+    std::transform(line.begin(), line.end(), line.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    line.erase(line.find_last_not_of(" \r") + 1);
+    if (line.rfind("www-authenticate:", 0) == 0 &&
+        line.find(needle) != std::string::npos)
+      return true;
+  }
+  return false;
+}
+
+// One SOAP POST.  @p auth_scheme is a CURLAUTH_* value, or 0 for none.  The
+// full response header block is appended to @p headers.
+absl::Status soap_post_once(const std::string& url,
+                            const std::string& body,
+                            const std::string& action,
+                            int timeout_sec,
+                            long auth_scheme,  // NOLINT(runtime/int)
+                            const HttpCredentials* cred,
+                            HttpResponse* resp,
+                            std::string* headers) {
   CURL* c = curl_easy_init();
   if (!c) return absl::InternalError("curl_easy_init failed");
-
-  HttpResponse resp;
 
   std::string ct = "Content-Type: application/soap+xml; charset=utf-8";
   if (!action.empty()) ct += "; action=\"" + action + "\"";
@@ -279,10 +319,19 @@ absl::StatusOr<HttpResponse> soap_post(
   // libcurl requires long for size/timeout params  // NOLINT(runtime/int)
   curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE,  static_cast<long>(body.size()));  // NOLINT
   curl_easy_setopt(c, CURLOPT_HTTPHEADER,     hdrs);
+  std::string body_out;
   curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,  curl_write_cb);
-  curl_easy_setopt(c, CURLOPT_WRITEDATA,      &resp.body);
+  curl_easy_setopt(c, CURLOPT_WRITEDATA,      &body_out);
+  curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, curl_header_cb);
+  curl_easy_setopt(c, CURLOPT_HEADERDATA,     headers);
   curl_easy_setopt(c, CURLOPT_TIMEOUT,        static_cast<long>(timeout_sec));  // NOLINT
   curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);  // NOLINT(runtime/int)
+
+  if (auth_scheme != 0 && cred) {
+    curl_easy_setopt(c, CURLOPT_HTTPAUTH, auth_scheme);  // NOLINT(runtime/int)
+    curl_easy_setopt(c, CURLOPT_USERNAME, cred->username.c_str());
+    curl_easy_setopt(c, CURLOPT_PASSWORD, cred->password.c_str());
+  }
 
   CURLcode rc = curl_easy_perform(c);
   curl_slist_free_all(hdrs);
@@ -294,8 +343,43 @@ absl::StatusOr<HttpResponse> soap_post(
 
   long code = 0;  // NOLINT(runtime/int)
   curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
-  resp.status_code = static_cast<int64_t>(code);
+  resp->status_code = static_cast<int64_t>(code);
+  resp->body = std::move(body_out);
   curl_easy_cleanup(c);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<HttpResponse> soap_post(
+  const std::string& url,
+  const std::string& body,
+  const std::string& action,
+  int timeout_sec = 30,
+  const HttpCredentials* cred = nullptr) {
+  HttpResponse resp;
+  std::string headers;
+  auto st = soap_post_once(url, body, action, timeout_sec, 0, nullptr,
+                           &resp, &headers);
+  if (!st.ok()) return st;
+
+  // A 401 that carries a challenge means this endpoint wants HTTP
+  // authentication as well as the WS-Security login.  Replay the same login
+  // with the scheme the camera named, preferring digest, so it is only sent
+  // to a camera that asked for it.
+  if (resp.status_code == 401 && cred && !cred->username.empty()) {
+    long scheme = 0;  // NOLINT(runtime/int)
+    if (has_auth_challenge(headers, "digest")) {
+      scheme = CURLAUTH_DIGEST;
+    } else if (has_auth_challenge(headers, "basic")) {
+      scheme = CURLAUTH_BASIC;
+    }
+    if (scheme != 0) {
+      resp = HttpResponse{};
+      headers.clear();
+      st = soap_post_once(url, body, action, timeout_sec, scheme, cred,
+                          &resp, &headers);
+      if (!st.ok()) return st;
+    }
+  }
   return resp;
 }
 
@@ -821,7 +905,8 @@ absl::StatusOr<int64_t> send_unsubscribe(const CameraConfig& cam,
   const std::string body = "    <wsnt:Unsubscribe/>\n";
   const std::string soap = build_soap(cam.user, cam.password, body, url,
                                       ACTION, ref_params);
-  auto resp_or = soap_post(url, soap, ACTION, timeout_sec);
+  const HttpCredentials cred{cam.user, cam.password};
+  auto resp_or = soap_post(url, soap, ACTION, timeout_sec, &cred);
   if (!resp_or.ok()) return resp_or.status();
   RawSink::instance().record(cam.ip, url, ACTION, soap,
                              resp_or->status_code, resp_or->body);
@@ -1562,7 +1647,8 @@ class CameraWorker {
                                             const std::string& body,
                                             const std::string& action,
                                             int timeout_sec) {
-    auto resp_or = soap_post(url, body, action, timeout_sec);
+    const HttpCredentials cred{cfg_.user, cfg_.password};
+    auto resp_or = soap_post(url, body, action, timeout_sec, &cred);
     if (!resp_or.ok()) return resp_or;
     RawSink::instance().record(cfg_.ip, url, action, body,
                                resp_or->status_code, resp_or->body);

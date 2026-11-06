@@ -1,3 +1,6 @@
+_SSL = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:openssl"],
+               "//conditions:default":    ["//third_party:openssl"]})
+
 config_setting(
     name = "is_arm64",
     constraint_values = ["@platforms//cpu:aarch64"],
@@ -38,7 +41,7 @@ cc_library(
     name = "onvif_camera_emulator",
     srcs = ["onvif_camera_emulator.cpp"],
     hdrs = ["onvif_camera_emulator.hpp"],
-    deps = select({
+    deps = _SSL + select({
         ":is_arm64": ["@arm64_sysroot//:libmicrohttpd"],
         "//conditions:default": ["//third_party:libmicrohttpd"],
     }),
