@@ -1419,6 +1419,55 @@ static void test_thumbnail_crop_dimensions(const std::string& ubv_dir) {
 }
 
 // ============================================================
+// Snapshot fetch over HTTP Digest
+// ============================================================
+
+// A camera with ONVIF authentication set to Digest challenges every request,
+// snapshot GET included.  The thumbnail must still be fetched and stored.
+static void test_snapshot_http_digest(const std::string& ubv_dir) {
+  auto backend = std::make_unique<MockBackend>();
+
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  if (!rec_or.ok()) {
+    CHECK(false, std::string("DetectionRecorder::CreateWithBackend failed: ")
+                 + std::string(rec_or.status().message()));
+    return;
+  }
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_ubv_dir(ubv_dir);
+
+  auto jpeg = load_file(source_dir() + "testdata/snapshot_108.jpg");
+  SnapshotSyntheticEmulator emu("192.168.1.201",
+    {make_cell_motion_response(true,  "2026-03-21T10:00:00Z"),
+     make_cell_motion_response(false, "2026-03-21T10:00:05Z")},
+    jpeg);
+  emu.require_http_digest("admin", "password");
+  emu.start();
+
+  const bool ok = run_single_camera(emu, recorder, 2);
+  CHECK(ok, "snapshot_http_digest: timed out before events arrived");
+  if (!ok) return;
+
+  const std::string ubv_path =
+      ubv_dir + "/" + emu.local_address() + "_thumbnails.ubv";
+  auto frames_or = ubv::decode(ubv_path);
+  if (!frames_or.ok()) {
+    CHECK(false, "snapshot_http_digest: ubv::decode failed: "
+                 + std::string(frames_or.status().message()));
+    return;
+  }
+  const auto& frames = *frames_or;
+  CHECK(!frames.empty(), "snapshot_http_digest: no thumbnails stored");
+  if (frames.empty()) return;
+  int w = 0, h = 0;
+  CHECK(jpeg_dims(frames[0].jpeg, &w, &h),
+        "snapshot_http_digest: stored frame is not a valid JPEG");
+  CHECK(w == 2560 && h == 1440,
+        "snapshot_http_digest: expected 2560x1440, got "
+        + std::to_string(w) + "x" + std::to_string(h));
+}
+
+// ============================================================
 // Thumbnail hook tests
 // ============================================================
 
@@ -4218,6 +4267,8 @@ int main() {
            [&] { test_ai_suppresses_cell_motion(dir()); });
   run_test("thumbnail_crop_dimensions",
            [&] { test_thumbnail_crop_dimensions(dir()); });
+  run_test("snapshot_http_digest",
+           [&] { test_snapshot_http_digest(dir()); });
   run_test("onvif_bbox_crop",
            [&] { test_onvif_bbox_crop(dir()); });
   run_test("thumbnail_hook_replaces",

@@ -362,9 +362,15 @@ static std::vector<unsigned char> fetch_snapshot_once(
   CURL* curl = curl_easy_init();
   if (!curl) return buf;
 
+  // An authenticated fetch gets twice the anonymous budget: a camera that
+  // challenges with Digest has to be asked once more before it starts
+  // sending the image, and a busy camera can take several seconds after
+  // that.  A dead camera still fails fast on the connect timeout.
+  const long timeout_sec = user.empty() ? 5L : 10L;  // NOLINT(runtime/int)
   curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT,        5L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT,        timeout_sec);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);  // NOLINT(runtime/int)
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL,       1L);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  curl_write_cb);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &buf);
