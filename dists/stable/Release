@@ -3,19 +3,19 @@ Label: onvif-recorder
 Suite: stable
 Codename: stable
 Version: 1.0
-Date: Fri, 06 Nov 2026 14:43:25 UTC
+Date: Sun, 15 Nov 2026 13:36:25 UTC
 Architectures: arm64
 Components: main
 Description: onvif-recorder stable channel
 MD5Sum:
- 27459ae81da66bae3f2bb604ea92c2e0 986 main/binary-arm64/Packages
- cd9ac6cf2fd64c21d77d1aaa0ddd81ec 624 main/binary-arm64/Packages.gz
+ e99582cefa412162b396cd9c01b79f8a 986 main/binary-arm64/Packages
+ d4d2b09351217966e5285ace0ec1317d 623 main/binary-arm64/Packages.gz
  5b0d463a62135a82f3c045bd284dabda 153 main/binary-arm64/Release
 SHA1:
- 94404e702a3f31258b4388ffbf9d53eee0cebab6 986 main/binary-arm64/Packages
- d00ae69b0a3fd1c9b2caad13d26e2db88671fbd5 624 main/binary-arm64/Packages.gz
+ 5c1b17abad4f5ebf3d8776e3ab1de744a55cb37a 986 main/binary-arm64/Packages
+ 8a9e78dea4413300ed2eb6f54a44bd322505568c 623 main/binary-arm64/Packages.gz
  602e4d1942e7372479e6bc986b3c24ce07bd25a5 153 main/binary-arm64/Release
 SHA256:
- 313d346702a154a7398db5ac56ba592b8caae44017cdd7c01790ae9604cd6549 986 main/binary-arm64/Packages
- fa85ec6158c3e97b06d05528fb55b05141f521b3b5833fd8ab66c760e32d92bf 624 main/binary-arm64/Packages.gz
+ 35fdf483e819b83a4fa286ce41ce4b481c1172ff8665047edbf24a4ea201c261 986 main/binary-arm64/Packages
+ 0b0c943174f70d6a81b88001b65136dead04030fd31ae2be3ad8877b71625099 623 main/binary-arm64/Packages.gz
  b44ba30daf8e3d33127ee15a9ce8185a34461185153db4211fd70824bee58d19 153 main/binary-arm64/Release
