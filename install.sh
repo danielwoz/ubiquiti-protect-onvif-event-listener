@@ -126,7 +126,8 @@ done
 echo "==> Installing onvif-recorder ..."
 apt-get install -y -o DPkg::Lock::Timeout=600 onvif-recorder
 
-# 5. Persistent recovery layer (survives firmware upgrades + apt purge).
+# 5. Persistent recovery layer (survives firmware upgrades; an
+#    `apt purge` removes its cron jobs, see debian/postrm).
 DATA_DIR=/data/onvif-recorder
 #
 # The package now owns this logic at /usr/share/onvif-recorder/recovery-layer.sh
