@@ -352,21 +352,24 @@ static size_t curl_write_cb(void* data, size_t size, size_t nmemb, void* userp) 
 }
 
 // Single HTTP GET attempt with optional Basic/Digest auth.  Returns
-// empty on any non-200 or transport error.  Called by fetch_snapshot()
-// which layers an anonymous-fallback retry on top.
+// empty on any non-200 or transport error, and records the response
+// code, or 0 when the request never got an answer.  Called by
+// fetch_snapshot() which layers an anonymous-fallback retry on top.
 static std::vector<unsigned char> fetch_snapshot_once(
     const std::string& url,
     const std::string& user,
-    const std::string& password) {
+    const std::string& password,
+    long* http_code) {  // NOLINT(runtime/int)
+  *http_code = 0;
   std::vector<unsigned char> buf;
   CURL* curl = curl_easy_init();
   if (!curl) return buf;
 
-  // An authenticated fetch gets twice the anonymous budget: a camera that
-  // challenges with Digest has to be asked once more before it starts
-  // sending the image, and a busy camera can take several seconds after
-  // that.  A dead camera still fails fast on the connect timeout.
-  const long timeout_sec = user.empty() ? 5L : 10L;  // NOLINT(runtime/int)
+  // An authenticated fetch gets 15 seconds: the camera has to challenge
+  // for Digest and then encode a fresh JPEG, and a busy camera can need
+  // just over ten seconds (seen on a Dahua on the dev router).  A dead
+  // camera still fails fast on the 3-second connect timeout.
+  const long timeout_sec = user.empty() ? 5L : 15L;  // NOLINT(runtime/int)
   curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(curl, CURLOPT_TIMEOUT,        timeout_sec);
@@ -383,11 +386,14 @@ static std::vector<unsigned char> fetch_snapshot_once(
   }
 
   CURLcode rc = curl_easy_perform(curl);
+  // A response code survives a transfer that failed after the status line
+  // (a camera that answers 401 and then drops the connection), so query it
+  // even when the transfer did not finish; that case still deserves the
+  // anonymous retry that rescues corrupt stored credentials (#34).
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_code);
   if (rc == CURLE_OK) {
-    long http_code = 0;  // NOLINT(runtime/int)
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    if (http_code != 200) {
-      LOG(WARNING) << "[snapshot] HTTP " << http_code << " from " << url
+    if (*http_code != 200) {
+      LOG(WARNING) << "[snapshot] HTTP " << *http_code << " from " << url
                    << (user.empty() ? " (anon)" : " (auth)");
       buf.clear();
     }
@@ -472,22 +478,32 @@ static std::vector<unsigned char> fetch_via_protect(
 }
 
 // Fetch a camera snapshot with credentials, falling back to an
-// unauthenticated GET on failure.  Common on cameras whose HTTP
-// snapshot endpoint accepts anonymous requests even though ONVIF
-// requires WSSE, and rescues installs where Protect stored corrupt
-// credentials (field-observed on issue #34: literal single-space
-// username + password stored in cameras.thirdPartyCameraInfo).
+// unauthenticated GET when the camera answers with an HTTP status.
+// Common on cameras whose HTTP snapshot endpoint accepts anonymous
+// requests even though ONVIF requires WSSE, and rescues installs where
+// Protect stored corrupt credentials (field-observed on issue #34:
+// literal single-space username + password stored in
+// cameras.thirdPartyCameraInfo).  A request that never got an answer
+// (timeout, refused connection) is not retried: dropping the login
+// cannot fix a network-level failure, and the camera is usually just
+// slow, so a second wait only delays the event.
 static std::vector<unsigned char> fetch_snapshot(const std::string& url,
                                                   const std::string& user,
                                                   const std::string& password) {
-  std::vector<unsigned char> buf = fetch_snapshot_once(url, user, password);
-  if (buf.empty() && !user.empty()) {
+  long http_code = 0;  // NOLINT(runtime/int)
+  std::vector<unsigned char> buf =
+      fetch_snapshot_once(url, user, password, &http_code);
+  if (buf.empty() && !user.empty() && http_code != 0) {
     LOG(INFO) << "[snapshot] auth fetch of " << url
               << " failed; retrying anonymously";
-    buf = fetch_snapshot_once(url, "", "");
+    long anon_code = 0;  // NOLINT(runtime/int)
+    buf = fetch_snapshot_once(url, "", "", &anon_code);
     if (!buf.empty()) {
       LOG(INFO) << "[snapshot] anonymous fetch of " << url << " succeeded";
     }
+  } else if (buf.empty() && !user.empty()) {
+    LOG(INFO) << "[snapshot] auth fetch of " << url
+              << " got no answer; not retrying anonymously";
   }
   return buf;
 }
