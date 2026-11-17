@@ -23,6 +23,13 @@ case "$1" in
         rm -rf /etc/systemd/system/onvif-recorder-autoupdate.timer.d
         rm -f /etc/apt/sources.list.d/onvif-recorder.list
         rm -f /usr/share/keyrings/onvif-recorder-archive-keyring.gpg
+        # The recovery layer re-installs the package on boot whenever the
+        # binary is missing, which is the state a purge leaves.  A purge is
+        # a deliberate removal, so drop its boot and backup jobs.  Its
+        # scripts and config backups stay in /data for a later reinstall;
+        # see the README's Uninstall section to remove those too.
+        rm -f /etc/cron.d/onvif-recorder-boot-restore
+        rm -f /etc/cron.d/onvif-recorder-backup
         systemctl daemon-reload 2>/dev/null || true
         ;;
     upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)

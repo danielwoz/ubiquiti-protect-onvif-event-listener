@@ -526,9 +526,10 @@ recovery layer the package vanishes after every firmware upgrade and
 the user has to re-run the installer manually — this is the root
 cause of issue #30.
 
-To make survival automatic, **`gh-pages/install.sh` deploys a small
-recovery layer outside the .deb** (so it survives both firmware
-upgrades and `apt purge`):
+To make survival automatic, **`debian/postinst` (and the one-line
+installer) deploys a small recovery layer outside the .deb** — it
+survives firmware upgrades, and a deliberate `apt purge` removes only
+its two cron jobs, so a purged package stays gone:
 
 | Path | Role |
 |------|------|
@@ -546,8 +547,11 @@ upgrades and `apt purge`):
 knows about. If the recovery scripts lived inside the package, purging
 would wipe them along with the application, defeating the whole
 point. Keeping them on `/data` and in `/etc/cron.d/` (neither managed
-by dpkg) means a normal `apt remove` and `apt purge` leave the
-recovery layer untouched, ready to re-install on next boot.
+by dpkg) means a normal `apt remove` leaves the recovery layer
+untouched, ready to re-install on the next boot. A deliberate
+`apt purge` removes the two cron jobs (so the package is not
+reinstalled at the next boot), while the scripts and config backups
+stay on `/data` for a later install.
 
 **Why gated on consent?** A user who explicitly purges the package
 probably doesn't want a boot cron silently reinstalling it. The
@@ -565,23 +569,26 @@ For a *complete* removal, including the recovery layer:
 
 ```bash
 # 1. Remove the package (runs --rollback=all via prerm, then wipes
-#    /etc/onvif-recorder, /var/lib/onvif-recorder, etc.):
+#    /etc/onvif-recorder, /var/lib/onvif-recorder, etc.), and its
+#    recovery jobs (/etc/cron.d/onvif-recorder-boot-restore and
+#    /etc/cron.d/onvif-recorder-backup):
 apt-get purge -y onvif-recorder
 
-# 2. Remove the persistent recovery layer (NOT managed by dpkg, so
-#    apt purge does not touch these — must be removed by hand):
+# 2. Remove the persistent recovery files (NOT managed by dpkg, so
+#    apt purge keeps them — must be removed by hand):
 rm -rf /data/onvif-recorder
-rm -f  /etc/cron.d/onvif-recorder-boot-restore
-rm -f  /etc/cron.d/onvif-recorder-backup
 rm -f  /var/log/onvif-recorder-boot-restore.log
 rm -f  /var/log/onvif-recorder-backup.log
 ```
 
 Skipping step 2 is intentional when the user only wants to clear apt
-state but plans to reinstall — the next boot (or `apt install`) will
-pick up the previous channel and config from the backup tarball. Only
-do step 2 when the user really wants the device to forget the
-application existed.
+state but plans to reinstall — /data keeps the previous config backup,
+and the next install restores it (postinst extracts it when
+`/etc/onvif-recorder` is missing). Only do step 2 when the user really
+wants the device to forget the application existed.
+
+Packages older than v1.6.42 leave their cron entries behind on purge;
+remove those two `/etc/cron.d/` files by hand after purging one.
 
 ### APT suite promotion
 

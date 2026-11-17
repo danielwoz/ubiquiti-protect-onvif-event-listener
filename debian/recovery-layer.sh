@@ -14,8 +14,10 @@
 #   - gh-pages/install.sh, which delegates here when the packaged copy exists.
 #
 # The files it writes are deliberately NOT dpkg-owned: `apt purge` removes
-# everything dpkg knows about, and the whole point is to outlive that.  See
-# CLAUDE.md "Uninstall — full purge" to remove them by hand.
+# everything dpkg knows about, and the whole point is to outlive that.  The
+# one exception is the cron jobs: postrm removes them on purge, because a
+# purge must not be undone by a reinstall at the next boot.  See CLAUDE.md
+# "Uninstall — full purge" to remove the files on /data by hand.
 set -e
 
 REPO_URL="${REPO_URL:-https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener}"
@@ -26,7 +28,8 @@ if [ ! -d /data ]; then
     exit 0
 fi
 
-# 5. Persistent recovery layer (survives firmware upgrades + apt purge).
+# 5. Persistent recovery layer (survives firmware upgrades; an
+#    `apt purge` removes its cron jobs, see debian/postrm).
 #
 # UDM firmware upgrades wipe /usr/bin/onvif-recorder, the systemd unit, and
 # /etc/apt/sources.list.d/ but preserve /data/ and /etc/cron.d/.  We install
@@ -35,10 +38,12 @@ fi
 #   (a) restore the config from the backup tarball in /data/, and
 #   (b) re-run this install script to bring the package back.
 #
-# These files are intentionally NOT in the .deb package: they must survive
-# `apt purge`, because purge wipes /etc/onvif-recorder/ and the apt source
-# along with everything else dpkg knows about.  To remove the recovery
-# layer too, see CLAUDE.md "Uninstall — full purge".
+# These files are intentionally NOT in the .deb package under /data: they
+# must survive `apt purge`, because purge wipes /etc/onvif-recorder/ and the
+# apt source along with everything else dpkg knows about.  The cron jobs in
+# /etc/cron.d/ are the exception: postrm removes them on purge, so a purged
+# package is not reinstalled at the next boot.  To remove the /data files
+# too, see CLAUDE.md "Uninstall — full purge".
 DATA_DIR=/data/onvif-recorder
 echo "==> Installing recovery layer to $DATA_DIR ..."
 mkdir -p "$DATA_DIR/backups"
@@ -169,11 +174,11 @@ chmod 0755 "$DATA_DIR/backup.sh"
 "$DATA_DIR/backup.sh"
 
 # Cron entries — these live in /etc/cron.d/ (which survives firmware
-# upgrades on UDM) and are intentionally outside the .deb so that
-# `apt purge` does not remove them.
+# upgrades on UDM) and are intentionally outside the .deb, so only an
+# explicit purge removes them (debian/postrm does that).
 cat > /etc/cron.d/onvif-recorder-boot-restore <<'EOF_CRON_BOOT'
 # ONVIF Recorder — auto-reinstall after firmware upgrade.
-# NOT managed by dpkg; survives `apt purge`.
+# NOT managed by dpkg; `apt purge` removes this file (debian/postrm).
 # To remove permanently, see CLAUDE.md "Uninstall — full purge".
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -183,7 +188,7 @@ chmod 0644 /etc/cron.d/onvif-recorder-boot-restore
 
 cat > /etc/cron.d/onvif-recorder-backup <<'EOF_CRON_BACKUP'
 # ONVIF Recorder — daily config backup to /data.
-# NOT managed by dpkg; survives `apt purge`.
+# NOT managed by dpkg; `apt purge` removes this file (debian/postrm).
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 17 4 * * * root /data/onvif-recorder/backup.sh >>/var/log/onvif-recorder-backup.log 2>&1

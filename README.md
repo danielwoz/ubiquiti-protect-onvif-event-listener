@@ -111,9 +111,27 @@ which the Windows installer reads.
 ### Uninstall
 
 ```bash
-apt-get remove onvif-recorder          # stops service, rolls back DB changes
-apt-get purge  onvif-recorder          # also removes /etc/onvif-recorder and state
+apt-get remove onvif-recorder   # stops the service and rolls back its database changes
+apt-get purge  onvif-recorder   # also removes its configuration and state
 ```
+
+The recorder keeps a recovery layer outside the package: scripts and config
+backups in `/data/onvif-recorder`, and two jobs in `/etc/cron.d/` that put the
+package back after a UniFi OS update wipes it. Those files are deliberately not
+owned by dpkg, so they survive firmware upgrades. `apt-get purge` removes the
+boot and backup jobs, so a purged package stays gone across reboots; the config
+backups are kept so a later reinstall can restore your settings.
+
+To forget the recorder completely, remove the backups and logs as well:
+
+```bash
+rm -rf /data/onvif-recorder
+rm -f  /var/log/onvif-recorder-boot-restore.log /var/log/onvif-recorder-backup.log
+```
+
+Packages older than v1.6.42 do not remove their cron entries on purge; delete
+`/etc/cron.d/onvif-recorder-boot-restore` and
+`/etc/cron.d/onvif-recorder-backup` by hand after purging one of those.
 
 ### Legacy install (deprecated)
 

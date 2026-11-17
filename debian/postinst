@@ -63,6 +63,17 @@ case "$1" in
         mkdir -p "$STATE_DIR"
         chmod 700 "$STATE_DIR"
 
+        # ----- Restore config after a purge -----
+        # `apt purge` removes /etc/onvif-recorder, but the recovery layer
+        # keeps a backup in /data; a reinstall restores it so the channel,
+        # flags and cached IDs come back.  A plain `apt remove` keeps the
+        # directory, so this only fires after a purge.
+        if [ ! -d /etc/onvif-recorder ] && \
+           [ -f /data/onvif-recorder/backups/config-current.tar.gz ]; then
+            tar -xzf /data/onvif-recorder/backups/config-current.tar.gz \
+                -C / 2>/dev/null || true
+        fi
+
         # ----- Ensure config dir + default channel exist -----
         mkdir -p /etc/onvif-recorder
         if [ ! -f /etc/onvif-recorder/channel ]; then

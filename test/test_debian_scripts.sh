@@ -205,8 +205,76 @@ if configure=$(branch "$POSTINST" configure); then
     else
         pass "postinst configure) does not stop the service"
     fi
+    # A reinstall after a purge must restore the backup the recovery layer
+    # kept in /data, and it must do so before the default config is created.
+    restore_at=$(line_of "$TMP/configure" "config-current.tar.gz")
+    mkdir_at=$(line_of "$TMP/configure" "mkdir -p /etc/onvif-recorder")
+    if [ -n "$restore_at" ] && [ -n "$mkdir_at" ] && \
+            [ "$restore_at" -lt "$mkdir_at" ]; then
+        pass "postinst restores a post-purge backup before creating defaults"
+    else
+        bad "postinst does not restore the config backup before defaults"
+    fi
 else
     bad "postinst has no configure) branch"
+fi
+
+# ----- 5. postrm purge) -----
+# The recovery layer re-installs the package on boot whenever the binary is
+# missing, which is the state a purge leaves.  A purge must therefore remove
+# its boot and backup jobs, or the package comes back at the next reboot
+# (issue #74).
+if body=$(branch "$POSTRM" purge); then
+    for cron in onvif-recorder-boot-restore onvif-recorder-backup; do
+        # The removal itself is proven by the run below; here just check
+        # that the branch names the file, whatever rm spelling it uses.
+        if printf '%s\n' "$body" | grep -qF "/etc/cron.d/$cron"; then
+            pass "postrm purge) names /etc/cron.d/$cron"
+        else
+            bad "postrm purge) does not name /etc/cron.d/$cron"
+        fi
+    done
+else
+    bad "postrm has no purge) branch"
+fi
+
+# Run a rewritten postrm against a throwaway tree: every absolute path it
+# touches is pointed at $TMP first, so the run cannot affect the host.
+mkdir -p "$TMP/root/etc/cron.d" "$TMP/root/etc/onvif-recorder" \
+         "$TMP/root/etc/systemd/system/onvif-recorder-autoupdate.timer.d" \
+         "$TMP/root/etc/apt/sources.list.d" "$TMP/root/usr/bin" \
+         "$TMP/root/usr/share/keyrings" "$TMP/root/var/lib/onvif-recorder" \
+         "$TMP/root/data/onvif-recorder/backups"
+touch "$TMP/root/etc/cron.d/onvif-recorder-boot-restore" \
+      "$TMP/root/etc/cron.d/onvif-recorder-backup" \
+      "$TMP/root/etc/onvif-recorder/channel" \
+      "$TMP/root/etc/apt/sources.list.d/onvif-recorder.list" \
+      "$TMP/root/usr/share/keyrings/onvif-recorder-archive-keyring.gpg" \
+      "$TMP/root/usr/bin/onvif_recorder" \
+      "$TMP/root/data/onvif-recorder/backups/config-current.tar.gz"
+sed -e "s|/usr/bin/onvif_recorder|$TMP/root/usr/bin/onvif_recorder|g" \
+    -e "s|/etc/onvif-recorder|$TMP/root/etc/onvif-recorder|g" \
+    -e "s|/var/lib/onvif-recorder|$TMP/root/var/lib/onvif-recorder|g" \
+    -e "s|/etc/systemd/system|$TMP/root/etc/systemd/system|g" \
+    -e "s|/etc/apt/sources.list.d|$TMP/root/etc/apt/sources.list.d|g" \
+    -e "s|/usr/share/keyrings|$TMP/root/usr/share/keyrings|g" \
+    -e "s|/etc/cron.d|$TMP/root/etc/cron.d|g" \
+    -e "s|/data/onvif-recorder|$TMP/root/data/onvif-recorder|g" \
+    "$POSTRM" > "$TMP/postrm"
+rc=0
+PATH="$TMP/bin:$PATH" sh "$TMP/postrm" purge >/dev/null 2>&1 || rc=$?
+if [ "$rc" -ne 0 ]; then
+    bad "postrm purge exited $rc"
+elif [ -e "$TMP/root/etc/cron.d/onvif-recorder-boot-restore" ] || \
+     [ -e "$TMP/root/etc/cron.d/onvif-recorder-backup" ]; then
+    bad "postrm purge left a recovery cron entry"
+elif [ -e "$TMP/root/etc/onvif-recorder" ] || \
+     [ -e "$TMP/root/var/lib/onvif-recorder" ]; then
+    bad "postrm purge left config or state behind"
+elif [ ! -f "$TMP/root/data/onvif-recorder/backups/config-current.tar.gz" ]; then
+    bad "postrm purge removed the config backups"
+else
+    pass "postrm purge clears config, state and recovery crons, keeps backups"
 fi
 
 exit $fail
