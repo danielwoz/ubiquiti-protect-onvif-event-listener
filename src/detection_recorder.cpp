@@ -72,6 +72,9 @@ struct Detection {
   // True for camera analytics rules (field / line rules).  A rule trip is
   // never dropped as unclassified motion, even when it carries no class.
   bool        analytic_rule{false};
+  // Licence-plate text attached to the event by a camera or proxy that
+  // reads plates.  Kept only when the detection ends up being a vehicle.
+  std::string plate;
 };
 
 // Topics that are valid ONVIF but carry no detection we can act on --
@@ -197,7 +200,7 @@ std::optional<Detection> classify(const OnvifEvent& ev,
 
     return Detection{type, inside_it->second == "true", ev.event_time,
                      /*from_fallback=*/fell_back, /*momentary=*/false,
-                     /*analytic_rule=*/true};
+                     /*analytic_rule=*/true, /*plate=*/{}};
   }
 
   // --- State-shaped AI topics (see kStateTopics) ---
@@ -205,7 +208,8 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     if (ev.topic != st.topic) continue;
     auto it = ev.data.find("State");
     if (it == ev.data.end()) return {};
-    return Detection{st.type, it->second == "true", ev.event_time};
+    return Detection{st.type, it->second == "true", ev.event_time, false,
+                     false, false, {}};
   }
 
   // --- IVS line crossing (Dahua and compatibles) ---
@@ -231,7 +235,7 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     return Detection{cls.empty() ? fallback_type : cls,
                      /*started=*/true, ev.event_time,
                      /*from_fallback=*/cls.empty(), /*momentary=*/true,
-                     /*analytic_rule=*/true};
+                     /*analytic_rule=*/true, /*plate=*/{}};
   }
 
   // --- Generic CellMotionDetector/Motion (Amcrest, Lorex, Dahua, etc.) ---
@@ -246,7 +250,8 @@ std::optional<Detection> classify(const OnvifEvent& ev,
   if (is_cell_motion_topic(ev.topic)) {
     auto it = ev.data.find("IsMotion");
     if (it == ev.data.end()) return {};
-    return Detection{fallback_type, it->second == "true", ev.event_time, true};
+    return Detection{fallback_type, it->second == "true", ev.event_time, true,
+                     false, false, {}};
   }
 
   // --- VideoSource/MotionAlarm fallback ---
@@ -257,7 +262,8 @@ std::optional<Detection> classify(const OnvifEvent& ev,
   if (ev.topic == "tns1:VideoSource/MotionAlarm") {
     auto it = ev.data.find("State");
     if (it == ev.data.end()) return {};
-    return Detection{fallback_type, it->second == "true", ev.event_time, true};
+    return Detection{fallback_type, it->second == "true", ev.event_time, true,
+                     false, false, {}};
   }
 
   return {};
@@ -328,12 +334,120 @@ static const char* sdo_type(const std::string& det_type) {
   return "person";  // "human" -> "person"
 }
 
-// Build the smartDetectTypes JSON array from our detection type.
-static std::string smart_detect_types_json(const std::string& det_type) {
+// Build the smartDetectTypes JSON array from our detection type.  A
+// vehicle detection carrying a plate reports both classes, the way
+// Protect's own licence-plate events do; the plate filter, the event
+// badge and protect:objects.licensePlate alarm triggers all match on
+// the licensePlate entry.
+static std::string smart_detect_types_json(const std::string& det_type,
+                                            const std::string& plate = {}) {
+  if (det_type == "vehicle" && !plate.empty())
+    return "[\"vehicle\",\"licensePlate\"]";
   if (det_type == "vehicle") return "[\"vehicle\"]";
   if (det_type == "animal")  return "[\"animal\"]";
   if (det_type == "package") return "[\"package\"]";
   return "[\"person\"]";
+}
+
+// Build the smartDetectObjects.attributes JSON for one object.  A
+// non-zero confidence and a non-empty zone array mirror Protect's native
+// writes: the iOS app dereferences attributes.zone[0] without a length
+// check, so zone:[] crashes it on every recent event for third-party
+// cameras.  A licence-plate object puts the plate text in matchedName
+// (what the event shows and Find Anything searches) and is marked as
+// read by the camera's own reader.
+static std::string sdo_attributes_json(const std::string& obj_type,
+                                       const std::string& plate) {
+  std::string out = std::string("{")
+      + "\"associatedFaceTrackerID\":null,"
+      + "\"blurness\":null,";
+  if (!plate.empty()) out += "\"capturedByAiKey\":true,";
+  out += std::string("\"color\":null,")
+      + "\"confidence\":100,"
+      + "\"faceEmbed\":null,"
+      + "\"faceLandmarks\":null,"
+      + "\"faceMask\":null,"
+      + "\"facePose\":null,"
+      + "\"faceVerifyStatus\":null,"
+      + "\"line\":null,"
+      + "\"matchedId\":null,"
+      + "\"matchedName\":" + (plate.empty() ? std::string("null")
+                                           : util::json_str(plate)) + ",";
+  out += std::string("\"namesTopK\":null,")
+      + "\"objectType\":" + util::json_str(obj_type) + ","
+      + "\"personEmbedFromCamera\":null,"
+      + "\"qualityScore\":null,"
+      + "\"topKCandidate\":null,"
+      + "\"trackerId\":1,"
+      + "\"vehicleType\":null,"
+      + "\"zone\":[1]"
+      + "}";
+  return out;
+}
+
+// Plate text carried by a vehicle event as a tt:SimpleItem (cameras and
+// plate-reading proxies put it in tt:Data as PlateNumber).  Control
+// characters are dropped, the text is trimmed, and only well-formed
+// UTF-8 is kept: PostgreSQL rejects an invalid byte sequence, and that
+// INSERT failing would leave the event without its objects.  Empty when
+// nothing usable is left.
+static std::string plate_from_event(const OnvifEvent& ev) {
+  auto it = ev.data.find("PlateNumber");
+  if (it == ev.data.end()) return {};
+  constexpr int kMaxPlateChars = 24;
+  // Trim first: a fixed-width integration can pad the value with more
+  // spaces than the cap allows, and those must not count as the plate.
+  std::string in = it->second;
+  auto not_space = [](char c) {
+    return c != ' ' && c != '\t' && c != '\r' && c != '\n';
+  };
+  in.erase(in.begin(), std::find_if(in.begin(), in.end(), not_space));
+  in.erase(std::find_if(in.rbegin(), in.rend(), not_space).base(), in.end());
+  std::string plate;
+  int chars = 0;
+  for (std::size_t i = 0; i < in.size() && chars < kMaxPlateChars;) {
+    const unsigned char c = static_cast<unsigned char>(in[i]);
+    std::size_t len = 0;
+    uint32_t cp = 0;
+    if (c < 0x80) {
+      len = 1;
+      cp = c;
+    } else if ((c & 0xE0) == 0xC0) {
+      len = 2;
+      cp = c & 0x1F;
+    } else if ((c & 0xF0) == 0xE0) {
+      len = 3;
+      cp = c & 0x0F;
+    } else if ((c & 0xF8) == 0xF0) {
+      len = 4;
+      cp = c & 0x07;
+    } else {
+      ++i;  // stray continuation or invalid lead byte
+      continue;
+    }
+    if (i + len > in.size()) break;
+    bool ok = true;
+    for (std::size_t k = 1; k < len; ++k) {
+      const unsigned char cc = static_cast<unsigned char>(in[i + k]);
+      if ((cc & 0xC0) != 0x80) {
+        ok = false;
+        break;
+      }
+      cp = (cp << 6) | (cc & 0x3F);
+    }
+    const bool overlong = (len == 2 && cp < 0x80) ||
+                          (len == 3 && cp < 0x800) ||
+                          (len == 4 && cp < 0x10000);
+    if (!ok || overlong || cp > 0x10FFFF ||
+        (cp >= 0xD800 && cp <= 0xDFFF) || cp < 0x20 || cp == 0x7f) {
+      ++i;  // drop one byte and resynchronise
+      continue;
+    }
+    plate.append(in, i, len);
+    i += len;
+    ++chars;
+  }
+  return plate;
 }
 
 }  // anonymous namespace
@@ -708,6 +822,51 @@ bool insert_detection_labels(PGconn* conn,
   return ok;
 }
 
+bool append_event_label(PGconn* conn,
+                        const std::string& event_id,
+                        const std::string& label_name,
+                        const std::string& now_str) {
+  const std::string label_id = util::generate_uuid();
+  const char* params[] = {
+    event_id.c_str(), label_name.c_str(), label_id.c_str(),
+    now_str.c_str()
+  };
+  // Resolve (creating when missing) the lid, then add it to the event's
+  // own label row.  insert_detection_labels cannot do this: its
+  // ON CONFLICT DO NOTHING drops a second event-level row rather than
+  // extending the first.
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(conn, -1,
+    "WITH input(name, id) AS ("
+    "  SELECT $2::text, $3::text"
+    "), inserted AS ("
+    "  INSERT INTO labels (id, name, \"createdAt\", \"updatedAt\")"
+    "  SELECT i.id, i.name, $4::timestamptz, $4::timestamptz FROM input i"
+    "   WHERE NOT EXISTS (SELECT 1 FROM labels l WHERE l.name = i.name)"
+    "  ON CONFLICT (name) DO NOTHING"
+    "  RETURNING lid, name"
+    "), lid AS ("
+    "  SELECT lid FROM inserted"
+    "  UNION"
+    "  SELECT l.lid FROM labels l JOIN input i ON i.name = l.name"
+    "   WHERE NOT EXISTS (SELECT 1 FROM inserted n WHERE n.name = l.name)"
+    "  LIMIT 1"
+    ")"
+    " UPDATE \"detectionLabels\""
+    "   SET labels = labels || ARRAY[(SELECT lid FROM lid)],"
+    "       \"updatedAt\" = $4::timestamptz"
+    " WHERE \"eventId\" = $1 AND \"objectId\" IS NULL"
+    "   AND NOT (labels @> ARRAY[(SELECT lid FROM lid)])",
+    4, nullptr, params, nullptr, nullptr, 0);
+  const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
+  if (!ok) {
+    const char* msg = res ? PQresultErrorMessage(res) : nullptr;
+    LOG(ERROR) << "[pg] event label append failed: "
+               << ((msg && *msg) ? msg : PQerrorMessage(conn));
+  }
+  PQclear(res);
+  return ok;
+}
+
 }  // namespace detection_recorder_internal
 
 // ============================================================
@@ -1004,12 +1163,66 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
       3, params);
   }
 
+  bool add_event_plate(const std::string& event_id,
+                       const std::string& metadata,
+                       const std::string& now_str) override {
+    if (!maybe_reconnect()) return false;
+    const char* params[] = {
+      event_id.c_str(),
+      metadata.empty() ? nullptr : metadata.c_str(),
+      now_str.c_str(),
+    };
+    // The class list gains licensePlate once per event; the plate object's
+    // detectedAreas / detectedThumbnails entries are appended to the
+    // existing metadata.  A legacy install (empty metadata) keeps its
+    // metadata as it is, the way insert_event's sparse path does.
+    PGresult* res = onvif::pg::ExecParamsWithTimeout(conn_, -1,
+      "UPDATE events SET"
+      "  \"smartDetectTypes\" = CASE"
+      "    WHEN \"smartDetectTypes\"::jsonb ? 'licensePlate'"
+      "    THEN \"smartDetectTypes\""
+      "    ELSE (\"smartDetectTypes\"::jsonb"
+      "          || '[\"licensePlate\"]'::jsonb)::json"
+      "  END,"
+      "  metadata = CASE WHEN $2::text IS NULL THEN metadata ELSE"
+      "    jsonb_set(jsonb_set(COALESCE(metadata::jsonb, '{}'::jsonb),"
+      "      '{detectedAreas}',"
+      "      COALESCE(metadata::jsonb->'detectedAreas','[]'::jsonb)"
+      "        || $2::jsonb->'detectedAreas', true),"
+      "      '{detectedThumbnails}',"
+      "      COALESCE(metadata::jsonb->'detectedThumbnails','[]'::jsonb)"
+      "        || $2::jsonb->'detectedThumbnails', true)::json"
+      "  END,"
+      "  \"updatedAt\" = $3"
+      " WHERE id = $1"
+      "   AND NOT (\"smartDetectTypes\"::jsonb ? 'licensePlate')"
+      " RETURNING id",
+      3, nullptr, params, nullptr, nullptr, 0);
+    const ExecStatusType st = PQresultStatus(res);
+    if (st != PGRES_TUPLES_OK) {
+      LOG(ERROR) << "[pg] event plate update failed: " << pg_errmsg(res);
+      PQclear(res);
+      return false;
+    }
+    const bool gained = PQntuples(res) > 0;
+    PQclear(res);
+    if (gained &&
+        !detection_recorder_internal::append_event_label(
+            conn_, event_id, "smartDetectType:licensePlate", now_str)) {
+      LOG(WARNING) << "[pg] event " << event_id
+                   << " gained licensePlate but its event-level label did "
+                      "not";
+    }
+    return gained;
+  }
+
   // Insert JPEG thumbnail directly into Protect's thumbnails table.
   // Protect serves 24-char thumbnailIds from this table (not via msp TCP).
   void insert_smart_detect_raw(const std::string& id,
                                const std::string& camera_ip,
                                uint64_t           ts_ms,
                                const std::string& obj_type,
+                               const std::string& plate,
                                const std::string& now_str) override {
     const std::string& cam_id = camera_id(camera_ip);
     const std::string  ts = std::to_string(ts_ms);
@@ -1031,7 +1244,8 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         + "\"firstShownTimeMs\":" + ts + ","
         + "\"id\":\"1\","
         + "\"idleSinceTimeMs\":" + ts + ","
-        + "\"licensePlate\":null,"
+        + "\"licensePlate\":"
+        + (plate.empty() ? std::string("null") : util::json_str(plate)) + ","
         + "\"lines\":[],"
         + "\"loiterZones\":[],"
         + "\"matchedId\":null,"
@@ -1074,6 +1288,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
                                   uint64_t           start_ms,
                                   uint64_t           end_ms,
                                   const std::string& obj_type,
+                                  const std::string& plate,
                                   int                confidence,
                                   const std::string& now_str) override {
     const std::string& cam_id  = camera_id(camera_ip);
@@ -1094,7 +1309,8 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         + "\"firstShownTimeMs\":" + start_str + ","
         + "\"id\":\"1\","
         + "\"idleSinceTimeMs\":0,"
-        + "\"licensePlate\":null,"
+        + "\"licensePlate\":"
+        + (plate.empty() ? std::string("null") : util::json_str(plate)) + ","
         + "\"lines\":[],"
         + "\"loiterZones\":[],"
         + "\"matchedId\":null,"
@@ -1751,6 +1967,12 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
   auto key = std::make_pair(ev.camera_ip, det->type);
 
   if (det->started) {
+    // A plate reader in the camera, or a proxy in front of it, puts the
+    // plate text on the notification that opens the detection.  An
+    // "ended" notification only closes an existing event, so a plate
+    // carried there has nowhere to go.
+    det->plate = plate_from_event(ev);
+
     // 1. Coalesce / rate-limit checks then snapshot + config read (brief lock, no I/O).
     std::string snap_url, snap_user, snap_pass, ubv_dir, cam_uuid, cam_mac;
     uint64_t pre_ms;
@@ -2190,35 +2412,23 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // mutated obj_type -- Protect's Find-Anything filter joins on
     // attributes->>'objectType', so it must match the outer SDO type column.
     //
-    // confidence + zone must mirror what Protect's native AI writes for a
-    // smart-detect row: a non-zero confidence (we use 100 to match the
-    // events.score literal we set below) and a non-empty zone array.  The
-    // iOS app dereferences attributes.zone[0] without a length check, so
-    // writing zone:[] crashes the mobile app on every recent event for
-    // third-party cameras.
-    const std::string attributes =
-        std::string("{")
-        + "\"associatedFaceTrackerID\":null,"
-        + "\"blurness\":null,"
-        + "\"color\":null,"
-        + "\"confidence\":100,"
-        + "\"faceEmbed\":null,"
-        + "\"faceLandmarks\":null,"
-        + "\"faceMask\":null,"
-        + "\"facePose\":null,"
-        + "\"faceVerifyStatus\":null,"
-        + "\"line\":null,"
-        + "\"matchedId\":null,"
-        + "\"matchedName\":null,"
-        + "\"namesTopK\":null,"
-        + "\"objectType\":\"" + obj_type + "\","
-        + "\"personEmbedFromCamera\":null,"
-        + "\"qualityScore\":null,"
-        + "\"topKCandidate\":null,"
-        + "\"trackerId\":1,"
-        + "\"vehicleType\":null,"
-        + "\"zone\":[1]"
-        + "}";
+    // A plate is only written for a vehicle detection: the type may have
+    // been changed by NanoDet-M or a per-camera override after the text
+    // was read, and Protect has no plate object for anything else.
+    const std::string plate =
+        obj_type == "vehicle" ? det->plate : std::string();
+    if (!plate.empty()) sdt_json = smart_detect_types_json(obj_type, plate);
+    // The plate text belongs to the licensePlate object only; the vehicle
+    // it was read from keeps the plain attributes.
+    const std::string attributes = sdo_attributes_json(obj_type, {});
+
+    // A plate event carries a second smartDetectObjects row typed
+    // licensePlate next to the vehicle it was read from.
+    const std::string plate_sdo_id =
+        plate.empty() ? std::string() : util::generate_uuid();
+    const std::string plate_attributes =
+        plate.empty() ? std::string()
+                      : sdo_attributes_json("licensePlate", plate);
 
     // Version gate: on Protect 7.1+, write the rich events.metadata + the
     // thumbnailFullfovId + a smartDetectObjectAreas row.  On earlier
@@ -2229,6 +2439,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // Build the rich events.metadata + bbox lazily; cheap when not used.
     std::string rich_metadata;
     onvif::enricher::Bbox rich_bbox{0, 0, 0, 0};
+    onvif::enricher::Bbox rich_plate_bbox{0, 0, 0, 0};
     std::string rich_area_id;
     if (rich_path) {
       onvif::enricher::EventInput ein;
@@ -2236,6 +2447,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       ein.camera_id         = cam_uuid;  // populated from camera_ids_ earlier
       ein.event_type        = "smartDetectZone";
       ein.smart_detect_types = {obj_type};
+      if (!plate.empty()) ein.smart_detect_types.push_back("licensePlate");
       ein.score             = 100;            // matches sparse-path literal
       ein.thumbnail_id      = thumb_id;
       ein.start_ms          = ts_ms;
@@ -2247,13 +2459,46 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       ein.image_width       = 2560;
       ein.image_height      = 1440;
       ein.object_ids        = {sdo_id};
+      ein.object_types      = {obj_type};
+      if (!plate.empty()) {
+        ein.object_ids.push_back(plate_sdo_id);
+        ein.object_types.push_back("licensePlate");
+        ein.plate = plate;
+      }
       rich_metadata = onvif::enricher::BuildEnrichedMetadata(ein);
       rich_bbox = onvif::enricher::PlaceholderBbox(
           ein.image_width, ein.image_height, obj_type);
       rich_area_id = "sda-" + sdo_id;
+      if (!plate.empty()) {
+        rich_plate_bbox = onvif::enricher::PlaceholderBbox(
+            ein.image_width, ein.image_height, "licensePlate");
+      }
+    }
+
+    // Metadata for a plate that arrives on a detection coalesced into an
+    // existing event: only the plate object's entries are new, and the
+    // event row gains them by append.
+    std::string plate_metadata;
+    if (rich_path && !plate.empty() && !coalesced_event_id.empty()) {
+      onvif::enricher::EventInput pin;
+      pin.event_id           = event_id;
+      pin.camera_id          = cam_uuid;
+      pin.event_type         = "smartDetectZone";
+      pin.smart_detect_types = {"vehicle", "licensePlate"};
+      pin.score              = 100;
+      pin.thumbnail_id       = thumb_id;
+      pin.start_ms           = ts_ms;
+      pin.end_ms             = ts_ms;
+      pin.image_width        = 2560;
+      pin.image_height       = 1440;
+      pin.object_ids         = {plate_sdo_id};
+      pin.object_types       = {"licensePlate"};
+      pin.plate              = plate;
+      plate_metadata = onvif::enricher::BuildEnrichedMetadata(pin);
     }
 
     // 4. INSERT into both tables, write thumbnail -- all under lock.
+    bool plate_added = false;
     {
       absl::MutexLock lk(&mu_);
 
@@ -2282,15 +2527,27 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       // hit within the merged event.
       db_->insert_sdo(sdo_id, event_id, thumb_id, ev.camera_ip,
                       obj_type, attributes, ts_ms, now_str);
-      db_->insert_smart_detect_raw(sdr_id, ev.camera_ip, ts_ms, obj_type, now_str);
+      if (!plate.empty()) {
+        db_->insert_sdo(plate_sdo_id, event_id, thumb_id, ev.camera_ip,
+                        "licensePlate", plate_attributes, ts_ms, now_str);
+      }
+      db_->insert_smart_detect_raw(sdr_id, ev.camera_ip, ts_ms, obj_type,
+                                   plate, now_str);
       db_->insert_smart_detect_track(sdtrk_id, event_id, ev.camera_ip,
-                                      ts_ms, ts_ms, obj_type,
+                                      ts_ms, ts_ms, obj_type, plate,
                                       /*confidence=*/100, now_str);
       if (rich_path) {
         db_->insert_smart_detect_object_area(
             rich_area_id, sdo_id,
             rich_bbox.x1, rich_bbox.y1, rich_bbox.x2, rich_bbox.y2,
             ts_ms, ts_ms, now_str);
+        if (!plate.empty()) {
+          db_->insert_smart_detect_object_area(
+              "sda-" + plate_sdo_id, plate_sdo_id,
+              rich_plate_bbox.x1, rich_plate_bbox.y1,
+              rich_plate_bbox.x2, rich_plate_bbox.y2,
+              ts_ms, ts_ms, now_str);
+        }
       }
 
       // Insert detectionLabels rows so events appear in Protect's find-anything
@@ -2302,6 +2559,12 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           "eventType:smartDetectZone",
           "smartDetectType:" + obj_type,
         };
+        // The event-level row carries every class the event has, so the
+        // plate shows up in Find Anything alongside the vehicle.  The
+        // vehicle object's own row picks the extra label up as well,
+        // which is harmless next to its smartDetectType:vehicle.
+        if (!plate.empty())
+          label_names.push_back("smartDetectType:licensePlate");
         if (!cam_uuid.empty()) {
           label_names.push_back("camera:" + cam_uuid);
           label_names.push_back("zone:" + cam_uuid + ":1");
@@ -2309,6 +2572,19 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         db_->insert_detection_labels(event_id, sdo_id,
                                      /*event_level=*/coalesced_event_id.empty(),
                                      label_names, now_str);
+        if (!plate.empty()) {
+          db_->insert_detection_labels(event_id, plate_sdo_id,
+                                       /*event_level=*/false,
+                                       {"smartDetectType:licensePlate"},
+                                       now_str);
+          // The event row was written by the detection that opened it;
+          // a plate arriving later (a coalesced detection) adds the class
+          // to that row, its metadata and its event-level label.
+          if (!coalesced_event_id.empty()) {
+            plate_added =
+                db_->add_event_plate(event_id, plate_metadata, now_str);
+          }
+        }
       }
 
       // Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.
@@ -2350,9 +2626,17 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // row and any thumbnail written above already exist, so the alarm's
     // notification can resolve both.  AlarmNotifier hands the detection to
     // UniFi OS (Global Alarm Manager) or runs Protect's automations (Local).
-    // Only notify for new events, not for detections coalesced into an existing one.
-    if (coalesced_event_id.empty() && alarm_notif && !cam_mac.empty()) {
-      alarm_notif->notify(obj_type, cam_mac, event_id, ts_ms);
+    // Only notify for new events, not for detections coalesced into an
+    // existing one -- except that a plate added to a coalesced event is
+    // news to the plate alarms, so it is handed over as its own class.
+    if (alarm_notif && !cam_mac.empty()) {
+      if (coalesced_event_id.empty()) {
+        alarm_notif->notify(obj_type, cam_mac, event_id, ts_ms,
+                            plate.empty() ? std::string()
+                                          : std::string("licensePlate"));
+      } else if (plate_added) {
+        alarm_notif->notify("licensePlate", cam_mac, event_id, ts_ms);
+      }
     }
 
     // 6. Momentary topics (line crossing) never send an "ended"
@@ -2434,6 +2718,13 @@ int DetectionRecorder::coalesce_history(int days) {
            events[j].camera_id == events[i].camera_id &&
            events[j].sdt_json  == events[i].sdt_json) {
       ++j;
+    }
+    // Licence-plate events are left alone: each carries a different plate,
+    // and merging deletes the absorbed event's objects and payloads, so
+    // its plate text would be lost.
+    if (events[i].sdt_json.find("licensePlate") != std::string::npos) {
+      i = j;
+      continue;
     }
     // Walk events[i..j): merge adjacent events within the coalesce window.
     std::size_t base = i;

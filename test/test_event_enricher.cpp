@@ -89,6 +89,48 @@ void test_smart_detect_object_attributes_person() {
   CHECK_CONTAINS(s, "\"zone\":[1]");
 }
 
+void test_smart_detect_object_attributes_license_plate() {
+  std::string s = onvif::enricher::BuildSmartDetectObjectAttributes(
+      100, "licensePlate", "XX-111-X");
+  CHECK_CONTAINS(s, "\"matchedName\":\"XX-111-X\"");
+  CHECK_CONTAINS(s, "\"capturedByAiKey\":true");
+  CHECK_CONTAINS(s, "\"objectType\":\"licensePlate\"");
+
+  // Without a plate the attribute stays null and the flag absent.
+  std::string p = onvif::enricher::BuildSmartDetectObjectAttributes(
+      100, "person");
+  CHECK_CONTAINS(p, "\"matchedName\":null");
+  CHECK(p.find("capturedByAiKey") == std::string::npos);
+}
+
+// One event can carry two objects, a vehicle and its plate.  The plate
+// entry is typed licensePlate and carries the text in matchedName and
+// name, the way Protect's own LPR events do.
+void test_metadata_license_plate_object() {
+  onvif::enricher::EventInput ev;
+  ev.event_id = "plate-event";
+  ev.camera_id = "cam";
+  ev.event_type = "smartDetectZone";
+  ev.smart_detect_types = {"vehicle", "licensePlate"};
+  ev.thumbnail_id = "AA-3";
+  ev.start_ms = 1779465293952ULL;
+  ev.end_ms = 1779465312040ULL;
+  ev.object_ids = {"veh-uuid", "plate-uuid"};
+  ev.object_types = {"vehicle", "licensePlate"};
+  ev.plate = "XX-111-X";
+
+  std::string md = onvif::enricher::BuildEnrichedMetadata(ev);
+  CHECK_CONTAINS(md, "\"smartDetectObject\":\"veh-uuid\"");
+  CHECK_CONTAINS(md, "\"smartDetectObject\":\"plate-uuid\"");
+  CHECK_CONTAINS(md, "\"objectType\":\"vehicle\"");
+  CHECK_CONTAINS(md, "\"objectType\":\"licensePlate\"");
+  CHECK_CONTAINS(md, "\"matchedName\":\"XX-111-X\"");
+  CHECK_CONTAINS(md, "\"name\":\"XX-111-X\"");
+  CHECK_CONTAINS(md, "\"type\":\"licensePlate\"");
+  CHECK_CONTAINS(md, "\"smartDetectType:licensePlate\"");
+  CHECK_CONTAINS(md, "\"capturedByAiKey\":true");
+}
+
 void test_metadata_has_seven_top_level_keys() {
   onvif::enricher::EventInput ev;
   ev.event_id = "test-event-id";
@@ -203,6 +245,8 @@ int main() {
   test_placeholder_bbox_unknown_falls_back();
   test_full_grid_area_indexes();
   test_smart_detect_object_attributes_person();
+  test_smart_detect_object_attributes_license_plate();
+  test_metadata_license_plate_object();
   test_metadata_has_seven_top_level_keys();
   test_metadata_carries_source_tag();
   test_metadata_with_no_objects_has_empty_arrays();

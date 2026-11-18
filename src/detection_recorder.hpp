@@ -59,6 +59,7 @@ class MsrClient;      // forward declaration; full definition in msr_client.hpp
  *
  *   tns1:VehicleAlarm/IVB/VehicleDetect  (Hikvision knockoff / Dahua)
  *     data["State"]    = "true"  | "false"   (always maps to "vehicle")
+ *     data["PlateNumber"] = "XX-111-X"       (optional; records the plate)
  *
  *   tns1:RuleEngine/MyRuleDetector/PeopleDetect  (Reolink)
  *     data["State"]    = "true"  | "false"   (maps to "person")
@@ -78,6 +79,11 @@ class MsrClient;      // forward declaration; full definition in msr_client.hpp
  * ----------------------
  *   ONVIF "human"   -> smartDetectTypes ["person"],  smartDetectObjects.type "person"
  *   ONVIF "vehicle" -> smartDetectTypes ["vehicle"], smartDetectObjects.type "vehicle"
+ *
+ *   A vehicle event carrying PlateNumber also reports "licensePlate": the
+ *   event lists both classes, a second smartDetectObjects row is typed
+ *   "licensePlate" with the text in attributes.matchedName, and the
+ *   smartDetectRaws / smartDetectTracks payloads carry it in licensePlate.
  *
  *   Generic motion events (CellMotionDetector, VideoSource/MotionAlarm) use the
  *   configured default_object_type (default "person") unless NanoDet-M is
@@ -426,6 +432,19 @@ class DetectionRecorder {
                                   uint64_t           end_ms,
                                   const std::string& now_str) = 0;
 
+    /// Add the licensePlate class to an event row that already exists,
+    /// for a plate that arrived on a detection coalesced into it.  Appends
+    /// the class to smartDetectTypes, merges the plate object's
+    /// detectedAreas / detectedThumbnails entries from @p metadata (empty
+    /// = legacy path, metadata untouched) and adds the event-level
+    /// smartDetectType:licensePlate label.  Returns true when the event
+    /// gained the class, false when it already had it.
+    virtual bool add_event_plate(const std::string& /*event_id*/,
+                                 const std::string& /*metadata*/,
+                                 const std::string& /*now_str*/) {
+      return false;
+    }
+
     /// Store a JPEG thumbnail: INSERT INTO thumbnails.
     virtual void write_thumbnail(const std::string&              thumb_id,
                                  const std::string&              event_id,
@@ -435,10 +454,13 @@ class DetectionRecorder {
                                  const std::vector<unsigned char>& jpeg) = 0;
 
     /// Insert one row into smartDetectRaws with a minimal payload JSON.
+    /// @p plate is the licence-plate text when the event carried one;
+    /// empty keeps the payload's licensePlate field null.
     virtual void insert_smart_detect_raw(const std::string& /*id*/,
                                          const std::string& /*camera_ip*/,
                                          uint64_t           /*ts_ms*/,
                                          const std::string& /*obj_type*/,
+                                         const std::string& /*plate*/,
                                          const std::string& /*now_str*/) {}
 
     /// Insert one row into smartDetectTracks with a payload JSON
@@ -451,6 +473,7 @@ class DetectionRecorder {
                                             uint64_t           /*start_ms*/,
                                             uint64_t           /*end_ms*/,
                                             const std::string& /*obj_type*/,
+                                            const std::string& /*plate*/,
                                             int                /*confidence*/,
                                             const std::string& /*now_str*/) {}
 
@@ -752,6 +775,14 @@ bool insert_detection_labels(PGconn* conn,
                              const std::string& object_id,
                              const std::vector<std::string>& label_names,
                              const std::string& now_str);
+
+/// Append @p label_name to the event-level `detectionLabels` row of
+/// @p event_id, creating the label when missing.  Returns false and logs
+/// on failure.  Exposed for testing against a database.
+bool append_event_label(PGconn* conn,
+                        const std::string& event_id,
+                        const std::string& label_name,
+                        const std::string& now_str);
 
 }  // namespace detection_recorder_internal
 

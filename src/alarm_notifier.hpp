@@ -155,15 +155,20 @@ class AlarmNotifier {
 
   /// Trigger matching Protect alarms for a detection event.  Call it
   /// after the event row (and any thumbnail written inline) exists.
-  ///   obj_type   -- "person", "vehicle", "animal", or "package"
-  ///   camera_mac -- camera MAC, e.g. "024D4F434B01" (case and ':' / '-'
-  ///                 separators are normalised)
-  ///   event_id   -- id of the inserted events row
-  ///   ts_ms      -- event start timestamp (ms since Unix epoch)
+  ///   obj_type       -- "person", "vehicle", "animal", or "package"
+  ///   camera_mac     -- camera MAC, e.g. "024D4F434B01" (case and ':'
+  ///                     / '-' separators are normalised)
+  ///   event_id       -- id of the inserted events row
+  ///   ts_ms          -- event start timestamp (ms since Unix epoch)
+  ///   extra_obj_type -- a second trigger class the same event carries,
+  ///                     e.g. "licensePlate" on a vehicle event.  An
+  ///                     alarm or automation matching either class fires;
+  ///                     a dual-trigger alarm fires once.
   void notify(const std::string& obj_type,
               const std::string& camera_mac,
               const std::string& event_id,
-              uint64_t ts_ms);
+              uint64_t ts_ms,
+              const std::string& extra_obj_type = {});
 
  private:
   // One condition of an alarm or recipient schedule, as Protect's
@@ -310,6 +315,7 @@ class AlarmNotifier {
   // An empty @p camera_id leaves sourceEvent.camera out.
   static std::string build_uos_events(const std::vector<UosAlarm>& alarms,
                                       const std::string& obj_type,
+                                      const std::string& extra_obj_type,
                                       const std::string& mac,
                                       const std::string& camera_id,
                                       const std::string& event_id,
@@ -337,9 +343,12 @@ class AlarmNotifier {
   void refresh_local(const std::string& protect_url);
   // Refresh when due, unless another thread is already refreshing.
   void maybe_refresh();
-  void notify_global(const std::string& obj_type, const std::string& mac,
+  void notify_global(const std::string& obj_type,
+                     const std::string& extra_obj_type,
+                     const std::string& mac,
                      const std::string& event_id, uint64_t ts_ms);
   void notify_local(const std::string& obj_type,
+                    const std::string& extra_obj_type,
                     const std::string& camera_mac,
                     const std::string& event_id, uint64_t ts_ms);
 

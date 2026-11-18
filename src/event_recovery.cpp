@@ -36,6 +36,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "event_enricher.hpp"
+#include "json_value.hpp"
 #include "pg_util.hpp"
 #include "protect_version.hpp"
 #include "util.hpp"
@@ -315,7 +316,8 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
       "       e.\"smartDetectTypes\"::text, "
       "       e.start, COALESCE(e.\"end\", e.start), "
       "       COALESCE(e.score, 100), "
-      "       COALESCE(e.\"thumbnailId\", '') "
+      "       COALESCE(e.\"thumbnailId\", ''), "
+      "       COALESCE(e.metadata::text, '') "
       "FROM events e "
       "WHERE e.\"cameraId\" IS NOT NULL "
       "  AND e.type IN (") + EnrichableEventTypesSqlList() + ") "
@@ -403,11 +405,15 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
     ein.camera_id   = PQgetvalue(r, i, 1);
     ein.event_type  = PQgetvalue(r, i, 2);
     const std::string sdt_text = PQgetvalue(r, i, 3);
-    // Strip the JSON quotes/brackets to extract the first type.  Lightweight
-    // parse since the column is always shaped like '["person"]' or '[]'.
-    size_t q1 = sdt_text.find('"'), q2 = sdt_text.find('"', q1 + 1);
-    if (q1 != std::string::npos && q2 != std::string::npos)
-      ein.smart_detect_types = {sdt_text.substr(q1 + 1, q2 - q1 - 1)};
+    // Every class the event carries: Protect's own licence-plate events
+    // list both vehicle and licensePlate.
+    for (std::size_t p = 0;
+         (p = sdt_text.find('"', p)) != std::string::npos;) {
+      const std::size_t q = sdt_text.find('"', p + 1);
+      if (q == std::string::npos) break;
+      ein.smart_detect_types.push_back(sdt_text.substr(p + 1, q - p - 1));
+      p = q + 1;
+    }
     ein.start_ms     = std::stoull(PQgetvalue(r, i, 4));
     ein.end_ms       = std::stoull(PQgetvalue(r, i, 5));
     ein.score        = std::atoi(PQgetvalue(r, i, 6));
@@ -435,20 +441,70 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
     }
     PQclear(s);
 
-    // Materialise a smartDetectObjects row for any objectId we found via
-    // detectionLabels that doesn't yet have one.  Without this the bbox /
-    // Inspect-Detection panel stays empty even though the event is visible.
     const std::string det_type =
         ein.smart_detect_types.empty() ? std::string("unknown")
                                        : ein.smart_detect_types.front();
-    const std::string attrs = enricher::BuildSmartDetectObjectAttributes(
-        ein.score, det_type);
-    const std::string ts_ms_str = std::to_string(ein.start_ms);
+
+    // Each object's own class and, for a licence plate, its text, from
+    // the event's metadata: detectedThumbnails names every object's type
+    // and a plate entry carries the text in name (Protect's native shape)
+    // or attributes.matchedName.  An object the metadata does not name
+    // falls back to the event's first class.
+    const std::string md_text = PQgetvalue(r, i, 8);
+    onvif::json::Value mdv;
+    const bool md_ok = !md_text.empty() && onvif::json::parse(md_text, &mdv);
+    const onvif::json::Value* thumbs = nullptr;
+    if (md_ok) {
+      const onvif::json::Value* t = mdv.member("detectedThumbnails");
+      if (t && t->type == onvif::json::Value::Type::kArray) thumbs = t;
+    }
     for (const std::string& oid : ein.object_ids) {
+      std::string otype = det_type;
+      if (thumbs != nullptr) {
+        for (const auto& entry : thumbs->items) {
+          const onvif::json::Value* id = entry.member("objectId");
+          if (id == nullptr ||
+              id->type != onvif::json::Value::Type::kString ||
+              id->text != oid)
+            continue;
+          const onvif::json::Value* tv = entry.member("type");
+          if (tv != nullptr && tv->type == onvif::json::Value::Type::kString)
+            otype = tv->text;
+          if (otype == "licensePlate" && ein.plate.empty()) {
+            const onvif::json::Value* nv = entry.member("name");
+            if (nv != nullptr &&
+                nv->type == onvif::json::Value::Type::kString)
+              ein.plate = nv->text;
+            if (ein.plate.empty()) {
+              const onvif::json::Value* av = entry.member("attributes");
+              const onvif::json::Value* mn =
+                  av == nullptr ? nullptr : av->member("matchedName");
+              if (mn != nullptr &&
+                  mn->type == onvif::json::Value::Type::kString)
+                ein.plate = mn->text;
+            }
+          }
+          break;
+        }
+      }
+      ein.object_types.push_back(otype);
+    }
+
+    // Materialise a smartDetectObjects row for any objectId we found via
+    // detectionLabels that doesn't yet have one.  Without this the bbox /
+    // Inspect-Detection panel stays empty even though the event is visible.
+    const std::string ts_ms_str = std::to_string(ein.start_ms);
+    for (std::size_t j = 0; j < ein.object_ids.size(); ++j) {
+      const std::string& oid = ein.object_ids[j];
+      const std::string otype = j < ein.object_types.size()
+                                    ? ein.object_types[j] : det_type;
+      const std::string attrs = enricher::BuildSmartDetectObjectAttributes(
+          ein.score, otype,
+          otype == "licensePlate" ? ein.plate : std::string());
       const char* p[] = {
         oid.c_str(), ein.event_id.c_str(), ein.camera_id.c_str(),
         ein.thumbnail_id.empty() ? nullptr : ein.thumbnail_id.c_str(),
-        det_type.c_str(), attrs.c_str(), ts_ms_str.c_str(),
+        otype.c_str(), attrs.c_str(), ts_ms_str.c_str(),
       };
       PGresult* sr = onvif::pg::ExecParamsWithTimeout(
           conn, -1,
@@ -496,11 +552,11 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
     PQclear(upr);
 
     // Insert smartDetectObjectAreas per existing object.
-    for (const std::string& oid : ein.object_ids) {
+    for (std::size_t j = 0; j < ein.object_ids.size(); ++j) {
+      const std::string& oid = ein.object_ids[j];
       const auto bb = enricher::PlaceholderBbox(
           image_width, image_height,
-          ein.smart_detect_types.empty()
-              ? std::string("unknown") : ein.smart_detect_types.front());
+          j < ein.object_types.size() ? ein.object_types[j] : det_type);
       const std::string sda_id = "sda-" + oid;
       const std::string aidx   = enricher::FullGridAreaIndexesSqlArray();
       std::ostringstream sql;

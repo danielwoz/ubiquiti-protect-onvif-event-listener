@@ -123,8 +123,9 @@ struct AlarmNotifierTest {
                                 const std::string& type,
                                 const std::string& mac,
                                 const std::string& camera_id,
-                                const std::string& event_id, uint64_t ts) {
-    return AlarmNotifier::build_uos_events(alarms, type, mac, camera_id,
+                                const std::string& event_id, uint64_t ts,
+                                const std::string& extra = {}) {
+    return AlarmNotifier::build_uos_events(alarms, type, extra, mac, camera_id,
                                            event_id, ts);
   }
   static std::string normalize_mac(const std::string& mac) {
@@ -2032,6 +2033,96 @@ static void test_refresh_does_not_block() {
   }
 }
 
+// A vehicle event carrying a plate also offers the licensePlate class: a
+// License Plate alarm fires, a vehicle alarm fires once, and the plate
+// alarm's event is filed under licensePlate while sourceEvent names both
+// classes.
+static void test_global_plate_trigger() {
+  FakeUosAgent uos;
+  uos.set_alarms(
+      "[" +
+      uos_alarm("a-plate", "Plate",
+                "[[" + trig("protect:objects.licensePlate") + "]]",
+                kZonesAll) +
+      "," +
+      uos_alarm("a-vehicle", "Vehicle",
+                "[[" + trig("protect:objects.vehicle") + "]]", kZonesAll) +
+      "]");
+  uos.start();
+  NoAlarmManagerProtect protect("[]");
+  protect.start();
+  onvif::ProtectUserIdProvider provider("owner-user-id", "");
+  {
+    onvif::AlarmNotifier notifier(
+        "http://127.0.0.1:" + std::to_string(protect.port()), &provider,
+        "host=/nonexistent-onvif-recorder-test port=1 connect_timeout=1",
+        uos.base_url());
+    notifier.set_mode_probe(global_console);
+    AlarmNotifierTest::set_camera_id(&notifier, kMockMac, kMockCameraId);
+    notifier.refresh_alarms();
+
+    notifier.notify("vehicle", kMockMac, "evt-plain", 1);
+    auto events = uos.events();
+    check(events.size() == 1 &&
+              alarm_ids(events[0]) ==
+                  std::vector<std::string>({"a-vehicle"}),
+          "plate: a vehicle without a plate does not fire the plate alarm");
+
+    notifier.notify("vehicle", kMockMac, "evt-plate", 2, "licensePlate");
+    events = uos.events();
+    check(events.size() == 2, "plate: one POST for the plate detection");
+    if (events.size() == 2) {
+      check(alarm_ids(events[1]) ==
+                std::vector<std::string>({"a-plate", "a-vehicle"}),
+            "plate: plate and vehicle alarms each fire once");
+      check(contains(events[1],
+                     R"("id":"licensePlate","alarm_id":"a-plate")"),
+            "plate: the plate alarm is filed under licensePlate");
+      check(contains(events[1],
+                     R"("id":"vehicle","alarm_id":"a-vehicle")"),
+            "plate: the vehicle alarm stays filed under vehicle");
+      check(contains(events[1],
+                     R"("smartDetectTypes":["vehicle","licensePlate"])"),
+            "plate: sourceEvent names both classes");
+    }
+  }
+  check(uos.bad_requests() == 0, "plate: every request well formed");
+}
+
+// A Local automation with a License Plate trigger fires for the plate
+// class and its payload is filed under licensePlate.
+static void test_local_plate_trigger() {
+  UosEmulator protect;
+  protect.set_alarms_json(
+      R"([{"id":"plate-alarm","name":"Plate","enable":true,)"
+      R"("conditions":[{"condition":{"type":"is","source":"licensePlate"}}],)"
+      R"("sources":[],"actions":[{"type":"SEND_NOTIFICATION","metadata":)"
+      R"({"receivers":[)" + receiver(kOwnerPk, kOwner, R"(["push"])") +
+      R"(]},"order":-1}]}])");
+  protect.start();
+  onvif::ProtectUserIdProvider provider("owner-user-id", "");
+  {
+    onvif::AlarmNotifier notifier(protect.base_url(), &provider, "", kNoUos);
+    notifier.set_mode_probe(local_console);
+    notifier.refresh_alarms();
+    AlarmNotifierTest::set_camera_id(&notifier, kMockMac, kMockCameraId);
+
+    notifier.notify("vehicle", kMockMac, "evt-local-1", 1700000000000ULL);
+    check(protect.notify_bodies().empty(),
+          "plate: a plate-less vehicle does not fire the automation");
+
+    notifier.notify("vehicle", kMockMac, "evt-local-2", 1700000000001ULL,
+                    "licensePlate");
+    const auto bodies = protect.notify_bodies();
+    check(bodies.size() == 1,
+          "plate: the plate detection fires the automation once");
+    check(!bodies.empty() &&
+              contains(bodies[0],
+                       R"("smartDetectTypes":["licensePlate"])"),
+          "plate: the local payload is filed under licensePlate");
+  }
+}
+
 // --trigger_automations=false: no notifier, so nothing is read or sent.
 static void test_trigger_automations_off() {
   FakeUosAgent uos;
@@ -2069,6 +2160,8 @@ int main() {
   test_uos_alarm_parsing();
   test_uos_payload_golden();
   test_global_notify();
+  test_global_plate_trigger();
+  test_local_plate_trigger();
   test_global_errors();
   test_mode_at_run_time();
   test_refresh_does_not_block();

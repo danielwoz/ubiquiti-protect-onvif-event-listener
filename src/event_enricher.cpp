@@ -134,7 +134,8 @@ std::string FullGridAreaIndexesSqlArray() {
 }
 
 std::string BuildSmartDetectObjectAttributes(int confidence,
-                                              std::string_view det_type) {
+                                              std::string_view det_type,
+                                              std::string_view plate) {
   // Matches the 22-field shape Protect 7.1.47 writes for a native person event
   // on a G4 Doorbell.  Most fields are null placeholders; we populate the ones
   // we can synthesise.
@@ -143,6 +144,8 @@ std::string BuildSmartDetectObjectAttributes(int confidence,
   // TODO: associatedFaceTrackerID = face tracker id when face detection runs.
   j.key("associatedFaceTrackerID").val_null();
   j.key("blurness").val_null();
+  // Only an object read by the camera's own plate reader carries this.
+  if (!plate.empty()) j.key("capturedByAiKey").val_bool(true);
   j.key("color").val_null();
   // TODO: per-object confidence.  Using event.score as approximation.
   j.key("confidence").val_int(confidence);
@@ -153,7 +156,11 @@ std::string BuildSmartDetectObjectAttributes(int confidence,
   j.key("faceVerifyStatus").val_null();
   j.key("line").val_null();
   j.key("matchedId").val_null();
-  j.key("matchedName").val_null();
+  if (plate.empty()) {
+    j.key("matchedName").val_null();
+  } else {
+    j.key("matchedName").val_str(plate);
+  }
   j.key("namesTopK").val_null();
   j.key("objectType").val_str(det_type);
   j.key("personEmbedFromCamera").val_null();
@@ -170,6 +177,12 @@ std::string BuildSmartDetectObjectAttributes(int confidence,
 
 std::string BuildEnrichedMetadata(const EventInput& ev) {
   const std::string det_type = DetTypeForEvent(ev);
+  // One event can carry several classes (a vehicle and its plate); the
+  // object_types list names each object.  Callers that only set
+  // smart_detect_types fall back to its first entry for every object.
+  auto object_type_at = [&](std::size_t i) {
+    return i < ev.object_types.size() ? ev.object_types[i] : det_type;
+  };
   Json j;
   j.object_open();
 
@@ -187,8 +200,9 @@ std::string BuildEnrichedMetadata(const EventInput& ev) {
 
   // ---- detectedAreas ----
   j.key("detectedAreas").array_open();
-  for (const auto& obj_id : ev.object_ids) {
-    Bbox bb = PlaceholderBbox(ev.image_width, ev.image_height, det_type);
+  for (std::size_t i = 0; i < ev.object_ids.size(); ++i) {
+    Bbox bb = PlaceholderBbox(ev.image_width, ev.image_height,
+                              object_type_at(i));
     int cx = (bb.x1 + bb.x2) / 2;
     int cy = (bb.y1 + bb.y2) / 2;
     j.sep().object_open();
@@ -202,25 +216,30 @@ std::string BuildEnrichedMetadata(const EventInput& ev) {
           .sep().array_open().val_int(cx).val_int(cy).array_close()
         .array_close()
       .object_close();
-      j.key("smartDetectObject").val_str(obj_id);
+      j.key("smartDetectObject").val_str(ev.object_ids[i]);
     j.object_close();
   }
   j.array_close();
 
   // ---- detectedThumbnails ----
   j.key("detectedThumbnails").array_open();
-  for (const auto& obj_id : ev.object_ids) {
-    Bbox bb = PlaceholderBbox(ev.image_width, ev.image_height, det_type);
+  for (std::size_t i = 0; i < ev.object_ids.size(); ++i) {
+    const std::string otype = object_type_at(i);
+    Bbox bb = PlaceholderBbox(ev.image_width, ev.image_height, otype);
     int w = bb.x2 - bb.x1;
     int h = bb.y2 - bb.y1;
     j.sep().object_open();
-      j.key("attributes").object_open()
-        .key("objectType").val_str(det_type)
+      j.key("attributes").object_open();
+        if (otype == "licensePlate" && !ev.plate.empty())
+          j.key("capturedByAiKey").val_bool(true);
+        j.key("objectType").val_str(otype);
+        if (otype == "licensePlate" && !ev.plate.empty())
+          j.key("matchedName").val_str(ev.plate);
         // TODO: real tracker id from the camera's analytics stream.
-        .key("trackerId").val_int(1)
+        j.key("trackerId").val_int(1);
         // TODO: real zones array from smartDetectZones intersection.
-        .key("zone").array_open().val_int(1).array_close()
-      .object_close();
+        j.key("zone").array_open().val_int(1).array_close();
+      j.object_close();
       // TODO: clockBestWall should be the wall-clock at the frame the best
       // thumbnail was captured; for now use event.start.
       j.key("clockBestWall").val_int(static_cast<int64_t>(ev.start_ms));
@@ -235,11 +254,14 @@ std::string BuildEnrichedMetadata(const EventInput& ev) {
       j.key("croppedId").val_str(ev.thumbnail_id);
       // TODO: real label strings -- for now we synthesise from event type.
       j.key("labels").array_open()
-        .val_str(std::string("smartDetectType:") + det_type)
+        .val_str(std::string("smartDetectType:") + otype)
         .val_str(std::string("zone:") + ev.camera_id + ":1")
       .array_close();
-      j.key("objectId").val_str(obj_id);
-      j.key("type").val_str(det_type);
+      // Protect's own plate entries carry the plate text in name.
+      if (otype == "licensePlate" && !ev.plate.empty())
+        j.key("name").val_str(ev.plate);
+      j.key("objectId").val_str(ev.object_ids[i]);
+      j.key("type").val_str(otype);
     j.object_close();
   }
   j.array_close();

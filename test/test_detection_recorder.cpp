@@ -443,7 +443,15 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
     std::string id;
     std::string camera_ip;
     std::string obj_type;
+    std::string plate;
     uint64_t    ts_ms{0};
+  };
+  struct SdtRow {
+    std::string id;
+    std::string event_id;
+    std::string camera_ip;
+    std::string obj_type;
+    std::string plate;
   };
   struct DetLabelRow {
     std::string      event_id;
@@ -465,6 +473,7 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
   std::vector<EventRow>   events;
   std::vector<SdoRow>     sdos;
   std::vector<SdrRow>     sdrs;
+  std::vector<SdtRow>     sdts;
   std::vector<ThumbRow>   thumbs;
   std::vector<SdaRow>     sdas;
   std::map<std::string, int> labels;      // name -> simulated lid
@@ -500,11 +509,14 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
     last_event_thumb_fullfov_id  = thumb_fullfov_id;
   }
 
+  std::map<std::string, std::string> sdo_attributes;
+
   void insert_sdo(const std::string& id, const std::string& event_id,
                   const std::string& /*thumb_id*/, const std::string& camera_ip,
-                  const std::string& obj_type, const std::string& /*attributes*/,
+                  const std::string& obj_type, const std::string& attributes,
                   uint64_t /*ts_ms*/, const std::string& /*now_str*/) override {
     sdos.push_back({id, event_id, camera_ip, obj_type});
+    sdo_attributes[id] = attributes;
   }
 
   void update_event_end(const std::string& event_id, uint64_t end_ms,
@@ -528,8 +540,21 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
                                const std::string& camera_ip,
                                uint64_t ts_ms,
                                const std::string& obj_type,
+                               const std::string& plate,
                                const std::string& /*now_str*/) override {
-    sdrs.push_back({id, camera_ip, obj_type, ts_ms});
+    sdrs.push_back({id, camera_ip, obj_type, plate, ts_ms});
+  }
+
+  void insert_smart_detect_track(const std::string& id,
+                                  const std::string& event_id,
+                                  const std::string& camera_ip,
+                                  uint64_t /*start_ms*/,
+                                  uint64_t /*end_ms*/,
+                                  const std::string& obj_type,
+                                  const std::string& plate,
+                                  int /*confidence*/,
+                                  const std::string& /*now_str*/) override {
+    sdts.push_back({id, event_id, camera_ip, obj_type, plate});
   }
 
   void insert_smart_detect_object_area(
@@ -558,6 +583,25 @@ struct MockBackend : onvif::DetectionRecorder::IDbBackend {
     if (lids.empty()) return;
     if (event_level) det_labels.push_back({event_id, "", lids});
     if (!object_id.empty()) det_labels.push_back({event_id, object_id, lids});
+  }
+
+  struct PlateUpgradeRow {
+    std::string event_id;
+    std::string metadata;
+  };
+  std::vector<PlateUpgradeRow> plate_upgrades;
+
+  bool add_event_plate(const std::string& event_id,
+                       const std::string& metadata,
+                       const std::string& /*now_str*/) override {
+    for (auto& e : events) {
+      if (e.id != event_id) continue;
+      if (e.sdt_json.find("licensePlate") != std::string::npos) return false;
+      e.sdt_json = "[\"vehicle\",\"licensePlate\"]";
+      plate_upgrades.push_back({event_id, metadata});
+      return true;
+    }
+    return false;
   }
 
   std::vector<onvif::DetectionRecorder::IDbBackend::EventSummary>
@@ -3422,6 +3466,204 @@ static void test_default_object_type_each_value() {
   }
 }
 
+// A camera or proxy that reads plates puts the text on its vehicle event
+// as a tt:SimpleItem.  The event is recorded the way Protect's own
+// licence-plate events are shaped: both classes in smartDetectTypes, a
+// second smartDetectObjects row typed licensePlate holding the text, the
+// plate on the raw and track payloads, and a Find Anything label.  A
+// plate on a non-vehicle event is dropped.
+static void test_license_plate_recording() {
+  onvif::protect_version::ResetForTesting();
+  onvif::protect_version::SetCurrent({7, 1, 47});
+
+  auto backend = std::make_unique<MockBackend>();
+  MockBackend* bptr = backend.get();
+  auto rec_or = onvif::DetectionRecorder::CreateWithBackend(std::move(backend));
+  CHECK(rec_or.ok(), "license_plate: CreateWithBackend failed");
+  onvif::DetectionRecorder& recorder = **rec_or;
+  recorder.set_coalesce_window(0);
+
+  onvif::OnvifEvent ev;
+  ev.camera_ip   = "192.168.1.244";
+  ev.topic       = "tns1:VehicleAlarm/IVB/VehicleDetect";
+  ev.event_time  = "2026-11-18T10:00:00Z";
+  ev.property_op = "Changed";
+  ev.data["State"]       = "true";
+  ev.data["PlateNumber"] = "  XX-111-X ";
+  recorder.on_event(ev);
+
+  CHECK(bptr->events.size() == 1, "license_plate: expected 1 event row");
+  CHECK(bptr->events[0].sdt_json == "[\"vehicle\",\"licensePlate\"]",
+        "license_plate: expected both classes, got " +
+            bptr->events[0].sdt_json);
+  CHECK(bptr->sdos.size() == 2,
+        "license_plate: expected a vehicle and a licensePlate object");
+  if (bptr->sdos.size() == 2) {
+    CHECK(bptr->sdos[0].obj_type == "vehicle",
+          "license_plate: first object must stay the vehicle");
+    CHECK(bptr->sdos[1].obj_type == "licensePlate",
+          "license_plate: second object must be licensePlate");
+  }
+  CHECK(bptr->sdrs.size() == 1 && bptr->sdrs[0].plate == "XX-111-X",
+        "license_plate: smartDetectRaws payload must carry the plate");
+  CHECK(bptr->sdts.size() == 1 && bptr->sdts[0].plate == "XX-111-X",
+        "license_plate: smartDetectTracks payload must carry the plate");
+  CHECK(bptr->sdas.size() == 2 &&
+            bptr->sdos.size() == 2 &&
+            bptr->sdas[1].sdo_id == bptr->sdos[1].id,
+        "license_plate: the plate object needs its own area row");
+  if (bptr->sdos.size() == 2) {
+    const auto& plate_attrs = bptr->sdo_attributes[bptr->sdos[1].id];
+    const auto& veh_attrs   = bptr->sdo_attributes[bptr->sdos[0].id];
+    CHECK(plate_attrs.find("\"matchedName\":\"XX-111-X\"") !=
+              std::string::npos,
+          "license_plate: plate object must carry the text in matchedName");
+    CHECK(plate_attrs.find("\"capturedByAiKey\":true") != std::string::npos,
+          "license_plate: plate object must be marked capturedByAiKey");
+    CHECK(veh_attrs.find("\"matchedName\":null") != std::string::npos,
+          "license_plate: the vehicle object keeps a null matchedName");
+  }
+
+  bool event_label = false, object_label = false;
+  for (const auto& row : bptr->det_labels) {
+    bool has_plate_label = false;
+    for (int lid : row.lids) {
+      for (const auto& [name, l] : bptr->labels) {
+        if (l == lid && name == "smartDetectType:licensePlate")
+          has_plate_label = true;
+      }
+    }
+    if (!has_plate_label) continue;
+    if (row.object_id.empty()) event_label = true;
+    else                      object_label = true;
+  }
+  CHECK(event_label, "license_plate: event-level plate label missing");
+  CHECK(object_label, "license_plate: plate object needs its own label row");
+
+  // The plate object's own row carries exactly the plate label; the
+  // vehicle object's row also listing it is not enough.
+  bool plate_object_row = false;
+  if (bptr->sdos.size() == 2) {
+    for (const auto& row : bptr->det_labels) {
+      if (row.object_id != bptr->sdos[1].id || row.lids.size() != 1) continue;
+      for (const auto& [name, l] : bptr->labels) {
+        if (l == row.lids[0] && name == "smartDetectType:licensePlate")
+          plate_object_row = true;
+      }
+    }
+  }
+  CHECK(plate_object_row,
+        "license_plate: the plate object needs a row with only its label");
+
+  const std::string& md = bptr->last_event_metadata;
+  CHECK(md.find("\"matchedName\":\"XX-111-X\"") != std::string::npos,
+        "license_plate: metadata must carry the plate in matchedName");
+  CHECK(md.find("\"name\":\"XX-111-X\"") != std::string::npos,
+        "license_plate: metadata plate entry must carry the plate name");
+  CHECK(md.find("\"type\":\"licensePlate\"") != std::string::npos,
+        "license_plate: metadata must type the plate object");
+
+  // A plate attached to a person event is not something Protect can
+  // represent; it must not invent a plate class or object.
+  bptr->events.clear();
+  bptr->sdos.clear();
+  bptr->sdrs.clear();
+  bptr->sdts.clear();
+  onvif::OnvifEvent person;
+  person.camera_ip   = "192.168.1.245";
+  person.topic       = "tns1:UserAlarm/IVA/HumanShapeDetect";
+  person.event_time  = "2026-11-18T10:01:00Z";
+  person.property_op = "Changed";
+  person.data["State"]       = "true";
+  person.data["PlateNumber"] = "AB-123-CD";
+  recorder.on_event(person);
+  CHECK(bptr->events.size() == 1 &&
+            bptr->events[0].sdt_json == "[\"person\"]",
+        "license_plate: a plate on a person must not change its class");
+  CHECK(bptr->sdos.size() == 1 && bptr->sdos[0].obj_type == "person",
+        "license_plate: a plate on a person must not add an object");
+  CHECK(bptr->sdrs.size() == 1 && bptr->sdrs[0].plate.empty(),
+        "license_plate: a plate on a person must not be written");
+
+  // An item holding only whitespace is not a plate.
+  bptr->events.clear();
+  bptr->sdos.clear();
+  bptr->sdrs.clear();
+  onvif::OnvifEvent blank;
+  blank.camera_ip   = "192.168.1.246";
+  blank.topic       = "tns1:VehicleAlarm/IVB/VehicleDetect";
+  blank.event_time  = "2026-11-18T10:02:00Z";
+  blank.property_op = "Changed";
+  blank.data["State"]       = "true";
+  blank.data["PlateNumber"] = "   ";
+  recorder.on_event(blank);
+  CHECK(bptr->events.size() == 1 &&
+            bptr->events[0].sdt_json == "[\"vehicle\"]",
+        "license_plate: blank item must leave the event a plain vehicle");
+
+  // Control bytes and invalid UTF-8 are dropped rather than sent to
+  // PostgreSQL, which would reject the INSERT and leave the event
+  // without its objects.
+  bptr->events.clear();
+  bptr->sdos.clear();
+  bptr->sdrs.clear();
+  onvif::OnvifEvent dirty;
+  dirty.camera_ip   = "192.168.1.247";
+  dirty.topic       = "tns1:VehicleAlarm/IVB/VehicleDetect";
+  dirty.event_time  = "2026-11-18T10:03:00Z";
+  dirty.property_op = "Changed";
+  dirty.data["State"] = "true";
+  dirty.data["PlateNumber"] =
+      std::string("A") + '\x01' + "B" + static_cast<char>(0xFF) + "C";
+  recorder.on_event(dirty);
+  CHECK(bptr->sdrs.size() == 1 && bptr->sdrs[0].plate == "ABC",
+        "license_plate: control and invalid bytes must be dropped");
+
+  // A plate arriving on a detection coalesced into an open event must
+  // upgrade that event: its smartDetectTypes, metadata and event-level
+  // label gain the class instead of the plate existing only in object
+  // rows.
+  recorder.set_coalesce_window(30);
+  bptr->events.clear();
+  bptr->sdos.clear();
+  bptr->sdrs.clear();
+  bptr->sdts.clear();
+  bptr->sdas.clear();
+  bptr->det_labels.clear();
+  bptr->plate_upgrades.clear();
+
+  onvif::OnvifEvent first;
+  first.camera_ip   = "192.168.1.248";
+  first.topic       = "tns1:VehicleAlarm/IVB/VehicleDetect";
+  first.event_time  = "2026-11-18T10:04:00Z";
+  first.property_op = "Changed";
+  first.data["State"] = "true";
+  recorder.on_event(first);
+  CHECK(bptr->events.size() == 1 &&
+            bptr->events[0].sdt_json == "[\"vehicle\"]",
+        "license_plate coalesced: the first detection starts a vehicle");
+
+  onvif::OnvifEvent later = first;
+  later.event_time           = "2026-11-18T10:04:05Z";
+  later.data["PlateNumber"]  = "XX-111-X";
+  recorder.on_event(later);
+  CHECK(bptr->events.size() == 1,
+        "license_plate coalesced: the detection merges into the event");
+  CHECK(bptr->events[0].sdt_json == "[\"vehicle\",\"licensePlate\"]",
+        "license_plate coalesced: the event row gains the plate class");
+  CHECK(bptr->plate_upgrades.size() == 1 &&
+            bptr->plate_upgrades[0].event_id == bptr->events[0].id,
+        "license_plate coalesced: the surviving event is upgraded once");
+  if (!bptr->plate_upgrades.empty()) {
+    const std::string& md = bptr->plate_upgrades[0].metadata;
+    CHECK(md.find("\"matchedName\":\"XX-111-X\"") != std::string::npos &&
+              md.find("\"type\":\"licensePlate\"") != std::string::npos,
+          "license_plate coalesced: the plate entry reaches the metadata");
+  }
+
+  onvif::protect_version::ResetForTesting();
+}
+
 // default_object_type=motion leaves unclassified generic motion to
 // Protect's own motion events, exactly as --drop_unclassified_motion
 // does: camera AI events, line crossings, field rules without a class and
@@ -3867,14 +4109,14 @@ static void test_purge_orphaned_rows() {
   // Valid dependent rows.
   bptr->sdos.push_back({"sdo-1", "E1", "192.168.1.200", "person"});
   bptr->thumbs.push_back({"thumb-1", "E1", "192.168.1.200"});
-  bptr->sdrs.push_back({"sdr-1", "192.168.1.200", "person", T + 5000});
+  bptr->sdrs.push_back({"sdr-1", "192.168.1.200", "person", "", T + 5000});
   bptr->det_labels.push_back({"E1", "", {1}});
 
   // Orphaned dependent rows (parent event does not exist).
   bptr->sdos.push_back({"sdo-orphan", "GONE", "192.168.1.200", "person"});
   bptr->thumbs.push_back({"thumb-orphan", "GONE", "192.168.1.200"});
   // Orphaned sdr: timestamp outside any event window for this camera.
-  bptr->sdrs.push_back({"sdr-orphan", "192.168.1.200", "person", T + 50000});
+  bptr->sdrs.push_back({"sdr-orphan", "192.168.1.200", "person", "", T + 50000});
   bptr->det_labels.push_back({"GONE", "", {1}});
 
   const int deleted = recorder.purge_orphaned_rows();
@@ -4319,6 +4561,8 @@ int main() {
            [] { test_drop_unclassified_without_snapshot(); });
   run_test("default_object_type_each_value",
            [] { test_default_object_type_each_value(); });
+  run_test("license_plate_recording",
+           [] { test_license_plate_recording(); });
   run_test("default_object_type_motion",
            [] { test_default_object_type_motion(); });
   run_test("default_object_type_motion_nanodet",

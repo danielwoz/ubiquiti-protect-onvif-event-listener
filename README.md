@@ -2,7 +2,8 @@
 
 Bridges **third-party ONVIF cameras** into UniFi Protect. It listens to ONVIF
 WS-PullPoint event streams and writes detection events (person, vehicle, animal,
-package) to the UniFi Protect PostgreSQL database so they appear natively in the
+package, and licence plates a camera or proxy reads) to the UniFi Protect
+PostgreSQL database so they appear natively in the
 Protect UI — including timeline clips, thumbnails, smart detection search, and
 security alarms.
 
@@ -181,7 +182,8 @@ Admin UI -> Detection -> camera_object_types
 ## Alarms and notifications
 
 onvif-recorder triggers Protect's alarms (**Protect → Alarms**) for the detections it records,
-so an alarm with a Person, Vehicle, Animal or Package trigger fires for your ONVIF cameras too.
+so an alarm with a Person, Vehicle, Animal, Package or License Plate trigger fires for your
+ONVIF cameras too (the plate trigger when the camera supplies the plate text).
 It follows Protect's Alarm Manager setting, checking it again about once a minute while
 detections arrive. The mode it uses, and any change, is logged as an info line, which shows in
 the log viewer (`https://<device>/onvif/events/log`) and, with `--verbose`, in the journal:
@@ -201,6 +203,23 @@ the log viewer (`https://<device>/onvif/events/log`) and, with `--verbose`, in t
 
 Turn `trigger_automations` off to record detections without triggering any alarm. See
 [Security alarms](FLAGS.md#security-alarms) for the details.
+
+## Licence plates
+
+A camera that reads plates, or a proxy in front of it, can attach the text to its
+existing vehicle event as a data item:
+
+```xml
+<tt:SimpleItem Name="PlateNumber" Value="XX-111-X"/>
+```
+
+The detection is then recorded as Protect's own licence-plate events are: the
+event carries both classes, the plate text is shown on the event, Find Anything
+searches for it, and an alarm with a License Plate trigger fires. The vehicle
+class stays on the event, so vehicle alarms still fire. A plate item on a
+non-vehicle event is ignored, and the plate has to travel on the notification
+that starts the detection (the one carrying `State=true` or
+`IsInside=true`).
 
 ## Sharing a camera's events with Protect
 

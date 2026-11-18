@@ -55,6 +55,13 @@ struct EventInput {
   // UUIDs already present in detectionLabels.objectId for this event;
   // these become smartDetectObjects.id values so the FK chain stays intact.
   std::vector<std::string> object_ids;
+  // smartDetectType of each object, parallel to object_ids.  One event can
+  // carry more than one class (a vehicle and its licence plate).  A
+  // missing entry falls back to smart_detect_types.front().
+  std::vector<std::string> object_types;
+  // Licence-plate text.  Non-empty adds a name and matchedName to the
+  // licensePlate object's metadata entries.
+  std::string plate;
 };
 
 // Synth a placeholder bbox sized for the given detection type.
@@ -66,9 +73,13 @@ Bbox PlaceholderBbox(int width, int height, std::string_view det_type);
 std::string BuildEnrichedMetadata(const EventInput& ev);
 
 // Build smartDetectObjects.attributes JSON for one detected object.
-// `det_type` is the smartDetectType ("person", "vehicle", ...).
+// `det_type` is the smartDetectType ("person", "vehicle", ...).  A
+// non-empty `plate` writes the text to matchedName (and marks the object
+// as read by the camera's own reader), the shape Protect uses for a
+// licensePlate object.
 std::string BuildSmartDetectObjectAttributes(int confidence,
-                                              std::string_view det_type);
+                                              std::string_view det_type,
+                                              std::string_view plate = {});
 
 // Render the full areaIndexes int[] literal for SQL: e.g. "ARRAY[0,1,...,119]".
 // TODO: derive from bbox-vs-grid intersection instead of full coverage.

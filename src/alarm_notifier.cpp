@@ -1154,8 +1154,9 @@ bool AlarmNotifier::parse_uos_alarms(const std::string& json,
 // static
 std::string AlarmNotifier::build_uos_events(
     const std::vector<UosAlarm>& alarms, const std::string& obj_type,
-    const std::string& mac, const std::string& camera_id,
-    const std::string& event_id, uint64_t ts_ms) {
+    const std::string& extra_obj_type, const std::string& mac,
+    const std::string& camera_id, const std::string& event_id,
+    uint64_t ts_ms) {
   using onvif::util::json_str;
   char ts_buf[24];
   std::snprintf(ts_buf, sizeof(ts_buf), "%" PRIu64, ts_ms);
@@ -1176,10 +1177,14 @@ std::string AlarmNotifier::build_uos_events(
   std::string p = "[";
   for (size_t i = 0; i < alarms.size(); ++i) {
     const UosAlarm& a = alarms[i];
+    // The event is filed under the class this alarm matches, so a plate
+    // alarm sees a licensePlate event and a vehicle alarm a vehicle one.
+    const std::string key = a.fire_types.count(obj_type) || extra_obj_type.empty()
+                                ? obj_type : extra_obj_type;
     std::vector<std::string> keys = a.scope_keys;
-    if (keys.empty()) keys.push_back(default_scope_key(obj_type));
+    if (keys.empty()) keys.push_back(default_scope_key(key));
     if (i > 0) p += ',';
-    p += "{\"id\":";             p += json_str(obj_type);
+    p += "{\"id\":";             p += json_str(key);
     p += ",\"alarm_id\":";       p += json_str(a.id);
     p += ",\"scope\":{";
     for (const std::string& k : keys) {
@@ -1189,7 +1194,7 @@ std::string AlarmNotifier::build_uos_events(
       p += ',';
     }
     p += "\"site_id\":\"protect\"}";
-    p += ",\"metadata\":{\"event\":{\"key\":"; p += json_str(obj_type);
+    p += ",\"metadata\":{\"event\":{\"key\":"; p += json_str(key);
     p += ",\"device\":";         p += json_str(mac);
     p += ",\"eventId\":";        p += json_str(event_id);
     p += ",\"timestamp\":";      p += ts_buf;
@@ -1197,7 +1202,12 @@ std::string AlarmNotifier::build_uos_events(
       p += ",\"sourceEvent\":{\"type\":\"smartDetectZone\"";
       p += ",\"camera\":";       p += json_str(camera_id);
       p += ",\"start\":";        p += ts_buf;
-      p += ",\"smartDetectTypes\":["; p += json_str(obj_type); p += "]}";
+      p += ",\"smartDetectTypes\":["; p += json_str(obj_type);
+      if (!extra_obj_type.empty()) {
+        p += ',';
+        p += json_str(extra_obj_type);
+      }
+      p += "]}";
     }
     p += "}}}";
   }
@@ -1658,16 +1668,18 @@ void AlarmNotifier::refresh_local(const std::string& url) {
 void AlarmNotifier::notify(const std::string& obj_type,
                            const std::string& camera_mac,
                            const std::string& event_id,
-                           uint64_t ts_ms) {
+                           uint64_t ts_ms,
+                           const std::string& extra_obj_type) {
   // The mode is decided again, and the Global alarm list re-read, once
   // the last refresh is a minute old (10 s while unsettled).
   maybe_refresh();
   switch (mode()) {
     case Mode::kGlobal:
-      notify_global(obj_type, normalize_mac(camera_mac), event_id, ts_ms);
+      notify_global(obj_type, extra_obj_type, normalize_mac(camera_mac),
+                    event_id, ts_ms);
       break;
     case Mode::kLocal:
-      notify_local(obj_type, camera_mac, event_id, ts_ms);
+      notify_local(obj_type, extra_obj_type, camera_mac, event_id, ts_ms);
       break;
     case Mode::kUnknown:
       LOG(ERROR) << "[alarm] " << obj_type << " on " << camera_mac
@@ -1679,6 +1691,7 @@ void AlarmNotifier::notify(const std::string& obj_type,
 }
 
 void AlarmNotifier::notify_global(const std::string& obj_type,
+                                  const std::string& extra_obj_type,
                                   const std::string& mac,
                                   const std::string& event_id,
                                   uint64_t ts_ms) {
@@ -1689,7 +1702,10 @@ void AlarmNotifier::notify_global(const std::string& obj_type,
     absl::MutexLock lk(&mu_);
     loaded = uos_loaded_;
     for (const UosAlarm& a : uos_alarms_) {
-      if (!a.paused && a.fire_types.count(obj_type)) selected.push_back(a);
+      if (a.paused) continue;
+      if (a.fire_types.count(obj_type) ||
+          (!extra_obj_type.empty() && a.fire_types.count(extra_obj_type)))
+        selected.push_back(a);
     }
     const auto it = mac_to_camera_id_.find(mac);
     if (it != mac_to_camera_id_.end()) camera_id = it->second;
@@ -1717,7 +1733,8 @@ void AlarmNotifier::notify_global(const std::string& obj_type,
     titles += "\"" + a.title + "\"";
   }
   const std::string payload =
-      build_uos_events(selected, obj_type, mac, camera_id, event_id, ts_ms);
+      build_uos_events(selected, obj_type, extra_obj_type, mac, camera_id,
+                       event_id, ts_ms);
   const std::string url = uos_url_ + "/api/v1/alarms/events";
 
   // UniFi OS answers 202 before it runs the alarms and does not drop a
@@ -1758,6 +1775,7 @@ void AlarmNotifier::notify_global(const std::string& obj_type,
 }
 
 void AlarmNotifier::notify_local(const std::string& obj_type,
+                                 const std::string& extra_obj_type,
                                  const std::string& camera_mac,
                                  const std::string& event_id,
                                  uint64_t ts_ms) {
@@ -1791,8 +1809,16 @@ void AlarmNotifier::notify_local(const std::string& obj_type,
   for (const auto& automation : automations_copy) {
     if (!automation.enabled) continue;
 
-    // Check if this detection type matches an automation condition.
-    if (!automation.trigger_types.count(obj_type)) continue;
+    // A detection can carry two classes (a vehicle and its plate).  The
+    // automation fires once, filed under the class it matches.
+    const bool matches_primary =
+        automation.trigger_types.count(obj_type) != 0;
+    const bool matches_extra =
+        !extra_obj_type.empty() &&
+        automation.trigger_types.count(extra_obj_type) != 0;
+    if (!matches_primary && !matches_extra) continue;
+    const std::string event_key =
+        matches_primary ? obj_type : extra_obj_type;
 
     // Check the automation's include / exclude camera lists.
     if (!covers_camera(automation, camera_mac)) continue;
@@ -1826,7 +1852,7 @@ void AlarmNotifier::notify_local(const std::string& obj_type,
     }
 
     LOG(INFO) << "[alarm] triggering automation " << automation.id
-              << " for " << obj_type << " on " << camera_mac
+              << " for " << event_key << " on " << camera_mac
               << " event_id=" << event_id;
     {
       // Use the camera's DB UUID as the device identifier so that
@@ -1863,7 +1889,7 @@ void AlarmNotifier::notify_local(const std::string& obj_type,
           LOG(INFO) << "[alarm] automation " << automation.id
                     << ": no notification sent -- " << plan.skip_reason;
         } else {
-          payload = build_notify_payload(automation.id, obj_type, device_id,
+          payload = build_notify_payload(automation.id, event_key, device_id,
                                          event_id, ts_ms, plan.receivers);
           code = http_post(notify_url, payload);
         }
@@ -1915,7 +1941,7 @@ void AlarmNotifier::notify_local(const std::string& obj_type,
     }
 
     // Record in automationsHistory so Protect UI shows hits and history.
-    record_history(automation, obj_type, camera_mac, event_id, ts_ms);
+    record_history(automation, event_key, camera_mac, event_id, ts_ms);
 
     // Update local cooldown tracker.
     {

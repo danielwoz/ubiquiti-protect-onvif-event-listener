@@ -176,6 +176,12 @@ Optionally, per-camera UBV thumbnail files are also written to `ONVIF_UBV_DIR` i
 - `CameraConfig::id` and `mac` are populated from the UniFi Protect DB and used by
   the PostgreSQL backend to set `cameraId` and generate thumbnail IDs.
 - Detection mapping: ONVIF `"Human"` → `"person"`, `"Vehicle"` → `"vehicle"`.
+  A vehicle event whose `tt:Data` carries `PlateNumber` is recorded as
+  Protect's native licence-plate shape: `smartDetectTypes` gains
+  `licensePlate`, a second `smartDetectObjects` row typed `licensePlate`
+  holds the text in `attributes.matchedName`, and the `smartDetectRaws` /
+  `smartDetectTracks` payloads carry it in `licensePlate`. A plate on a
+  non-vehicle event is dropped.
 - `"end"` must be double-quoted in SQL (reserved word).
 - Thumbnail crop priority: ONVIF `tt:BoundingBox` (if w>0 && h>0) → ML detector
   (`ObjectDetector::detect()`) → smart_crop heuristic (square at 60% vertical centre).

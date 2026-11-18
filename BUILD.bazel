@@ -148,6 +148,7 @@ cc_library(
     strip_include_prefix = "src",
     deps = [
         ":event_enricher",
+        ":json_value",
         ":pg_util",
         ":protect_version",
         "@com_google_absl//absl/log:log",
