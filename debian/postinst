@@ -66,9 +66,13 @@ case "$1" in
         # ----- Restore config after a purge -----
         # `apt purge` removes /etc/onvif-recorder, but the recovery layer
         # keeps a backup in /data; a reinstall restores it so the channel,
-        # flags and cached IDs come back.  A plain `apt remove` keeps the
-        # directory, so this only fires after a purge.
-        if [ ! -d /etc/onvif-recorder ] && \
+        # flags and cached IDs come back.  dpkg recreates the directory
+        # from the packaged channel conffile before this script runs, so
+        # key off the runtime config instead: it only exists once the
+        # recorder has saved settings, and an upgrade keeps it.  A purge
+        # removes it, so this fires on reinstall or on a fresh install
+        # that has a backup waiting.
+        if [ ! -f /etc/onvif-recorder/config.json ] && \
            [ -f /data/onvif-recorder/backups/config-current.tar.gz ]; then
             tar -xzf /data/onvif-recorder/backups/config-current.tar.gz \
                 -C / 2>/dev/null || true

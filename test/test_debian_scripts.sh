@@ -13,7 +13,8 @@
 # prerm is also run with stub systemctl / systemd-cat / onvif-recorder
 # commands that record their arguments, so the checks cover what the script
 # does as well as what it says.  postinst touches fixed system paths, so it
-# is only checked as text.
+# is checked as text, except its post-purge restore block, which runs against
+# a throwaway root to prove the backup is extracted when config.json is gone.
 #
 # Run via: scripts/bz test --config=x86 //test:test_debian_scripts
 set -eu
@@ -214,6 +215,46 @@ if configure=$(branch "$POSTINST" configure); then
         pass "postinst restores a post-purge backup before creating defaults"
     else
         bad "postinst does not restore the config backup before defaults"
+    fi
+    # Run the restore block itself.  The package ships
+    # /etc/onvif-recorder/channel as a conffile, so dpkg recreates the
+    # directory before postinst runs; the backup must still be restored
+    # when the runtime config is absent, and an upgrade must be left alone.
+    restore_block=$(awk '
+        /# ----- Restore config after a purge -----/ { inb = 1 }
+        inb && /^        fi$/ { print; exit }
+        inb { print }' "$POSTINST")
+    if [ -z "$restore_block" ]; then
+        bad "postinst has no restore block"
+    else
+        mkdir -p "$TMP/root/etc/onvif-recorder" \
+                 "$TMP/root/data/onvif-recorder/backups" \
+                 "$TMP/tar/etc/onvif-recorder"
+        echo stable > "$TMP/root/etc/onvif-recorder/channel"
+        echo keep > "$TMP/tar/etc/onvif-recorder/e2e-marker"
+        tar -czf "$TMP/root/data/onvif-recorder/backups/config-current.tar.gz" \
+            -C "$TMP/tar" etc/onvif-recorder
+        printf '%s\n' "$restore_block" | \
+            sed -e "s|/etc/onvif-recorder|$TMP/root/etc/onvif-recorder|g" \
+                -e "s|/data/onvif-recorder|$TMP/root/data/onvif-recorder|g" \
+                -e "s|-C /|-C $TMP/root|g" > "$TMP/restore"
+        rc=0
+        sh "$TMP/restore" > /dev/null 2>&1 || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            bad "postinst restore block exited $rc"
+        elif [ ! -f "$TMP/root/etc/onvif-recorder/e2e-marker" ]; then
+            bad "postinst restore misses the backup when the conffile dir exists"
+        else
+            pass "postinst restore extracts the backup with no config.json"
+        fi
+        rm -f "$TMP/root/etc/onvif-recorder/e2e-marker"
+        echo '{}' > "$TMP/root/etc/onvif-recorder/config.json"
+        sh "$TMP/restore" > /dev/null 2>&1 || true
+        if [ -f "$TMP/root/etc/onvif-recorder/e2e-marker" ]; then
+            bad "postinst restore overwrites a configured install"
+        else
+            pass "postinst restore leaves an upgrade alone"
+        fi
     fi
 else
     bad "postinst has no configure) branch"
