@@ -158,6 +158,13 @@ filegroup(
     srcs = ["testdata/reolink_ai_doorbell_20260725.jsonl"],
 )
 
+# Plate-reading proxy in front of a Dahua (issue #73): the start carries
+# PlateNumber next to State, the end carries neither.
+filegroup(
+    name = "plate_proxy_raw_log",
+    srcs = ["testdata/plate_proxy_20261120.jsonl"],
+)
+
 cc_test(
     name = "test_onvif_listener",
     srcs = ["test_onvif_listener.cpp"],
@@ -181,6 +188,7 @@ cc_test(
         "$(location //test:hikvision_pullpoint_notauthorized_raw_log)",
         "$(location //test:dahua_ivs_linecross_raw_log)",
         "$(location //test:reolink_ai_doorbell_raw_log)",
+        "$(location //test:plate_proxy_raw_log)",
     ],
     data = [
         "//test:tsan_suppressions",
@@ -202,6 +210,7 @@ cc_test(
         "//test:hikvision_pullpoint_notauthorized_raw_log",
         "//test:dahua_ivs_linecross_raw_log",
         "//test:reolink_ai_doorbell_raw_log",
+        "//test:plate_proxy_raw_log",
     ],
     deps = [
         "//:onvif_listener",

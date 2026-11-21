@@ -2026,8 +2026,21 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
           coalesced_event_id = oit->second;
         } else {
           // Case 2: event ended recently — re-open it.
+          //
+          // A plate-bearing vehicle detection is never merged into a
+          // recently ended event.  The event row holds one plate and
+          // add_event_plate() refuses to overwrite it, so merging would
+          // silently drop this vehicle's plate; a plate is also what
+          // tells two vehicles apart.  An event that is still open
+          // (case 1) is still reused: the camera re-fired its start
+          // within the same detection, and there is no ended
+          // notification to split on.
+          const bool plate_vehicle =
+              canonical_object_type(det->type) == "vehicle" &&
+              !det->plate.empty();
           auto lei = last_event_.find(key);
-          if (lei != last_event_.end() && lei->second.real_end_ms > 0) {
+          if (!plate_vehicle && lei != last_event_.end() &&
+              lei->second.real_end_ms > 0) {
             const uint64_t cur = util::now_ms();
             if (cur >= lei->second.real_end_ms &&
                 cur - lei->second.real_end_ms <= cam_coalesce_ms) {

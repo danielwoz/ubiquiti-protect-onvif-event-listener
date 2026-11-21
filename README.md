@@ -221,7 +221,9 @@ searches for it, and an alarm with a License Plate trigger fires. The vehicle
 class stays on the event, so vehicle alarms still fire. A plate item on a
 non-vehicle event is ignored, and the plate has to travel on the notification
 that starts the detection (the one carrying `State=true` or
-`IsInside=true`).
+`IsInside=true`). A plate-bearing detection is not merged into a recently
+ended vehicle event, so two cars inside the coalesce window keep their own
+plates.
 
 ## Sharing a camera's events with Protect
 

@@ -740,6 +740,60 @@ static void test_dahua_ivs_line_crossing(const std::string& jsonl) {
 }
 
 // ============================================================
+// Test: a plate-reading proxy in front of a Dahua (issue #73).  The
+// start notification carries PlateNumber next to State and no
+// ClassTypes; the ended notification carries neither.  The capture is
+// the reporter's own.
+// ============================================================
+static void test_plate_proxy_event(const std::string& jsonl) {
+  ReplayCameraEmulator emu(jsonl);
+  emu.start();
+
+  onvif::CameraConfig cfg;
+  cfg.ip                 = emu.local_address();
+  cfg.user               = "admin";
+  cfg.password           = "password";
+  cfg.retry_interval_sec = 1;
+
+  auto r = collect_until({cfg},
+    [](const std::vector<onvif::OnvifEvent>& evs) {
+      bool started = false, ended = false;
+      for (const auto& e : evs) {
+        if (e.topic != "tns1:VehicleAlarm/IVB/VehicleDetect") continue;
+        auto s = e.data.find("State");
+        if (s == e.data.end()) continue;
+        if (s->second == "true")  started = true;
+        if (s->second == "false") ended   = true;
+      }
+      return started && ended;
+    }, std::chrono::seconds(30));
+
+  CHECK(!r.timed_out, "timed out waiting for the plate event");
+
+  bool saw_start = false, saw_end = false;
+  for (const auto& ev : r.events) {
+    if (ev.topic != "tns1:VehicleAlarm/IVB/VehicleDetect") continue;
+    auto s = ev.data.find("State");
+    if (s == ev.data.end()) continue;
+    if (s->second == "true") {
+      saw_start = true;
+      // The proxy leaves the class to the topic.
+      CHECK(ev.data.count("ClassTypes") == 0,
+            "the proxy sends no ClassTypes");
+      auto p = ev.data.find("PlateNumber");
+      CHECK(p != ev.data.end() && p->second == "PJ-131-X",
+            "the start notification must carry the plate text");
+    } else if (s->second == "false") {
+      saw_end = true;
+      CHECK(ev.data.count("PlateNumber") == 0,
+            "the ended notification carries no plate");
+    }
+  }
+  CHECK(saw_start, "expected a vehicle-detection start");
+  CHECK(saw_end, "expected a vehicle-detection end");
+}
+
+// ============================================================
 // Test: Reolink AI doorbell -- the whole MyRuleDetector family arrives,
 // covering all four smart-detect classes Protect models.
 // ============================================================
@@ -1749,7 +1803,7 @@ static void test_stop_before_run() {
 }
 
 int main(int argc, char* argv[]) {
-  if (argc < 19) {
+  if (argc < 20) {
     std::cerr << "Usage: " << argv[0] << "\n"
               << "  <hikvision_compatible.jsonl>\n"
               << "  <dahua_dh_sd4a425db_hny.jsonl>\n"
@@ -1768,7 +1822,8 @@ int main(int argc, char* argv[]) {
               << "  <reolink_bullet.jsonl>\n"
               << "  <hikvision_pullpoint_notauthorized.jsonl>\n"
               << "  <dahua_ivs_linecross.jsonl>\n"
-              << "  <reolink_ai_doorbell.jsonl>\n";
+              << "  <reolink_ai_doorbell.jsonl>\n"
+              << "  <plate_proxy.jsonl>\n";
     return 1;
   }
   const std::string hikvision_jsonl      = argv[1];
@@ -1789,6 +1844,7 @@ int main(int argc, char* argv[]) {
   const std::string hik_notauth_jsonl    = argv[16];
   const std::string dahua_ivs_jsonl      = argv[17];
   const std::string reolink_ai_jsonl     = argv[18];
+  const std::string plate_proxy_jsonl    = argv[19];
 
   onvif::global_init();
 
@@ -1866,6 +1922,8 @@ int main(int argc, char* argv[]) {
            [&] { test_dahua_ivs_line_crossing(dahua_ivs_jsonl); });
   run_test("reolink_ai_doorbell_classes",
            [&] { test_reolink_ai_doorbell_classes(reolink_ai_jsonl); });
+  run_test("plate_proxy_event",
+           [&] { test_plate_proxy_event(plate_proxy_jsonl); });
 
   onvif::global_cleanup();
 

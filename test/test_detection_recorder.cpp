@@ -3661,6 +3661,50 @@ static void test_license_plate_recording() {
           "license_plate coalesced: the plate entry reaches the metadata");
   }
 
+  // Two cars inside the coalesce window must stay separate events.  An
+  // event row holds one plate, so merging would drop the second plate.
+  bptr->events.clear();
+  bptr->sdos.clear();
+  bptr->sdrs.clear();
+  bptr->sdts.clear();
+  bptr->sdas.clear();
+  bptr->det_labels.clear();
+  bptr->plate_upgrades.clear();
+
+  onvif::OnvifEvent car_a = first;
+  car_a.camera_ip          = "192.168.1.249";
+  car_a.event_time         = "2026-11-18T10:05:00Z";
+  car_a.data["PlateNumber"] = "PJ-131-X";
+  recorder.on_event(car_a);
+  onvif::OnvifEvent car_a_end = car_a;
+  car_a_end.event_time        = "2026-11-18T10:05:13Z";
+  car_a_end.data["State"]     = "false";
+  car_a_end.data.erase("PlateNumber");
+  recorder.on_event(car_a_end);
+
+  onvif::OnvifEvent car_b = car_a;
+  car_b.event_time          = "2026-11-18T10:05:20Z";
+  car_b.data["PlateNumber"] = "AB-123-CD";
+  recorder.on_event(car_b);
+  onvif::OnvifEvent car_b_end = car_b;
+  car_b_end.event_time        = "2026-11-18T10:05:30Z";
+  car_b_end.data["State"]     = "false";
+  car_b_end.data.erase("PlateNumber");
+  recorder.on_event(car_b_end);
+
+  CHECK(bptr->events.size() == 2,
+        "license_plate: two cars within the coalesce window need two events, got " +
+            std::to_string(bptr->events.size()));
+  for (const auto& row : bptr->events) {
+    CHECK(row.sdt_json == "[\"vehicle\",\"licensePlate\"]",
+          "license_plate: each car's event must carry the plate class, got " +
+              row.sdt_json);
+  }
+  CHECK(bptr->sdrs.size() == 2 &&
+            bptr->sdrs[0].plate == "PJ-131-X" &&
+            bptr->sdrs[1].plate == "AB-123-CD",
+        "license_plate: each car must keep its own plate");
+
   onvif::protect_version::ResetForTesting();
 }
 
