@@ -247,13 +247,24 @@ if configure=$(branch "$POSTINST" configure); then
         else
             pass "postinst restore extracts the backup with no config.json"
         fi
-        rm -f "$TMP/root/etc/onvif-recorder/e2e-marker"
+        # An upgrade passes the previous version as $2 and must leave the
+        # live tree alone even when the admin form was never saved and the
+        # runtime config is therefore absent.
+        rm -f "$TMP/root/etc/onvif-recorder/e2e-marker" \
+              "$TMP/root/etc/onvif-recorder/config.json"
+        sh "$TMP/restore" configure 1.6.40 > /dev/null 2>&1 || true
+        if [ -f "$TMP/root/etc/onvif-recorder/e2e-marker" ]; then
+            bad "postinst restore overwrites an upgrade without config.json"
+        else
+            pass "postinst restore leaves an upgrade without config.json alone"
+        fi
+        # A configured install is left alone as well.
         echo '{}' > "$TMP/root/etc/onvif-recorder/config.json"
         sh "$TMP/restore" > /dev/null 2>&1 || true
         if [ -f "$TMP/root/etc/onvif-recorder/e2e-marker" ]; then
             bad "postinst restore overwrites a configured install"
         else
-            pass "postinst restore leaves an upgrade alone"
+            pass "postinst restore leaves a configured install alone"
         fi
     fi
 else

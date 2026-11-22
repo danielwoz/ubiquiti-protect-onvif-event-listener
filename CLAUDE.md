@@ -591,11 +591,13 @@ rm -f  /var/log/onvif-recorder-backup.log
 
 Skipping step 2 is intentional when the user only wants to clear apt
 state but plans to reinstall — /data keeps the previous config backup,
-and the next install restores it (postinst extracts it when the runtime
-`config.json` is missing; dpkg recreates the directory itself from the
-packaged channel conffile, so the directory is not a usable signal).
-Only do step 2 when the user really wants the device to forget the
-application existed.
+and the next install restores it (postinst extracts it on a fresh
+install or reinstall: `$2` is empty and the runtime `config.json` is
+missing; an upgrade keeps the live tree even when the admin form was
+never saved, and dpkg recreates the directory itself from the packaged
+channel conffile, so the directory is not a usable signal).  Only do
+step 2 when the user really wants the device to forget the application
+existed.
 
 Packages older than v1.6.42 leave their cron entries behind on purge;
 remove those two `/etc/cron.d/` files by hand after purging one.

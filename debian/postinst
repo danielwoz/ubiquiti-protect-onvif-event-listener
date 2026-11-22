@@ -69,10 +69,12 @@ case "$1" in
         # flags and cached IDs come back.  dpkg recreates the directory
         # from the packaged channel conffile before this script runs, so
         # key off the runtime config instead: it only exists once the
-        # recorder has saved settings, and an upgrade keeps it.  A purge
-        # removes it, so this fires on reinstall or on a fresh install
-        # that has a backup waiting.
-        if [ ! -f /etc/onvif-recorder/config.json ] && \
+        # recorder has saved settings.  $2 is empty on a fresh install or
+        # reinstall and holds the previous version on an upgrade; an
+        # upgrade keeps whatever is live even when the admin form was
+        # never saved, so it must not extract the daily backup over it.
+        if [ -z "$2" ] && \
+           [ ! -f /etc/onvif-recorder/config.json ] && \
            [ -f /data/onvif-recorder/backups/config-current.tar.gz ]; then
             tar -xzf /data/onvif-recorder/backups/config-current.tar.gz \
                 -C / 2>/dev/null || true
