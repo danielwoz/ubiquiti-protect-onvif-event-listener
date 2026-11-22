@@ -784,6 +784,17 @@ bool append_event_label(PGconn* conn,
                         const std::string& label_name,
                         const std::string& now_str);
 
+/// Append the licensePlate class to an event row that already exists on
+/// @p conn: extend smartDetectTypes, merge the plate object's detectedAreas
+/// and detectedThumbnails from @p metadata (empty leaves metadata alone),
+/// and add the event-level smartDetectType:licensePlate label.  Returns
+/// true when the event gained the class and false when it already had it
+/// or the update failed.  Exposed for testing against a database.
+bool update_event_plate(PGconn* conn,
+                        const std::string& event_id,
+                        const std::string& metadata,
+                        const std::string& now_str);
+
 }  // namespace detection_recorder_internal
 
 }  // namespace onvif

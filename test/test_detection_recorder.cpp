@@ -2834,6 +2834,137 @@ static void test_detection_labels_sql_db() {
   PQfinish(c);
 }
 
+// add_event_plate's UPDATE against a real PostgreSQL: the class append,
+// the detectedAreas / detectedThumbnails merge and the event-level label.
+// The mock backend records the call without running it, so this is the
+// only test that pins this SQL.
+static void test_update_event_plate_sql_db() {
+  const char* env = std::getenv("ONVIF_TEST_DB_CONN");
+  PGconn* c = PQconnectdb(env ? env : "");
+  if (PQstatus(c) != CONNECTION_OK) {
+    std::cout << "  SKIP: no postgres reachable (set ONVIF_TEST_DB_CONN)\n";
+    PQfinish(c);
+    return;
+  }
+  pg_scalar(c, "SET client_min_messages = warning");
+  pg_scalar(c,
+      "CREATE TEMP TABLE events ("
+      " id varchar(255) PRIMARY KEY, \"smartDetectTypes\" json,"
+      " metadata json, \"updatedAt\" timestamptz)");
+  pg_scalar(c,
+      "CREATE TEMP TABLE labels ("
+      " lid bigserial UNIQUE NOT NULL, name varchar(255) UNIQUE,"
+      " \"lastSeen\" bigint, id varchar(255) PRIMARY KEY,"
+      " \"createdAt\" timestamptz NOT NULL,"
+      " \"updatedAt\" timestamptz NOT NULL)");
+  pg_scalar(c,
+      "CREATE TEMP TABLE \"detectionLabels\" ("
+      " \"eventId\" varchar(255) NOT NULL REFERENCES events(id)"
+      "   ON UPDATE CASCADE ON DELETE CASCADE,"
+      " labels integer[], id varchar(255) PRIMARY KEY,"
+      " \"createdAt\" timestamptz NOT NULL,"
+      " \"updatedAt\" timestamptz NOT NULL, \"objectId\" varchar(255))");
+  pg_scalar(c,
+      "CREATE UNIQUE INDEX ON \"detectionLabels\" (\"eventId\")"
+      " WHERE \"objectId\" IS NULL");
+
+  const std::string now = "2026-11-22T00:00:00.000Z";
+  pg_scalar(c,
+      "INSERT INTO labels (name, id, \"createdAt\", \"updatedAt\") VALUES"
+      " ('camera:CAM', 'l1', '2026-11-21T00:00:00Z',"
+      " '2026-11-21T00:00:00Z'),"
+      " ('smartDetectType:vehicle', 'l2', '2026-11-21T00:00:00Z',"
+      " '2026-11-21T00:00:00Z')");
+  pg_scalar(c,
+      "INSERT INTO events VALUES ('E1', '[\"vehicle\"]'::json,"
+      " '{\"source\":\"onvif-recorder\",\"weather\":{\"condition\":\"clear\"},"
+      "\"detectedAreas\":[{\"id\":\"a-vehicle\",\"objectId\":\"V1\"}],"
+      "\"detectedThumbnails\":[{\"id\":\"t-vehicle\",\"objectId\":\"V1\","
+      "\"type\":\"vehicle\",\"name\":null}]}'::json,"
+      " '2026-11-21T00:00:00Z')");
+  pg_scalar(c,
+      "INSERT INTO \"detectionLabels\""
+      " (\"eventId\", \"objectId\", labels, id, \"createdAt\", \"updatedAt\")"
+      " VALUES ('E1', NULL, (SELECT array_agg(lid::int) FROM labels),"
+      " 'dl-e1', '2026-11-21T00:00:00Z', '2026-11-21T00:00:00Z')");
+
+  using onvif::detection_recorder_internal::update_event_plate;
+  const std::string plate_metadata =
+      "{\"detectedAreas\":[{\"id\":\"a-plate\",\"objectId\":\"P1\"}],"
+      "\"detectedThumbnails\":[{\"id\":\"t-plate\",\"objectId\":\"P1\","
+      "\"type\":\"licensePlate\",\"name\":\"PJ-131-X\"}]}";
+  CHECK(update_event_plate(c, "E1", plate_metadata, now),
+        "db: a plate on a coalesced event gains the class");
+  CHECK(pg_scalar(c, "SELECT metadata IS NOT NULL FROM events"
+                     " WHERE id = 'E1'") == "t",
+        "db: the plate upgrade keeps events.metadata");
+  CHECK(pg_scalar(c, "SELECT metadata::jsonb->>'source' FROM events"
+                     " WHERE id = 'E1'") == "onvif-recorder",
+        "db: the source marker survives the plate upgrade");
+  CHECK(pg_scalar(c, "SELECT metadata::jsonb->'weather'->>'condition'"
+                     " FROM events WHERE id = 'E1'") == "clear",
+        "db: unrelated metadata survives the plate upgrade");
+  CHECK(pg_scalar(c, "SELECT jsonb_array_length("
+                     "metadata::jsonb->'detectedAreas')::text"
+                     " FROM events WHERE id = 'E1'") == "2",
+        "db: the plate area is appended to the vehicle area");
+  CHECK(pg_scalar(c,
+                     "SELECT metadata::jsonb->'detectedAreas' @> "
+                     "'[{\"id\":\"a-plate\"}]'::jsonb"
+                     " FROM events WHERE id = 'E1'") == "t",
+        "db: the appended metadata carries the plate area");
+  CHECK(pg_scalar(c, "SELECT jsonb_array_length("
+                     "metadata::jsonb->'detectedThumbnails')::text"
+                     " FROM events WHERE id = 'E1'") == "2",
+        "db: the plate thumbnail is appended to the vehicle thumbnail");
+  CHECK(pg_scalar(c,
+                     "SELECT metadata::jsonb->'detectedThumbnails' @> "
+                     "'[{\"name\":\"PJ-131-X\"}]'::jsonb"
+                     " FROM events WHERE id = 'E1'") == "t",
+        "db: the appended metadata carries the plate text");
+  CHECK(pg_scalar(c, "SELECT \"smartDetectTypes\"::jsonb @> "
+                     "'[\"licensePlate\"]'::jsonb FROM events"
+                     " WHERE id = 'E1'") == "t",
+        "db: the event gains the licensePlate class");
+  CHECK(pg_scalar(c, "SELECT jsonb_array_length("
+                     "\"smartDetectTypes\"::jsonb)::text FROM events"
+                     " WHERE id = 'E1'") == "2",
+        "db: the class list keeps its vehicle entry");
+  CHECK(pg_scalar(c,
+                     "SELECT count(*) FROM \"detectionLabels\" dl"
+                     " JOIN labels l ON l.lid::int = ANY(dl.labels)"
+                     " WHERE dl.\"eventId\" = 'E1'"
+                     "   AND dl.\"objectId\" IS NULL"
+                     "   AND l.name = 'smartDetectType:licensePlate'") == "1",
+        "db: the event-level label gains smartDetectType:licensePlate");
+
+  CHECK(!update_event_plate(c, "E1", plate_metadata, now),
+        "db: a plate already on the event reports no gain");
+  CHECK(pg_scalar(c, "SELECT jsonb_array_length("
+                     "metadata::jsonb->'detectedAreas')::text"
+                     " FROM events WHERE id = 'E1'") == "2",
+        "db: the second call does not append the plate area again");
+  CHECK(pg_scalar(c, "SELECT count(*) FROM labels"
+                     " WHERE name = 'smartDetectType:licensePlate'") == "1",
+        "db: the second call does not create the label again");
+
+  // The sparse/legacy path (no plate metadata) adds the class and leaves
+  // the metadata column alone.
+  pg_scalar(c,
+      "INSERT INTO events VALUES ('E2', '[\"vehicle\"]'::json,"
+      " '{\"source\":\"onvif-recorder\"}'::json,"
+      " '2026-11-21T00:00:00Z')");
+  CHECK(update_event_plate(c, "E2", "", now),
+        "db: a legacy plate upgrade gains the class");
+  CHECK(pg_scalar(c, "SELECT metadata::jsonb->>'source' FROM events"
+                     " WHERE id = 'E2'") == "onvif-recorder",
+        "db: a legacy plate upgrade leaves metadata untouched");
+  CHECK(pg_scalar(c, "SELECT metadata::jsonb->'detectedAreas' IS NULL"
+                     " FROM events WHERE id = 'E2'") == "t",
+        "db: a legacy plate upgrade adds no detectedAreas");
+  PQfinish(c);
+}
+
 // The recorder's reconnect back-off, driven the way on_event drives it: a
 // detection every 100 ms through an outage that ends after 1 s .. 70 s.
 // No write gets through while the database is down, so every moment the
@@ -4595,6 +4726,8 @@ int main() {
            [] { test_detection_labels_follow_label_cleanup(); });
   run_test("pg_text_array", [] { test_pg_text_array(); });
   run_test("detection_labels_sql_db", [] { test_detection_labels_sql_db(); });
+  run_test("update_event_plate_sql_db",
+           [] { test_update_event_plate_sql_db(); });
   run_test("recorder_reconnect_after_outage",
            [] { test_recorder_reconnect_after_outage(); });
   run_test("drop_unclassified_motion",

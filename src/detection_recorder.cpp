@@ -852,10 +852,10 @@ bool append_event_label(PGconn* conn,
     "  LIMIT 1"
     ")"
     " UPDATE \"detectionLabels\""
-    "   SET labels = labels || ARRAY[(SELECT lid FROM lid)],"
+    "   SET labels = labels || ARRAY[(SELECT x.lid::int FROM lid x)],"
     "       \"updatedAt\" = $4::timestamptz"
     " WHERE \"eventId\" = $1 AND \"objectId\" IS NULL"
-    "   AND NOT (labels @> ARRAY[(SELECT lid FROM lid)])",
+    "   AND NOT (labels @> ARRAY[(SELECT x.lid::int FROM lid x)])",
     4, nullptr, params, nullptr, nullptr, 0);
   const bool ok = PQresultStatus(res) == PGRES_COMMAND_OK;
   if (!ok) {
@@ -865,6 +865,66 @@ bool append_event_label(PGconn* conn,
   }
   PQclear(res);
   return ok;
+}
+
+bool update_event_plate(PGconn* conn,
+                        const std::string& event_id,
+                        const std::string& metadata,
+                        const std::string& now_str) {
+  const char* params[] = {
+    event_id.c_str(),
+    metadata.empty() ? nullptr : metadata.c_str(),
+    now_str.c_str(),
+  };
+  // The class list gains licensePlate once per event; the plate object's
+  // detectedAreas / detectedThumbnails entries are appended to the
+  // existing metadata.  An empty metadata keeps the column as it is, the
+  // way insert_event's sparse path does.
+  //
+  // `||` and `->` share precedence and associate left to right, so each
+  // concatenation needs both operands completed first: `a || b -> 'key'`
+  // would parse as `(a || b) -> 'key'`, and a text key on an array is
+  // NULL, which jsonb_set would propagate into the whole column.
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(conn, -1,
+    "UPDATE events SET"
+    "  \"smartDetectTypes\" = CASE"
+    "    WHEN \"smartDetectTypes\"::jsonb ? 'licensePlate'"
+    "    THEN \"smartDetectTypes\""
+    "    ELSE (\"smartDetectTypes\"::jsonb"
+    "          || '[\"licensePlate\"]'::jsonb)::json"
+    "  END,"
+    "  metadata = CASE WHEN $2::text IS NULL THEN metadata ELSE"
+    "    jsonb_set(jsonb_set(COALESCE(metadata::jsonb, '{}'::jsonb),"
+    "      '{detectedAreas}',"
+    "      COALESCE(metadata::jsonb->'detectedAreas','[]'::jsonb)"
+    "        || COALESCE($2::jsonb->'detectedAreas','[]'::jsonb), true),"
+    "      '{detectedThumbnails}',"
+    "      COALESCE(metadata::jsonb->'detectedThumbnails','[]'::jsonb)"
+    "        || COALESCE($2::jsonb->'detectedThumbnails','[]'::jsonb), true)"
+    "      ::json"
+    "  END,"
+    "  \"updatedAt\" = $3"
+    " WHERE id = $1"
+    "   AND NOT (\"smartDetectTypes\"::jsonb ? 'licensePlate')"
+    " RETURNING id",
+    3, nullptr, params, nullptr, nullptr, 0);
+  const ExecStatusType st = PQresultStatus(res);
+  if (st != PGRES_TUPLES_OK) {
+    const char* msg = res ? PQresultErrorMessage(res) : nullptr;
+    LOG(ERROR) << "[pg] event plate update failed: "
+               << ((msg && *msg) ? msg : PQerrorMessage(conn));
+    PQclear(res);
+    return false;
+  }
+  const bool gained = PQntuples(res) > 0;
+  PQclear(res);
+  if (gained &&
+      !append_event_label(conn, event_id, "smartDetectType:licensePlate",
+                          now_str)) {
+    LOG(WARNING) << "[pg] event " << event_id
+                 << " gained licensePlate but its event-level label did not";
+  }
+  return gained;
 }
 
 }  // namespace detection_recorder_internal
@@ -1167,53 +1227,8 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
                        const std::string& metadata,
                        const std::string& now_str) override {
     if (!maybe_reconnect()) return false;
-    const char* params[] = {
-      event_id.c_str(),
-      metadata.empty() ? nullptr : metadata.c_str(),
-      now_str.c_str(),
-    };
-    // The class list gains licensePlate once per event; the plate object's
-    // detectedAreas / detectedThumbnails entries are appended to the
-    // existing metadata.  A legacy install (empty metadata) keeps its
-    // metadata as it is, the way insert_event's sparse path does.
-    PGresult* res = onvif::pg::ExecParamsWithTimeout(conn_, -1,
-      "UPDATE events SET"
-      "  \"smartDetectTypes\" = CASE"
-      "    WHEN \"smartDetectTypes\"::jsonb ? 'licensePlate'"
-      "    THEN \"smartDetectTypes\""
-      "    ELSE (\"smartDetectTypes\"::jsonb"
-      "          || '[\"licensePlate\"]'::jsonb)::json"
-      "  END,"
-      "  metadata = CASE WHEN $2::text IS NULL THEN metadata ELSE"
-      "    jsonb_set(jsonb_set(COALESCE(metadata::jsonb, '{}'::jsonb),"
-      "      '{detectedAreas}',"
-      "      COALESCE(metadata::jsonb->'detectedAreas','[]'::jsonb)"
-      "        || $2::jsonb->'detectedAreas', true),"
-      "      '{detectedThumbnails}',"
-      "      COALESCE(metadata::jsonb->'detectedThumbnails','[]'::jsonb)"
-      "        || $2::jsonb->'detectedThumbnails', true)::json"
-      "  END,"
-      "  \"updatedAt\" = $3"
-      " WHERE id = $1"
-      "   AND NOT (\"smartDetectTypes\"::jsonb ? 'licensePlate')"
-      " RETURNING id",
-      3, nullptr, params, nullptr, nullptr, 0);
-    const ExecStatusType st = PQresultStatus(res);
-    if (st != PGRES_TUPLES_OK) {
-      LOG(ERROR) << "[pg] event plate update failed: " << pg_errmsg(res);
-      PQclear(res);
-      return false;
-    }
-    const bool gained = PQntuples(res) > 0;
-    PQclear(res);
-    if (gained &&
-        !detection_recorder_internal::append_event_label(
-            conn_, event_id, "smartDetectType:licensePlate", now_str)) {
-      LOG(WARNING) << "[pg] event " << event_id
-                   << " gained licensePlate but its event-level label did "
-                      "not";
-    }
-    return gained;
+    return detection_recorder_internal::update_event_plate(
+        conn_, event_id, metadata, now_str);
   }
 
   // Insert JPEG thumbnail directly into Protect's thumbnails table.
