@@ -26,6 +26,9 @@
  *   Decodes an existing UBV file and runs the same verification steps.
  */
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -71,6 +74,54 @@ static bool check_markers(const std::vector<ubv::Frame>& frames) {
 
 // -- Self-contained round-trip test ──────────────────────────────────────────
 // Finds the snapshot JPEGs relative to the binary (Bazel runfiles).
+// New day directories and thumbnail files must match Protect's video tree:
+// same group as their parent and group-writable when the parent is, so
+// Protect's recorder (msr, user ms) can still create recording files in a day
+// directory the recorder (root) created first.  Without this they were
+// root:root 0755 / 0644 and msr failed with "Permission denied".
+static bool check_protect_path_permissions(const ubv::Frame& frame) {
+  std::cout << "\n--- protect_path()/append() ownership ---\n";
+  char tmpl[] = "/tmp/ubv_perm_test_XXXXXX";
+  if (!mkdtemp(tmpl)) {
+    std::cerr << "  mkdtemp failed\n";
+    return false;
+  }
+  const std::string base = tmpl;
+  chmod(base.c_str(), 0770);  // like Protect's ms:unifi-streaming 0770 tree
+  struct stat base_st{};
+  stat(base.c_str(), &base_st);
+
+  const uint64_t ts = 1795423223001ULL;  // 2026-11-23 UTC
+  const std::string path = ubv::protect_path(base, "AABBCCDDEEFF", ts);
+  bool ok = ubv::append(path, {ts, frame.jpeg}).ok();
+  if (!ok) std::cerr << "  append failed: " << path << '\n';
+
+  const std::string day = path.substr(0, path.rfind('/'));
+  const std::vector<std::pair<std::string, mode_t>> want_modes = {
+      {base + "/2026", 0770}, {base + "/2026/11", 0770}, {day, 0770}, {path, 0660}};
+  for (const auto& [p, want] : want_modes) {
+    struct stat st{};
+    if (stat(p.c_str(), &st) != 0) {
+      std::cerr << "  missing: " << p << '\n';
+      ok = false;
+      continue;
+    }
+    const mode_t got = st.st_mode & 0777;
+    if (got != want || st.st_gid != base_st.st_gid) {
+      std::cerr << "  " << p << ": mode " << std::oct << got << " want " << want
+                << std::dec << ", gid " << st.st_gid << " want " << base_st.st_gid << '\n';
+      ok = false;
+    }
+  }
+  unlink(path.c_str());
+  rmdir(day.c_str());
+  rmdir((base + "/2026/11").c_str());
+  rmdir((base + "/2026").c_str());
+  rmdir(base.c_str());
+  if (ok) std::cout << "  new folders 0770 and files 0660, parent's group: OK\n";
+  return ok;
+}
+
 static int run_self_contained() {
   // Locate snapshot files in the Bazel runfiles tree.
   const char* srcdir = std::getenv("TEST_SRCDIR");
@@ -188,6 +239,9 @@ static int run_self_contained() {
       }
     }
   }
+
+  if (!input_frames.empty() && !check_protect_path_permissions(input_frames[0]))
+    all_ok = false;
 
   std::cout << "\n=== Result ===\n";
   if (all_ok) {
