@@ -15,6 +15,7 @@
 #include "ubv_thumbnail.hpp"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -292,26 +293,39 @@ static void update_file_hdr_cursor(const std::string& path,
 // inherit_parent_ownership -- match a new file/dir to Protect's video tree
 // ---------------------------------------------------------------------------
 
-// Give a newly created @p path the owner and group of its parent directory,
-// and the parent's permission bits (minus execute for files).
+// Make @p path (just created, or created as root by an older version) match
+// Protect's video tree: the owner and group of its parent directory, and the
+// parent's permission bits capped at 02775 for directories / 0664 for files.
 //
 // The recorder runs as root but writes into Protect's video tree, which belongs
 // to Protect's own recorder (msr: user ms, group unifi-streaming on UniFi OS).
 // A day directory created as root:root 0755 stops msr creating its recording
 // files for that day ("Permission denied"), so cameras silently stop saving
-// video while live view and detections keep working.  Best effort: if any
-// call fails, the path keeps its old root ownership.
+// video while live view and detections keep working.
+//
+// Works on a descriptor opened with O_NOFOLLOW, so a symlink swapped into a
+// writable directory can't redirect the chown to another file.  The cap means
+// a 0777/1777 parent never makes thumbnails world-writable.  Best effort: if
+// any call fails, the path keeps its current owner and mode.
 static void inherit_parent_ownership(const std::string& path, bool is_dir) {
   size_t slash = path.rfind('/');
   if (slash == std::string::npos || slash == 0) return;
   struct stat parent{};
   if (stat(path.substr(0, slash).c_str(), &parent) != 0) return;
-  // chown before chmod: chown on a file clears its setuid/setgid bits.
-  if (geteuid() == 0)
-    (void)chown(path.c_str(), parent.st_uid, parent.st_gid);
-  const mode_t mode = is_dir ? (parent.st_mode & 07777)
-                             : (parent.st_mode & 0666);
-  (void)chmod(path.c_str(), mode);
+  int fd = open(path.c_str(),
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC | (is_dir ? O_DIRECTORY : 0));
+  if (fd < 0) return;
+  struct stat st{};
+  if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) == is_dir) {
+    // fchown before fchmod: fchown on a file clears its setuid/setgid bits.
+    if (geteuid() == 0 &&
+        (st.st_uid != parent.st_uid || st.st_gid != parent.st_gid))
+      (void)fchown(fd, parent.st_uid, parent.st_gid);
+    const mode_t mode = is_dir ? (parent.st_mode & 02775)
+                               : (parent.st_mode & 0664);
+    if ((st.st_mode & 07777) != mode) (void)fchmod(fd, mode);
+  }
+  close(fd);
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +418,19 @@ std::string protect_path(const std::string& base_dir,
 
   std::string dir = base_dir + "/" + date_buf;
   mkdirs(dir);
+
+  // Repair date directories an earlier version created as root:root 0755,
+  // which would otherwise keep Protect's recorder locked out of that day.
+  // Only YYYY, YYYY/MM and YYYY/MM/DD: never base_dir or anything above it.
+  if (geteuid() == 0) {
+    const std::string date(date_buf);
+    for (const std::string& d : {base_dir + "/" + date.substr(0, 4),
+                                 base_dir + "/" + date.substr(0, 7), dir}) {
+      struct stat st{};
+      if (lstat(d.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == 0)
+        inherit_parent_ownership(d, /*is_dir=*/true);
+    }
+  }
 
   // Look for an existing file for this MAC in today's directory.
   std::string prefix = mac + "_0_thumbnails_";
