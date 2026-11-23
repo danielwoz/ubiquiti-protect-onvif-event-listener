@@ -599,7 +599,7 @@ channel conffile, so the directory is not a usable signal).  Only do
 step 2 when the user really wants the device to forget the application
 existed.
 
-Packages older than v1.6.42 leave their cron entries behind on purge;
+Packages older than v1.6.44 leave their cron entries behind on purge;
 remove those two `/etc/cron.d/` files by hand after purging one.
 
 ### APT suite promotion

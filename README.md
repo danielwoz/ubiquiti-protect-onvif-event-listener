@@ -132,7 +132,7 @@ rm -rf /data/onvif-recorder
 rm -f  /var/log/onvif-recorder-boot-restore.log /var/log/onvif-recorder-backup.log
 ```
 
-Packages older than v1.6.42 do not remove their cron entries on purge; delete
+Packages older than v1.6.44 do not remove their cron entries on purge; delete
 `/etc/cron.d/onvif-recorder-boot-restore` and
 `/etc/cron.d/onvif-recorder-backup` by hand after purging one of those.
 
