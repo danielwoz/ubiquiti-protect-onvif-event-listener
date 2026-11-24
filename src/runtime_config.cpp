@@ -10,6 +10,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -243,6 +244,21 @@ const std::vector<Entry>& Schema() {
      "touching MSR or the events table.",
      "MSR forwarding"},
 
+    // ---- NTP server ----
+    {"ntp_server", Type::Bool,
+     "Serve NTP on the local network so third-party cameras can keep their "
+     "clocks in sync with the router.  Cameras that check ONVIF "
+     "WS-Security timestamps against their own clock reject requests once "
+     "it drifts, which shows up as ter:NotAuthorized or HTTP 401 answers; "
+     "point the camera's NTP server at this device's address.  On by "
+     "default.",
+     "NTP server"},
+    {"ntp_bind", Type::String,
+     "Address and UDP port the NTP server listens on, as address:port "
+     "(for example 0.0.0.0:123).  An empty address means all interfaces "
+     "and port 0 picks a free port.  Only used when the NTP server is on.",
+     "NTP server"},
+
     // ---- Logging ----
     {"verbose", Type::Bool,
      "Verbose log level (INFO and above).  Disabled by default writes only "
@@ -414,6 +430,19 @@ absl::Status ValidateValue(const std::string& name, const std::string& value) {
   if (value.empty()) return absl::OkStatus();
   if (name == "default_object_type")
     return ValidateObjectType(value, /*allow_motion=*/true);
+  if (name == "ntp_bind") {
+    const size_t colon = value.rfind(':');
+    if (colon == std::string::npos || colon + 1 >= value.size())
+      return absl::InvalidArgumentError(
+          "\"address:port\" expected, e.g. 0.0.0.0:123");
+    const std::string port = value.substr(colon + 1);
+    char* end = nullptr;
+    const unsigned long parsed =  // NOLINT(runtime/int)
+        std::strtoul(port.c_str(), &end, 10);
+    if (end == nullptr || *end != '\0' || parsed > 65535)
+      return absl::InvalidArgumentError("port must be 0-65535");
+    return absl::OkStatus();
+  }
   if (name != "camera_object_types") return absl::OkStatus();
   size_t pos = 0;
   while (pos <= value.size()) {

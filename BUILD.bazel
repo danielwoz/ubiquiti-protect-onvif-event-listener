@@ -336,6 +336,14 @@ cc_library(
 )
 
 cc_library(
+    name = "ntp_server",
+    srcs = ["src/ntp_server.cpp"],
+    hdrs = ["src/ntp_server.hpp"],
+    strip_include_prefix = "src",
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "event_proxy_mode",
     srcs = ["src/event_proxy_mode.cpp"],
     hdrs = ["src/event_proxy_mode.hpp"],
@@ -656,6 +664,7 @@ cc_binary(
         ":motion_poller",
         ":msr_backfill",
         ":msr_client",
+        ":ntp_server",
         ":object_detect",
         ":onvif_listener",
         ":patch_watcher",

@@ -74,6 +74,7 @@
 #include "event_proxy_mode.hpp"
 #include "event_recovery.hpp"
 #include "motion_poller.hpp"
+#include "ntp_server.hpp"
 #include "wedge_healer.hpp"
 #include "protect_version.hpp"
 #include "object_detect.hpp"
@@ -478,6 +479,16 @@ ABSL_FLAG(uint16_t, log_port, 7890,
 ABSL_FLAG(uint16_t, admin_port, 7891,
     "TCP port for the package admin page (loopback only). "
     "Served via nginx at /onvif/admin/ with Protect auth.");
+ABSL_FLAG(bool, ntp_server, true,
+    "Serve NTPv4 on the local network so third-party cameras can keep "
+    "their clocks in sync.  Cameras that check ONVIF WS-Security "
+    "timestamps against their own clock reject requests once it drifts, "
+    "which shows up as ter:NotAuthorized or 401 answers.  Set to false "
+    "to disable the server.");
+ABSL_FLAG(std::string, ntp_bind, "0.0.0.0:123",
+    "Address and UDP port for the built-in NTP server, as address:port.  "
+    "An empty address means all interfaces and port 0 picks a free port.  "
+    "Only used when --ntp_server is true.");
 ABSL_FLAG(std::string, channel_file, "/etc/onvif-recorder/channel",
     "Path to the APT-channel selector file read/written by the admin page.");
 
@@ -781,6 +792,23 @@ int main(int argc, char* argv[]) {
 
   onvif::global_init();
   (void)mkdir(state_dir.c_str(), 0755);
+
+  // ----------------------------------------------------------------
+  // NTP server (--ntp_server): hands the system clock to cameras that
+  // validate ONVIF timestamps against their own time.  A port already in
+  // use is not fatal -- the rest of the recorder keeps working.
+  // ----------------------------------------------------------------
+  onvif::NtpServer ntp_server;
+  if (absl::GetFlag(FLAGS_ntp_server)) {
+    std::string ntp_error;
+    if (ntp_server.start(absl::GetFlag(FLAGS_ntp_bind), &ntp_error)) {
+      LOG(INFO) << "[ntp] serving time on " << ntp_server.bound();
+    } else {
+      LOG(WARNING) << "[ntp] not serving time: " << ntp_error;
+    }
+  } else {
+    LOG(INFO) << "[ntp] disabled";
+  }
 
   // ----------------------------------------------------------------
   // Protect event sharing (--protect_event_proxy_cameras).  The mode
@@ -2125,6 +2153,7 @@ int main(int argc, char* argv[]) {
     hub->set_nudge_fn(nullptr);
     hub->set_resubscribe_fn(nullptr);
   }
+  ntp_server.stop();
   g_listener = nullptr;
   onvif::global_cleanup();
   LOG(INFO) << "Done";

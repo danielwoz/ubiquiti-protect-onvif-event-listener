@@ -21,6 +21,12 @@ cc_test(
 )
 
 cc_test(
+    name = "test_ntp_server",
+    srcs = ["test_ntp_server.cpp"],
+    deps = ["//:ntp_server"],
+)
+
+cc_test(
     name = "test_protect_version",
     srcs = ["test_protect_version.cpp"],
     deps = [

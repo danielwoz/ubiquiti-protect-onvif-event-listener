@@ -225,6 +225,24 @@ that starts the detection (the one carrying `State=true` or
 ended vehicle event, so two cars inside the coalesce window keep their own
 plates.
 
+## Time sync for third-party cameras
+
+onvif-recorder serves NTPv4 on UDP port 123 by default, handing out the
+router's own (NTP-synced) clock to the local network. Some cameras check the
+WS-Security timestamp of every ONVIF request against their own clock; once
+that clock drifts, requests fail with `ter:NotAuthorized` or HTTP 401, even
+though the login itself is correct.
+
+Point the camera's NTP server setting at this device's LAN address, or set
+the DHCP NTP server option to it, so the camera stays in step. The server
+answers standard NTPv3/NTPv4 client requests with stratum 3; no other
+configuration is needed.
+
+Turn it off with `--ntp_server=false` or the NTP server switch on the admin
+Configuration card. `--ntp_bind` changes the address and port (default
+`0.0.0.0:123`). If something else already owns the port, the recorder logs a
+warning and keeps running without it.
+
 ## Sharing a camera's events with Protect
 
 From Protect 7.1, Protect subscribes to each third-party camera's ONVIF events itself,

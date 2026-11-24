@@ -106,6 +106,8 @@ src/
   pullpoint_soap.hpp/.cpp       — PullPoint request parsing, SOAP 1.2 responses and faults
   event_proxy_mode.hpp/.cpp     — Event-sharing mode (serve / drain / off) from the setting,
                                     the state files and Protect's PID; /api/event_proxy JSON
+  ntp_server.hpp/.cpp           — Built-in NTPv4 server (UDP 123 by default) so third-party
+                                    cameras can keep their clocks in sync for ONVIF timestamps
   ubv_thumbnail.hpp/.cpp        — UBV container encode/decode (thumbnail storage)
   jpeg_crop.hpp/.cpp            — JPEG decode/crop/re-encode via libjpeg
   object_detect.hpp/.cpp        — NanoDet-M on-device object detection via NCNN
@@ -718,6 +720,8 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--model_dir` | `/usr/share/onvif-recorder/models` | Directory containing `nanodet_m.param` and `nanodet_m.bin`. Shipped inside the .deb; models are downloaded at runtime if not present. |
 | `--state_dir` | `/var/lib/onvif-recorder` | Directory for runtime state (API-key cache, future per-host state). Defense-in-depth fallback: if the default is used and the legacy `/root/.config/onvif-recorder-api-key` exists, it is copied here on first run. |
 | `--admin_port` | `7891` | localhost HTTP port serving the admin UI. Reached externally via the nginx-patched `https://<device>/onvif/admin/`. |
+| `--ntp_server` | `true` | Serve NTPv4 on the local network so third-party cameras can keep their clocks in sync. Cameras that check ONVIF WS-Security timestamps against their own clock reject requests once it drifts (`ter:NotAuthorized`, HTTP 401); point the camera's NTP server setting at this device. `false` disables the server. |
+| `--ntp_bind` | `0.0.0.0:123` | Address and UDP port for the NTP server, as `address:port`. An empty address means all interfaces; port 0 picks a free port. Only used while `--ntp_server` is on. |
 | `--channel_file` | `/etc/onvif-recorder/channel` | File containing the selected APT channel (`stable` / `rc` / `early-access`). Read by the admin UI and the `onvif-recorder-channel.service` oneshot. |
 | `--detect` | `true` | Enable NanoDet-M as fallback when the camera provides no ONVIF bbox |
 | `--detect_override` | `false` | Always run NanoDet-M, ignoring the ONVIF bbox entirely (implies `--detect`) |

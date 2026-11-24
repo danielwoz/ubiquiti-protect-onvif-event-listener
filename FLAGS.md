@@ -299,6 +299,8 @@ ExecStart=/usr/bin/onvif-recorder \
 | `--event_log` | _(disabled)_ | Path for parsed-event JSON Lines log. |
 | `--raw_log` | _(disabled)_ | Path for raw SOAP exchange JSON Lines log (large). |
 | `--admin_port` | `7891` | Port for the local admin HTTP server (loopback only). |
+| `--ntp_server` | `true` | Serve NTPv4 on the local network so third-party cameras can keep their clocks in sync; cameras that check ONVIF WS-Security timestamps against their own clock reject requests once it drifts. Point the camera's NTP server at this device. `false` disables the server. |
+| `--ntp_bind` | `0.0.0.0:123` | Address and UDP port for the NTP server, as `address:port`. An empty address means all interfaces; port 0 picks a free port. Only used while `--ntp_server` is on. |
 | `--log_port` | `7890` | Port for the local log-viewer HTTP server (loopback only). |
 | `--state_dir` | `/var/lib/onvif-recorder` | Directory for persistent runtime state (cached user IDs, etc). |
 | `--channel_file` | `/etc/onvif-recorder/channel` | Path to the apt channel file (`stable` / `rc` / `early-access`). |
