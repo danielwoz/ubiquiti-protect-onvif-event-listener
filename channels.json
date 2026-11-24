@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generated_at": "2026-11-23T21:05:42Z",
+  "generated_at": "2026-11-24T09:10:04Z",
   "default": "early-access",
   "channels": [
     {
@@ -18,8 +18,8 @@
       "aliases": [],
       "label": "Release Candidate",
       "description": "Releases promoted from Latest after testing on a live device.",
-      "version": "1.6.40",
-      "updated_at": "2026-11-15T13:34:40Z"
+      "version": "1.6.44",
+      "updated_at": "2026-11-24T09:10:04Z"
     },
     {
       "id": "stable",
