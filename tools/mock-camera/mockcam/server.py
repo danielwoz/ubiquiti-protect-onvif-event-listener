@@ -234,6 +234,8 @@ def apply_side_effects(cam: Camera, changed) -> None:
         cam.media.set_subject(cam.knobs["subject"])
     if cam.media and "stream_up" in changed:
         cam.media.refresh_status()
+    if "ntp_server" in changed or "ntp_interval_s" in changed:
+        cam.ntp.wake()
 
 
 def configure(cam: Camera, body: dict) -> dict:
@@ -385,6 +387,7 @@ def state(cam: Camera) -> dict:
                      "serial": cam.s.serial, "mac": cam.s.mac,
                      "advertise_host": cam.s.advertise_host},
         "knobs": cam.knobs.snapshot(),
+        "ntp": cam.ntp.state(),
         "encoders": {k: {x: v[x] for x in ("width", "height", "fps", "bitrate", "gov",
                                           "profile")} for k, v in cam._encoders().items()},
         "scenario": cam.scenario,
@@ -398,7 +401,7 @@ HELP = """MockCam control API (no authentication)
 
 GET    /healthz                  ready when both RTSP paths are live and the snapshot is fresh
 GET    /mock/state               identity, knobs, encoders, event states, subscriptions,
-                                 RTSP readers
+                                 NTP client state, RTSP readers
 GET    /mock/config              knobs
 POST   /mock/config              {"knob": value, ...}   (see README for every knob)
 POST   /mock/config/reset        all knobs back to their defaults

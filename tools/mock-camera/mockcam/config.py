@@ -7,6 +7,8 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from .ntp import parse_server
+
 # Every knob, its default and (for strings) the values it accepts.
 KNOB_DEFAULTS: Dict[str, Any] = {
     # Services advertised by GetServices / GetCapabilities.  Media1 is always on.
@@ -23,6 +25,10 @@ KNOB_DEFAULTS: Dict[str, Any] = {
     "auth_mode": "wsse",      # wsse | wsse_only | digest | none
     "created_window_s": 0,    # >0: reject UsernameTokens whose Created is further off
     "clock_skew_s": 0,        # added to the camera clock (GetSystemDateAndTime, events)
+    # NTP client.  Empty server disables it; the measured offset becomes part of the
+    # camera clock, never the host clock.
+    "ntp_server": "",         # host or host:port
+    "ntp_interval_s": 60,     # seconds between queries
     # Event service behaviour.
     "slots": 0,               # max live pull-point subscriptions; 0 = unlimited
     "wsa_strict": False,      # Pull/Renew/Unsubscribe without wsa:To + wsa:Action -> 400
@@ -46,6 +52,11 @@ KNOB_CHOICES = {
 }
 
 SIGNED_KNOBS = ("clock_skew_s",)
+
+KNOB_MIN = {"ntp_interval_s": 1}
+
+# Strings that are not a fixed choice; validated by their own rule below.
+FREE_STRING_KNOBS = ("ntp_server",)
 
 FAULT_NEXT_KEYS = {"op", "count", "status", "code", "subcode", "reason", "delay_s", "close"}
 
@@ -86,8 +97,18 @@ def validate_knobs(update: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError(f"{k} must be an integer")
             if v < 0 and k not in SIGNED_KNOBS:
                 raise ValueError(f"{k} must be >= 0")
+            if k in KNOB_MIN and v < KNOB_MIN[k]:
+                raise ValueError(f"{k} must be >= {KNOB_MIN[k]}")
         elif isinstance(default, str):
-            if v not in KNOB_CHOICES.get(k, ()):
+            if k in FREE_STRING_KNOBS:
+                if not isinstance(v, str):
+                    raise ValueError(f"{k} must be a string")
+                if v:
+                    try:
+                        parse_server(v)
+                    except ValueError as e:
+                        raise ValueError(f"{k}: {e}") from e
+            elif v not in KNOB_CHOICES.get(k, ()):
                 raise ValueError(f"{k} must be one of {', '.join(KNOB_CHOICES[k])}")
         out[k] = v
     return out

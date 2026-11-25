@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from .config import (BITRATE_RANGE, DEFAULT_ENCODERS, FPS_RANGE, GOV_RANGE, QUALITY_RANGE,
                      Knobs, Settings)
 from .events import CLASS_TYPES, KINDS, EventBus, Notification, topic_set_xml
+from .ntp import NtpClient
 from .soap import (DAHUA_SLOT_FAULT, NS, DigestAuth, SoapParseError, SoapRequest,
                    check_username_token, child, children, envelope, esc, fault, find_text, iso,
                    local, parse_datetime, parse_duration, parse_request, termination_seconds)
@@ -179,6 +180,7 @@ class Camera:
         self.scenario: Optional[dict] = None
         self.scenario_lock = threading.Lock()
         self.stop = threading.Event()
+        self.ntp = NtpClient(self.knobs, self.stop)
         self.snapshot_file: Optional[str] = None
         for kind in ("motion_alarm", "cell_motion"):
             self.bus.remember(self.bus.build(kind, False))
@@ -189,7 +191,9 @@ class Camera:
     # -- clock and URLs ----------------------------------------------------------
 
     def now(self) -> float:
-        return time.time() + self.knobs["clock_skew_s"]
+        # The NTP offset is what the camera learned from its time server; clock_skew_s
+        # is the deliberate drift on top.  The host clock is never changed.
+        return time.time() + self.ntp.offset_s() + self.knobs["clock_skew_s"]
 
     def host_for(self, host_header: str) -> Tuple[str, Optional[int]]:
         """(host, port) clients should use: the advertised host, else the Host header."""
@@ -364,7 +368,8 @@ class Camera:
             target = parse_datetime("%04d-%02d-%02dT%02d:%02d:%02dZ" % tuple(vals))
             if target is None:
                 raise invalid_arg("invalid UTCDateTime", "ter:InvalidDateTime")
-            self.knobs.update({"clock_skew_s": int(round(target - time.time()))})
+            base = time.time() + self.ntp.offset_s()
+            self.knobs.update({"clock_skew_s": int(round(target - base))})
         return "<tds:SetSystemDateAndTimeResponse/>"
 
     def _services(self, host: str, include_caps: bool) -> List[Tuple[str, str, str]]:

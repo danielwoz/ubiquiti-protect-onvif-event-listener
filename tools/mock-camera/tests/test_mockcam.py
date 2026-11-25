@@ -6,6 +6,7 @@ Run from tools/mock-camera:  python3 -m pytest -q tests
 import http.client
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -15,8 +16,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from mockcam import soap  # noqa: E402
-from mockcam.config import Settings  # noqa: E402
+from mockcam import ntp, soap  # noqa: E402
+from mockcam.config import Knobs, Settings  # noqa: E402
 from mockcam.events import KINDS  # noqa: E402
 from mockcam.server import CameraHandler, ControlHandler, Server, build, make_handler  # noqa: E402
 
@@ -713,3 +714,106 @@ def test_none_cancels_the_scenario_and_its_events(cam):
     assert cam.control("POST", "/mock/scenario", {"kind": "none"})[0] == 200
     assert _motion_state(cam) == "false"
     assert cam.cam.knobs["subject"] == "none" and cam.cam.scenario is None
+
+
+# -- NTP client ---------------------------------------------------------------
+
+class FakeNtp:
+    """UDP NTP server on 127.0.0.1 that answers every request at a fixed offset."""
+
+    def __init__(self, offset_s=0.0, stratum=2):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.settimeout(0.2)
+        self.port = self.sock.getsockname()[1]
+        self.offset_s, self.stratum = offset_s, stratum
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop.is_set():
+            try:
+                data, addr = self.sock.recvfrom(1024)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            now = time.time() + self.offset_s
+            reply = bytearray(48)
+            reply[0] = (4 << 3) | 4
+            reply[1] = self.stratum
+            reply[12:16] = b"LOCL"
+            reply[16:24] = data[40:48]
+            reply[32:40] = ntp.encode_timestamp(now - 0.001)
+            reply[40:48] = ntp.encode_timestamp(now)
+            self.sock.sendto(bytes(reply), addr)
+
+    def close(self):
+        self.stop.set()
+        self.sock.close()
+        self.thread.join(timeout=2)
+
+
+def test_ntp_query_measures_offset():
+    srv = FakeNtp(offset_s=1.25)
+    try:
+        r = ntp.query(f"127.0.0.1:{srv.port}", timeout_s=2)
+    finally:
+        srv.close()
+    assert abs(r["offset_s"] - 1.25) < 0.05
+    assert r["stratum"] == 2 and r["version"] == 4 and r["roundtrip_s"] < 0.1
+
+
+def test_ntp_query_rejects_unsynchronised_server():
+    srv = FakeNtp(stratum=0)
+    try:
+        with pytest.raises(OSError):
+            ntp.query(f"127.0.0.1:{srv.port}", timeout_s=2)
+    finally:
+        srv.close()
+
+
+def test_ntp_client_follows_server_then_clears():
+    srv = FakeNtp(offset_s=1.25)
+    knobs = Knobs({"ntp_server": f"127.0.0.1:{srv.port}", "ntp_interval_s": 1})
+    stop = threading.Event()
+    client = ntp.NtpClient(knobs, stop)
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and abs(client.offset_s() - 1.25) > 0.2:
+            time.sleep(0.05)
+        assert abs(client.offset_s() - 1.25) < 0.2
+        st = client.state()
+        assert st["enabled"] and st["stratum"] == 2 and st["last_sync"]
+        knobs.update({"ntp_server": ""})
+        client.wake()
+        deadline = time.time() + 3
+        while time.time() < deadline and client.offset_s() != 0.0:
+            time.sleep(0.05)
+        assert client.offset_s() == 0.0
+        assert client.state()["enabled"] is False
+    finally:
+        stop.set()
+        client.wake()
+        srv.close()
+
+
+def test_ntp_knobs_validate():
+    k = Knobs()
+    k.update({"ntp_server": "192.168.3.254", "ntp_interval_s": 5})
+    assert k["ntp_server"] == "192.168.3.254" and k["ntp_interval_s"] == 5
+    with pytest.raises(ValueError):
+        k.update({"ntp_server": "not a host"})
+    with pytest.raises(ValueError):
+        k.update({"ntp_interval_s": 0})
+    with pytest.raises(ValueError):
+        k.update({"ntp_server": 5})
+
+
+def test_state_includes_ntp_client(cam):
+    status, body = cam.control("GET", "/mock/state")
+    assert status == 200
+    assert body["ntp"]["enabled"] is False
+    assert body["ntp"]["server"] == ""
+    assert body["ntp"]["offset_ms"] is None

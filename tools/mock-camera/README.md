@@ -86,7 +86,7 @@ Base URL `http://192.168.3.216:8080` (`GET /` lists the endpoints).
 | Method and path | What |
 |---|---|
 | `GET /healthz` | 200 when both RTSP paths are live and the snapshot is less than 10 s old (the readiness probe) |
-| `GET /mock/state` | Everything in one place: identity, knobs, encoder settings, event states, subscriptions, RTSP readers (Protect's `ms` shows up here), recent ffmpeg log |
+| `GET /mock/state` | Everything in one place: identity, knobs, encoder settings, event states, subscriptions, NTP client state, RTSP readers (Protect's `ms` shows up here), recent ffmpeg log |
 | `GET /mock/config` | Current knobs |
 | `POST /mock/config` | Change knobs: `{"knob": value, ...}`; unknown knobs and bad values return 400 |
 | `POST /mock/config/reset` | All knobs back to their defaults |
@@ -126,6 +126,8 @@ Each request-log entry has these fields:
 | `auth_mode` | `wsse` | See below |
 | `created_window_s` | `0` | When greater than 0, reject a UsernameToken whose `Created` is further than this from the camera clock |
 | `clock_skew_s` | `0` | Seconds added to the camera clock. Protect's `SetSystemDateAndTime` (Manual) sets it too |
+| `ntp_server` | `""` | `host` or `host:port` of an NTP server. The measured offset becomes part of the camera clock (the host clock is not touched); empty disables the client |
+| `ntp_interval_s` | `60` | Seconds between NTP queries. A change to either NTP knob applies without waiting out the current interval |
 | `slots` | `0` | Maximum live pull-point subscriptions (0 = unlimited). When full, Create returns the captured Dahua `ter:BlockedThreadUpperLimit` fault |
 | `wsa_strict` | `false` | PullMessages, Renew and Unsubscribe without `wsa:To` and `wsa:Action` get HTTP 400 `ter:InvalidArgs`, as Reolink does (#58) |
 | `ref_params_required` | `false` | New subscriptions share the address `/onvif/subscription` and are identified only by `ReferenceParameters` (`mc:SubscriptionId`), as Axis does. Requests without them get 400 |
@@ -285,6 +287,11 @@ C=http://192.168.3.216:8080
     the clock back with `SetSystemDateAndTime`.
   - Combine with `{"created_window_s":300}` to see the recorder's tokens rejected: it signs
     with its own clock.
+- **NTP client:** `{"ntp_server":"192.168.3.254","ntp_interval_s":60}`.
+  - `GET /mock/state` shows `ntp.last_sync`, `offset_ms`, `roundtrip_ms`, `stratum` and
+    `last_error`; each exchange logs `[ntp] <server>: offset …`.
+  - The offset is added to the camera clock, so `GetSystemDateAndTime` and event timestamps
+    follow the server. The host clock is unchanged; `clock_skew_s` still adds drift on top.
 - **Stream settings UI:** changing resolution, frame rate or bitrate in Protect calls
   `SetVideoEncoderConfiguration`. That restarts the publisher with the new settings, and
   `GET $C/mock/state` shows them.
