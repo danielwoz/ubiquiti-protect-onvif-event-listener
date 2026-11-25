@@ -26,6 +26,9 @@
  *   Decodes an existing UBV file and runs the same verification steps.
  */
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -71,6 +74,72 @@ static bool check_markers(const std::vector<ubv::Frame>& frames) {
 
 // -- Self-contained round-trip test ──────────────────────────────────────────
 // Finds the snapshot JPEGs relative to the binary (Bazel runfiles).
+// New date directories and thumbnail files must match Protect's video tree:
+// the parent's group and (capped) permission bits, so Protect's recorder (msr,
+// user ms) can still create recording files in a day directory the recorder
+// (root) created first.  Before the fix they were 0755 / 0644 regardless of the
+// parent, and root:root when run as root, so msr failed with EACCES.  The
+// chown itself only happens as root and isn't exercised here.
+static bool check_date_tree_modes(const ubv::Frame& frame, mode_t base_mode,
+                                  mode_t want_dir, mode_t want_file) {
+  const char* tmpdir = std::getenv("TEST_TMPDIR");  // set by bazel test
+  std::string tmpl = std::string(tmpdir && *tmpdir ? tmpdir : "/tmp") +
+                     "/ubv_perm_test_XXXXXX";
+  std::vector<char> buf(tmpl.begin(), tmpl.end());
+  buf.push_back('\0');
+  if (!mkdtemp(buf.data())) {
+    std::cerr << "  mkdtemp failed\n";
+    return false;
+  }
+  const std::string base = buf.data();
+  chmod(base.c_str(), base_mode);
+  struct stat base_st{};
+  stat(base.c_str(), &base_st);
+
+  const uint64_t ts = 1795423223001ULL;  // 2026-11-23 UTC
+  const std::string path = ubv::protect_path(base, "AABBCCDDEEFF", ts);
+  bool ok = ubv::append(path, {ts, frame.jpeg}).ok();
+  if (!ok) std::cerr << "  append failed: " << path << '\n';
+
+  const std::string day = path.substr(0, path.rfind('/'));
+  const std::vector<std::pair<std::string, mode_t>> want_modes = {
+      {base + "/2026", want_dir}, {base + "/2026/11", want_dir},
+      {day, want_dir}, {path, want_file}};
+  for (const auto& [p, want] : want_modes) {
+    struct stat st{};
+    if (stat(p.c_str(), &st) != 0) {
+      std::cerr << "  missing: " << p << '\n';
+      ok = false;
+      continue;
+    }
+    const mode_t got = st.st_mode & 0777;
+    if (got != want || st.st_gid != base_st.st_gid) {
+      std::cerr << "  " << p << ": mode " << std::oct << got << " want " << want
+                << std::dec << ", gid " << st.st_gid << " want " << base_st.st_gid
+                << '\n';
+      ok = false;
+    }
+  }
+  unlink(path.c_str());
+  rmdir(day.c_str());
+  rmdir((base + "/2026/11").c_str());
+  rmdir((base + "/2026").c_str());
+  chmod(base.c_str(), 0700);
+  rmdir(base.c_str());
+  return ok;
+}
+
+static bool check_protect_path_permissions(const ubv::Frame& frame) {
+  std::cout << "\n--- protect_path()/append() permissions ---\n";
+  // Protect's tree (ms:unifi-streaming 0770): group-writable, like msr's own.
+  bool ok = check_date_tree_modes(frame, 0770, 0770, 0660);
+  if (ok) std::cout << "  0770 parent -> folders 0770, files 0660: OK\n";
+  // A world-writable parent must not make thumbnails world-writable.
+  const bool capped = check_date_tree_modes(frame, 0777, 0775, 0664);
+  if (capped) std::cout << "  0777 parent -> folders 0775, files 0664 (capped): OK\n";
+  return ok && capped;
+}
+
 static int run_self_contained() {
   // Locate snapshot files in the Bazel runfiles tree.
   const char* srcdir = std::getenv("TEST_SRCDIR");
@@ -188,6 +257,9 @@ static int run_self_contained() {
       }
     }
   }
+
+  if (!input_frames.empty() && !check_protect_path_permissions(input_frames[0]))
+    all_ok = false;
 
   std::cout << "\n=== Result ===\n";
   if (all_ok) {
