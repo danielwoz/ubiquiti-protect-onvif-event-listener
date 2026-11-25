@@ -322,6 +322,13 @@ absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
       "WHERE e.\"cameraId\" IS NOT NULL "
       "  AND e.type IN (") + EnrichableEventTypesSqlList() + ") "
       "  AND e.start > $2::bigint "
+      // Events outlive the camera they came from, but the SDO/SDA rows
+      // reference cameras(id): for a deleted camera every insert fails its
+      // foreign key, the event stays in this work set, and the loop
+      // re-selects it forever.  Skip events whose camera row is gone so
+      // the batch makes progress and finishes.
+      "  AND EXISTS (SELECT 1 FROM cameras c "
+      "              WHERE c.id = e.\"cameraId\") "
       "  AND ( "
       "    e.metadata IS NULL "
       "    OR NOT jsonb_path_exists(e.metadata::jsonb, '$.detectedAreas') "
